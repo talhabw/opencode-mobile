@@ -21,7 +21,7 @@ import {
 // useConnections, useEvents, or any sdk.ts client method, so it cannot
 // create a real session, touch the network, or corrupt real app state. The
 // permission "reply" only flips local component state (below); it never
-// calls sessionClient.permission.reply the way app/session/[id].tsx does.
+// calls the network.
 export default function DemoScreen() {
   const router = useRouter()
   const colorScheme = useColorScheme()

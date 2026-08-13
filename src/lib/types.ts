@@ -29,4 +29,4 @@ export interface AppSettings {
 }
 
 // Re-export SDK types we'll use frequently
-export type { Session, Message, Part, Project, Event, HealthResponse } from "./sdk"
+export type { Session, Message, Part, Project, Event, HealthResponse, CursorPage } from "./sdk"

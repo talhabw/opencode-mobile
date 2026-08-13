@@ -18,6 +18,7 @@ test("text parts show Writing", () => {
 test("known tools map to their friendly label", () => {
   assert.equal(statusFromPart(part({ type: "tool", tool: "grep" })), "Searching codebase...")
   assert.equal(statusFromPart(part({ type: "tool", tool: "bash" })), "Running command...")
+  assert.equal(statusFromPart(part({ type: "tool", tool: "shell" })), "Running command...")
   assert.equal(statusFromPart(part({ type: "tool", tool: "edit" })), "Making edits...")
 })
 

@@ -26,6 +26,19 @@ export function isAuthStatus(status: number): boolean {
   return status === 401 || status === 403
 }
 
+export function apiStatusFor(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") return undefined
+  const tagged = error as { _tag?: unknown; status?: unknown; cause?: unknown }
+  if (tagged._tag === "UnauthorizedError") return 401
+  if (tagged._tag === "SessionNotFoundError" || tagged._tag === "MessageNotFoundError") return 404
+  if (typeof tagged.status === "number") return tagged.status
+  if (tagged.cause && typeof tagged.cause === "object" && "status" in tagged.cause) {
+    const status = (tagged.cause as { status?: unknown }).status
+    if (typeof status === "number") return status
+  }
+  return undefined
+}
+
 /** Build the right error type for a failed HTTP response. */
 export function apiErrorFor(status: number, message: string): Error {
   return isAuthStatus(status) ? new ApiAuthError(status, message) : new Error(message)

@@ -179,7 +179,17 @@ export default function SessionsScreen() {
   const creatingInFlight = useRef(false)
   const [serverProjects, setServerProjects] = useState<Project[]>([])
 
-  const { sessions, isLoading, error, loadSessions, createSession, deleteSession } = useSessions()
+  const {
+    sessions,
+    isLoading,
+    loadingMoreSessions,
+    hasMoreSessions,
+    error,
+    loadSessions,
+    loadMoreSessions,
+    createSession,
+    deleteSession,
+  } = useSessions()
   const {
     activeConnection,
     client,
@@ -289,7 +299,7 @@ export default function SessionsScreen() {
     if (!renameClient) return
     renamingInFlight.current = true
     try {
-      await renameClient.session.update(renaming.id, { title })
+      await renameClient.session.rename(renaming.id, title)
       setRenaming(null)
       setRenameText("")
       loadSessions()
@@ -576,6 +586,11 @@ export default function SessionsScreen() {
         refreshControl={
           <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={isDark ? "#ffffff" : "#0a0a0a"} />
         }
+        onEndReached={() => {
+          if (hasMoreSessions && !loadingMoreSessions) loadMoreSessions()
+        }}
+        onEndReachedThreshold={0.4}
+        ListFooterComponent={loadingMoreSessions ? <ActivityIndicator style={{ padding: 16 }} /> : null}
         ListEmptyComponent={
           isLoading ? (
             <View style={styles.loadingContainer}>

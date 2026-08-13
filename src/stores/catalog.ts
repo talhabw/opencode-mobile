@@ -70,7 +70,8 @@ export const useCatalog = create<CatalogState>((set, get) => ({
     const agents = Array.isArray(agentResult) ? agentResult : []
     const commands = Array.isArray(commandResult) ? commandResult : []
 
-    // Parse provider response: { all: [...], default: {...}, connected: [...] }
+    // The v2 adapter returns one normalized catalog assembled from the official
+    // provider/model endpoints. Keep only connected providers for pickers.
     const raw = providerResult
     const connected = new Set(Array.isArray(raw?.connected) ? raw.connected : [])
     const defaults = raw?.default || {}
@@ -98,9 +99,10 @@ export const useCatalog = create<CatalogState>((set, get) => ({
     // Filter out hidden agents
     const visible = agents.filter((a) => !a.hidden)
 
-    // Default agent
+    // Keep only an explicit valid selection. An empty agent lets a new v2
+    // session use the server's configured default.
     const current = get().agent
-    const agent = current && visible.some((a) => a.name === current) ? current : visible[0]?.name || "build"
+    const agent = current && visible.some((a) => a.name === current) ? current : ""
 
     // Default model: keep valid existing selection; otherwise prefer connected
     // provider defaults, then first connected model; agent model is last fallback.
@@ -126,6 +128,10 @@ export const useCatalog = create<CatalogState>((set, get) => ({
   },
 
   setAgent: (name) => {
+    if (!name) {
+      set({ agent: "" })
+      return
+    }
     const match = get().agents.find((a) => a.name === name)
     if (!match) return
     const model = match.model || get().model

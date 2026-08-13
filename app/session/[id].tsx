@@ -38,7 +38,7 @@ import {
 } from "../../src/components/chat"
 import { computeSessionUsage } from "../../src/lib/session-usage"
 import { useSessions } from "../../src/stores/sessions"
-import { useEvents, refreshPending } from "../../src/stores/events"
+import { useEvents, refreshPending, markPendingResolved } from "../../src/stores/events"
 import { useConnections } from "../../src/stores/connections"
 import { useAuth } from "../../src/stores/auth"
 import { useCatalog } from "../../src/stores/catalog"
@@ -46,6 +46,7 @@ import { useSettings } from "../../src/stores/settings"
 import { useSpeech } from "../../src/lib/speech"
 import { useKeyboardHeight } from "../../src/lib/use-keyboard-height"
 import { useAccent, type AccentState } from "../../src/lib/accents"
+import { parseServerCommand } from "../../src/lib/session-request"
 
 // Header title marquee. When the session title overflows the header title
 // area it scrolls, but never continuously: it slides left, returns, pauses a
@@ -207,6 +208,7 @@ export default function SessionScreen() {
   const setModel = catalog.setModel
   const variant = catalog.variant
   const setVariant = catalog.setVariant
+  const setAgent = catalog.setAgent
   const cycleAgent = catalog.cycleAgent
 
   // Permission & question state
@@ -269,15 +271,16 @@ export default function SessionScreen() {
   const revertMessageID = currentSession?.revert?.messageID
 
   // Inverted FlatList: data is reversed (newest first) so newest renders at bottom
-  const messageData = useMemo(
-    () =>
-      (messages || [])
-        .filter((msg) => !revertMessageID || msg.id.startsWith("temp-") || msg.id < revertMessageID)
+  const messageData = useMemo(() => {
+      const revertIndex = revertMessageID ? messages.findIndex((message) => message.id === revertMessageID) : -1
+      return messages
+        .filter((msg, index) => revertIndex < 0 || msg.id.startsWith("temp-") || index < revertIndex)
         .map((msg) => ({
           message: msg,
           parts: (parts && parts[msg.id]) || [],
         }))
-        .reverse(),
+        .reverse()
+    },
     [messages, parts, revertMessageID],
   )
 
@@ -366,21 +369,23 @@ export default function SessionScreen() {
     }, [id, directory]),
   )
 
-  // Sync model chip from latest assistant message
+  // v2 persists these selections on the session. Reflect that state rather
+  // than inferring a model from message history (which loses the variant).
   useEffect(() => {
-    if (!messages || messages.length === 0) return
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i]
-      if (msg.role === "assistant" && msg.providerID && msg.modelID) {
-        setModel({ providerID: msg.providerID, modelID: msg.modelID })
-        return
-      }
-      if (msg.role === "user" && msg.model) {
-        setModel(msg.model)
-        return
-      }
-    }
-  }, [currentSession?.id, messages?.length])
+    if (!currentSession || !catalog.loaded) return
+    setAgent(currentSession.agent && agents.some((item) => item.name === currentSession.agent) ? currentSession.agent : "")
+    setModel(currentSession.model
+      ? { providerID: currentSession.model.providerID, modelID: currentSession.model.modelID }
+      : null)
+    setVariant(currentSession.model?.variant ?? null)
+  }, [
+    currentSession?.id,
+    currentSession?.agent,
+    currentSession?.model?.providerID,
+    currentSession?.model?.modelID,
+    currentSession?.model?.variant,
+    catalog.loaded,
+  ])
 
   // Slash command handler
   const handleSlashSelect = useCallback(
@@ -505,25 +510,26 @@ export default function SessionScreen() {
       return
     }
 
-    const text = input.trim()
+    const text = input
     const files = [...attachments]
     setInput("")
     setAttachments([])
 
     // Server slash commands (no attachments for commands)
-    if (text.startsWith("/") && files.length === 0) {
-      const [cmdName, ...args] = text.split(" ")
-      const name = cmdName.slice(1)
-      const match = serverCommands.find((c) => c.name === name)
-      if (match && sessionClient && currentSession) {
-        sessionClient.session
-          .command(currentSession.id, {
-            command: name,
-            arguments: args.join(" "),
-            agent,
-            model: model ? `${model.providerID}/${model.modelID}` : undefined,
-          })
-          .catch((err) => console.error("Command failed:", err))
+    const command = files.length === 0 ? parseServerCommand(text, serverCommands) : null
+    if (command && sessionClient && currentSession) {
+      try {
+        await sessionClient.session.command(currentSession.id, {
+          ...command,
+          agent: agent || undefined,
+          model: model || undefined,
+          variant: variant || undefined,
+        })
+        return
+      } catch (err) {
+        console.error("Command failed:", err)
+        setInput(text)
+        Alert.alert(t("session.alerts.sendFailedTitle"), t("session.alerts.sendFailedMessage"))
         return
       }
     }
@@ -595,6 +601,7 @@ export default function SessionScreen() {
     if (!sessionClient || !sessionID) return
     // Snapshot for rollback
     const snapshot = useEvents.getState().permissions[sessionID] || []
+    markPendingResolved("permission", requestID, true)
     // Optimistically remove from UI
     useEvents.setState((state) => ({
       permissions: {
@@ -603,8 +610,9 @@ export default function SessionScreen() {
       },
     }))
     try {
-      await sessionClient.permission.reply(requestID, reply)
+      await sessionClient.permission.reply(requestID, reply, sessionID)
     } catch (err) {
+      markPendingResolved("permission", requestID, false)
       console.error("Permission reply failed:", err)
       // Restore the prompt so the user can retry
       useEvents.setState((state) => ({
@@ -617,6 +625,7 @@ export default function SessionScreen() {
   const handleQuestionReply = async (requestID: string, answers: string[][]) => {
     if (!sessionClient || !sessionID) return
     const snapshot = useEvents.getState().questions[sessionID] || []
+    markPendingResolved("question", requestID, true)
     useEvents.setState((state) => ({
       questions: {
         ...state.questions,
@@ -624,8 +633,9 @@ export default function SessionScreen() {
       },
     }))
     try {
-      await sessionClient.question.reply(requestID, answers)
+      await sessionClient.question.reply(requestID, answers, sessionID)
     } catch (err) {
+      markPendingResolved("question", requestID, false)
       console.error("Question reply failed:", err)
       useEvents.setState((state) => ({
         questions: { ...state.questions, [sessionID]: snapshot },
@@ -637,6 +647,7 @@ export default function SessionScreen() {
   const handleQuestionReject = async (requestID: string) => {
     if (!sessionClient || !sessionID) return
     const snapshot = useEvents.getState().questions[sessionID] || []
+    markPendingResolved("question", requestID, true)
     useEvents.setState((state) => ({
       questions: {
         ...state.questions,
@@ -644,8 +655,9 @@ export default function SessionScreen() {
       },
     }))
     try {
-      await sessionClient.question.reject(requestID)
+      await sessionClient.question.reject(requestID, sessionID)
     } catch (err) {
+      markPendingResolved("question", requestID, false)
       console.error("Question reject failed:", err)
       useEvents.setState((state) => ({
         questions: { ...state.questions, [sessionID]: snapshot },
@@ -870,7 +882,7 @@ export default function SessionScreen() {
             onLongPress={() => cycleAgent(-1)}
           >
             <View style={[s.agentDot, { backgroundColor: agentColor }]} />
-            <Text style={[s.agentLabel, isDark && s.textWhite]}>{agent || "build"}</Text>
+            <Text style={[s.agentLabel, isDark && s.textWhite]}>{agent || t("session.toolbar.auto")}</Text>
             <Ionicons name="swap-horizontal-outline" size={12} color={isDark ? "#888888" : "#666666"} />
           </TouchableOpacity>
 

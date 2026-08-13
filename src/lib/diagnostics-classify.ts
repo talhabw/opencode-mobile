@@ -67,7 +67,7 @@ export function classify(
   // probe (captive portal, no WAN but Tailscale LAN still up, etc.) must not
   // override it and misreport a reachable server as "no internet".
   if (root.ok) {
-    return { classification: "health-failed", summary: `Server is reachable but /global/health failed (HTTP ${health.status ?? "error"}). Likely wrong path, auth, or an old server version.` }
+    return { classification: "health-failed", summary: `Server is reachable but /api/health failed (HTTP ${health.status ?? "error"}). An OpenCode v2 server is required; check the path, auth, and server version.` }
   }
   if (!internet.ok) {
     return { classification: "no-internet", summary: "The device has no working internet/network at all (public check also failed). Check Wi-Fi/data and Tailscale (VPN) status." }

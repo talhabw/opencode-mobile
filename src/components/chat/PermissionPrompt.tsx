@@ -1,3 +1,4 @@
+import { useRef } from "react"
 import { View, Text, TouchableOpacity, StyleSheet } from "react-native"
 import { Ionicons } from "@expo/vector-icons"
 import { useTranslation } from "react-i18next"
@@ -10,6 +11,12 @@ interface Props {
 
 export function PermissionPrompt({ permission, isDark, onReply }: Props) {
   const { t } = useTranslation()
+  const replied = useRef(false)
+  const reply = (value: "once" | "always" | "reject") => {
+    if (replied.current) return
+    replied.current = true
+    onReply(value)
+  }
   return (
     <View style={[s.card, isDark && s.cardDark]}>
       <View style={s.header}>
@@ -20,13 +27,13 @@ export function PermissionPrompt({ permission, isDark, onReply }: Props) {
         {permission.permission}: {permission.patterns.join(", ")}
       </Text>
       <View style={s.actions}>
-        <TouchableOpacity style={[s.btn, s.deny]} onPress={() => onReply("reject")}>
+        <TouchableOpacity style={[s.btn, s.deny]} onPress={() => reply("reject")}>
           <Text style={s.denyText}>{t("chat.permissionPrompt.deny")}</Text>
         </TouchableOpacity>
-        <TouchableOpacity style={[s.btn, s.always, isDark && s.alwaysDark]} onPress={() => onReply("always")}>
+        <TouchableOpacity style={[s.btn, s.always, isDark && s.alwaysDark]} onPress={() => reply("always")}>
           <Text style={[s.alwaysText, isDark && s.textWhite]}>{t("chat.permissionPrompt.always")}</Text>
         </TouchableOpacity>
-        <TouchableOpacity style={[s.btn, s.allow, isDark && s.allowDark]} onPress={() => onReply("once")}>
+        <TouchableOpacity style={[s.btn, s.allow, isDark && s.allowDark]} onPress={() => reply("once")}>
           <Text style={[s.allowText, isDark && s.allowTextDark]}>{t("chat.permissionPrompt.allow")}</Text>
         </TouchableOpacity>
       </View>

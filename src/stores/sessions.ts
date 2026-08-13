@@ -1,5 +1,15 @@
 import { create } from "zustand"
-import { ApiError, type Session, type Message, type Part, type Event, type MessageWithParts, type Client } from "../lib/sdk"
+import {
+  ApiError,
+  isAuthError,
+  type Session,
+  type Message,
+  type Part,
+  type Event,
+  type MessageWithParts,
+  type Client,
+  type CursorPage,
+} from "../lib/sdk"
 import { useConnections } from "./connections"
 import { useSettings } from "./settings"
 import { addBreadcrumb } from "../lib/sentry"
@@ -7,6 +17,8 @@ import { AnalyticsEvent, track } from "../lib/analytics"
 import { extractPromptFromParts, type PromptFromParts } from "../lib/prompt-from-parts"
 import { mergeIncomingMessage } from "../lib/message-merge"
 import { isColdSessionLoad, isLiveEventForSession } from "../lib/session-load-reconcile"
+import { appendCursorPage, dedupePage, mergeCursorRefresh, prependCursorPage, truncateCommittedRevert } from "../lib/cursor-pagination"
+import { attachmentUri } from "../lib/session-request"
 
 // Fast-fail bound for the sessions list on app start/open. A dead or
 // unreachable saved server otherwise holds the sessions tab's spinner for the
@@ -15,7 +27,6 @@ import { isColdSessionLoad, isLiveEventForSession } from "../lib/session-load-re
 // second), so a short bound only affects the offline case we want to fail fast.
 const SESSION_LIST_TIMEOUT_MS = 10_000
 
-// Helper to convert API response to our internal format
 function parseMessages(response: MessageWithParts[]): { messages: Message[]; parts: Record<string, Part[]> } {
   const messages: Message[] = []
   const parts: Record<string, Part[]> = {}
@@ -42,10 +53,15 @@ interface SessionsState {
   sending: Record<string, boolean>
   loadingMore: boolean
   hasMore: boolean
+  loadingMoreSessions: boolean
+  hasMoreSessions: boolean
+  sessionCursor: CursorPage<Session>["cursor"]
+  messageCursor: CursorPage<MessageWithParts>["cursor"]
   error: string | null
 
   // Actions
   loadSessions: () => Promise<void>
+  loadMoreSessions: () => Promise<void>
   selectSession: (sessionID: string, directory?: string) => Promise<void>
   loadOlderMessages: () => Promise<void>
   createSession: (title?: string) => Promise<Session | null>
@@ -102,12 +118,15 @@ export const useSessions = create<SessionsState>((set, get) => ({
   sending: {},
   loadingMore: false,
   hasMore: false,
+  loadingMoreSessions: false,
+  hasMoreSessions: false,
+  sessionCursor: {},
+  messageCursor: {},
   error: null,
 
   loadSessions: async () => {
     const connState = useConnections.getState()
-    // Use a directory-less client so the server returns sessions from ALL projects,
-    // not just the one matching the active connection's directory header.
+    // Session rows carry their location, which scopes all subsequent calls.
     const client = connState.clientForDirectory(undefined) || connState.client
     if (!client) {
       set({ error: "No active connection" })
@@ -116,12 +135,35 @@ export const useSessions = create<SessionsState>((set, get) => ({
 
     try {
       set({ isLoading: true, error: null })
-      // A directory-less list includes sessions across projects. Each row carries
-      // its own directory into the session route so subsequent operations stay scoped.
-      const sessions = await client.session.list({ roots: true, limit: 50 }, SESSION_LIST_TIMEOUT_MS)
-      set({ sessions, isLoading: false })
+      const page = await client.session.page({ limit: 50, order: "desc" }, SESSION_LIST_TIMEOUT_MS)
+      set({
+        sessions: dedupePage(page),
+        sessionCursor: page.cursor,
+        hasMoreSessions: Boolean(page.cursor.next),
+        isLoading: false,
+      })
     } catch (error) {
       set({ error: "Failed to load sessions", isLoading: false })
+    }
+  },
+
+  loadMoreSessions: async () => {
+    const connState = useConnections.getState()
+    const client = connState.clientForDirectory(undefined) || connState.client
+    const cursor = get().sessionCursor.next
+    if (!client || !cursor || get().loadingMoreSessions) return
+
+    try {
+      set({ loadingMoreSessions: true })
+      const page = await client.session.page({ limit: 50, cursor }, SESSION_LIST_TIMEOUT_MS)
+      set((state) => ({
+        sessions: appendCursorPage(state.sessions, page),
+        sessionCursor: page.cursor,
+        hasMoreSessions: Boolean(page.cursor.next),
+        loadingMoreSessions: false,
+      }))
+    } catch {
+      set({ loadingMoreSessions: false })
     }
   },
 
@@ -153,29 +195,49 @@ export const useSessions = create<SessionsState>((set, get) => ({
         isLoading: isColdLoad ? true : state.isLoading,
         error: null,
         hasMore: false,
+        messageCursor: {},
         loadingMore: false,
         sending: { ...state.sending, [sessionID]: false },
       }))
 
-      const [session, messagesResponse] = await Promise.all([
+      const [session, messagePage] = await Promise.all([
         client.session.get(sessionID),
-        client.session.messages(sessionID, { limit: pageSize() }),
+        client.session.messagePage(sessionID, { limit: pageSize(), order: "desc" }),
       ])
 
       // A newer selectSession started while we were fetching — discard this
       // stale result so it can't clobber the newer selection.
       if (seq !== selectSeq) return
 
-      // Parse the API response format: array of { info, parts }
-      const { messages, parts } = parseMessages(messagesResponse)
+      const firstPage = mergeCursorRefresh([], {
+        data: messagePage.data.map((item) => item.info),
+        cursor: messagePage.cursor,
+      })
+      const { parts } = parseMessages(messagePage.data)
 
-      set({
-        currentSession: session,
-        messages,
-        parts,
-        isLoading: false,
-        // If we got exactly PAGE_SIZE messages, there are probably more
-        hasMore: messagesResponse.length >= pageSize(),
+      set((state) => {
+        if (!isColdLoad && state.currentSession?.id === sessionID) {
+          const merged = mergeCursorRefresh(
+            state.messages.filter((message) => !message.id.startsWith("temp-")),
+            { data: messagePage.data.map((item) => item.info), cursor: messagePage.cursor },
+          )
+          return {
+            currentSession: session,
+            messages: merged,
+            parts: { ...state.parts, ...parts },
+            isLoading: false,
+            hasMore: Boolean(messagePage.cursor.next),
+            messageCursor: messagePage.cursor,
+          }
+        }
+        return {
+          currentSession: session,
+          messages: firstPage,
+          parts,
+          isLoading: false,
+          hasMore: Boolean(messagePage.cursor.next),
+          messageCursor: messagePage.cursor,
+        }
       })
     } catch (err) {
       if (seq !== selectSeq) return
@@ -193,21 +255,28 @@ export const useSessions = create<SessionsState>((set, get) => ({
     try {
       set({ loadingMore: true })
 
-      // Fetch ALL messages for this session
-      const response = await client.session.messages(session.id)
-      const { messages: all, parts: allParts } = parseMessages(response)
+      const cursor = get().messageCursor.next
+      if (!cursor) {
+        set({ loadingMore: false, hasMore: false })
+        return
+      }
+      const page = await client.session.messagePage(session.id, { limit: pageSize(), cursor })
+      const parsed = parseMessages(page.data)
 
-      // Merge: use all messages from full fetch, but keep any temp/optimistic messages
-      const existing = get().messages
-      const temp = existing.filter((m) => m.id.startsWith("temp-"))
-      const merged = [...all, ...temp]
-
-      set({
-        messages: merged,
-        parts: { ...allParts, ...Object.fromEntries(temp.map((m) => [m.id, get().parts[m.id] || []])) },
-        loadingMore: false,
-        hasMore: false, // We loaded everything
-      })
+      set((state) => ({
+        ...(state.currentSession?.id !== session.id
+          ? {}
+          : {
+              messages: prependCursorPage(state.messages, {
+                data: page.data.map((item) => item.info),
+                cursor: page.cursor,
+              }),
+              parts: { ...parsed.parts, ...state.parts },
+              loadingMore: false,
+              hasMore: Boolean(page.cursor.next),
+              messageCursor: page.cursor,
+            }),
+      }))
     } catch (error) {
       console.error("Failed to load older messages:", error)
       set({ loadingMore: false })
@@ -231,6 +300,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
         messages: [],
         parts: {},
         hasMore: false,
+        messageCursor: {},
         loadingMore: false,
       })
       return created
@@ -258,6 +328,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
       }))
     } catch (error) {
       set({ error: "Failed to delete session" })
+      throw error
     }
   },
 
@@ -320,14 +391,27 @@ export const useSessions = create<SessionsState>((set, get) => ({
       }
       if (files) {
         for (const f of files) {
-          const url = f.base64 ? `data:${f.mime};base64,${f.base64}` : f.uri
+          const url = attachmentUri(f)
           promptParts.push({ type: "file", mime: f.mime, url, filename: f.filename })
         }
       }
 
-      // Await submission (POST to /prompt_async resolves fast, well before the
+      // Await submission (the v2 prompt request resolves fast, well before the
       // streamed response) so a failure here can propagate to the caller — SSE
       // events still update messages/parts/status in real-time on success.
+      if (session.revert) {
+        await client.session.commitRevert(session.id)
+        set((state) => {
+          if (state.currentSession?.id !== session.id) return state
+          const messages = truncateCommittedRevert(state.messages, session.revert!.messageID)
+          const messageIDs = new Set(messages.map((message) => message.id))
+          return {
+            currentSession: { ...state.currentSession, revert: undefined },
+            messages,
+            parts: Object.fromEntries(Object.entries(state.parts).filter(([messageID]) => messageIDs.has(messageID))),
+          }
+        })
+      }
       await client.session.prompt(session.id, { parts: promptParts, model, agent, variant })
     } catch (err) {
       console.error("[sendMessage] error:", err)
@@ -347,7 +431,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
     if (!client || !session) return
 
     try {
-      await client.session.abort(session.id)
+      await client.session.interrupt(session.id)
       // Mark only after the abort request succeeded — if it failed, the run
       // continues and any eventual completion is a genuine response.
       abortedSessions.add(session.id)
@@ -363,20 +447,30 @@ export const useSessions = create<SessionsState>((set, get) => ({
     if (!client || !session) return
 
     try {
-      const response = await client.session.messages(session.id)
-      const { messages, parts } = parseMessages(response)
-      set({ messages, parts })
+      const page = await client.session.messagePage(session.id, { limit: pageSize(), order: "desc" })
+      const { parts } = parseMessages(page.data)
+      set((state) => {
+        if (state.currentSession?.id !== session.id) return state
+        const messages = mergeCursorRefresh(
+          state.messages.filter((message) => !message.id.startsWith("temp-")),
+          { data: page.data.map((item) => item.info), cursor: page.cursor },
+        )
+        const messageIDs = new Set(messages.map((message) => message.id))
+        return {
+          messages,
+          parts: Object.fromEntries(
+            Object.entries({ ...state.parts, ...parts }).filter(([messageID]) => messageIDs.has(messageID)),
+          ),
+          hasMore: Boolean(page.cursor.next),
+          messageCursor: page.cursor,
+        }
+      })
     } catch (error) {
       set({ error: "Failed to refresh messages" })
     }
   },
 
-  // Marks messageID (and everything after it) as pending revert, so the
-  // user can re-edit and resend it. The server keeps the underlying
-  // messages until the next prompt runs cleanup, or unrevertSession() below
-  // undoes it — so this only flips session.revert, it doesn't delete
-  // anything itself. Returns the reverted message's text/files so the
-  // caller can prefill the composer.
+  // Stage the revert and return the selected prompt so the composer can edit it.
   revertToMessage: async (messageID) => {
     const client = clientFor(get().currentSession?.directory)
     const session = get().currentSession
@@ -389,10 +483,8 @@ export const useSessions = create<SessionsState>((set, get) => ({
       }))
       return { ok: true, ...extractPromptFromParts(get().parts[messageID]) }
     } catch (err) {
-      if (err instanceof ApiError) {
-        // Older servers (pre session.revert) 404 on this route — degrade
-        // gracefully instead of surfacing a generic error.
-        if (err.status === 404) return { ok: false, reason: "unsupported" }
+      if (err instanceof ApiError && err.status === 404) return { ok: false, reason: "unsupported" }
+      if (isAuthError(err)) {
         // Expired/invalid credentials — distinct from a generic failure so
         // the caller can point the user at reconnecting rather than "retry".
         if (err.status === 401 || err.status === 403) return { ok: false, reason: "auth" }
@@ -409,7 +501,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
     if (!client || !session) return
 
     try {
-      const updated = await client.session.unrevert(session.id)
+      const updated = await client.session.clearRevert(session.id)
       set((state) => ({
         currentSession: state.currentSession?.id === session.id ? updated : state.currentSession,
       }))
@@ -423,7 +515,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
     const { currentSession } = get()
     if (!currentSession) return
 
-    const props = (event as any).properties || {}
+    const props = event.properties
 
     switch (event.type) {
       case "message.updated": {

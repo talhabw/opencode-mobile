@@ -86,7 +86,7 @@ export async function probeConnection(url: string, auth?: { username: string; pa
   if (parsed.valid) {
     const base = `${parsed.scheme}://${parsed.host}:${parsed.port}`
     ;[health, root, internet] = await Promise.all([
-      timedFetch("health", `${base}/global/health`, { headers }),
+      timedFetch("health", `${base}/api/health`, { headers }),
       timedFetch("server-root", `${base}/`, { headers }, { requireOk: false }),
       timedFetch("internet", INTERNET_CHECK_URL),
     ])

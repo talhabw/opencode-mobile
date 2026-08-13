@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { stripTrailingSlash, parentOf, nameOf } from "./path-utils.ts"
+import { stripTrailingSlash, parentOf, nameOf, resolveServerPath } from "./path-utils.ts"
 
 // stripTrailingSlash -------------------------------------------------------
 
@@ -85,4 +85,14 @@ test("nameOf: root paths fall back to the trimmed input", () => {
 
 test("nameOf: bare segment is returned as-is", () => {
   assert.equal(nameOf("project"), "project")
+})
+
+test("resolveServerPath joins relative v2 entries to POSIX and Windows locations", () => {
+  assert.equal(resolveServerPath("/work/project", "src"), "/work/project/src")
+  assert.equal(resolveServerPath("C:\\work\\project", "src"), "C:\\work\\project\\src")
+})
+
+test("resolveServerPath preserves absolute entries", () => {
+  assert.equal(resolveServerPath("/work/project", "/tmp"), "/tmp")
+  assert.equal(resolveServerPath("C:\\work", "D:\\tmp"), "D:\\tmp")
 })

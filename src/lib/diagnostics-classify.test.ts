@@ -39,7 +39,7 @@ test("flags an IPv4 host as not-a-hostname, and a DNS name as a hostname", () =>
 })
 
 test("ignores path, query, and fragment when extracting the host", () => {
-  const p = parseUrl("http://host:9000/global/health?x=1#frag")
+  const p = parseUrl("http://host:9000/api/health?x=1#frag")
   assert.equal(p.host, "host")
   assert.equal(p.port, "9000")
 })
@@ -121,6 +121,8 @@ test("root reachable but internet probe down still classifies as health-failed, 
     probe({ ok: true }), // root (reachable)
   )
   assert.equal(r.classification, "health-failed")
+  assert.match(r.summary, /\/api\/health/)
+  assert.match(r.summary, /v2 server is required/)
 })
 
 test("server-unreachable adds MagicDNS hint only for hostnames, not IPs", () => {

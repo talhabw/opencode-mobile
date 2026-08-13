@@ -111,7 +111,7 @@ test("redactHostAndUrls: strips URLs, bare host occurrences, credentials", () =>
   const text = [
     `Target URL:  https://user:pw@${host}:4096/api`,
     `  scheme=https host=${host} port=4096 hostname=true`,
-    `probe start http://${host}:4096/global/health`,
+    `probe start http://${host}:4096/api/health`,
     "internet https://www.gstatic.com/generate_204 OK",
   ].join("\n")
   const out = redactHostAndUrls(text, [host])

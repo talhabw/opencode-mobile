@@ -1,171 +1,42 @@
-// SDK client wrapper for React Native
-// We create our own lightweight client that mirrors the opencode SDK patterns
-// but works in React Native environment
-// expo/fetch provides WinterCG-compliant fetch with ReadableStream support for SSE
+import { OpenCode, type OpenCodeClient } from "@opencode-ai/client"
 import { fetch as expoFetch } from "expo/fetch"
 import { buildRequestHeaders } from "./headers"
-import { SSEParser } from "./sse"
-import { apiErrorFor } from "./api-error"
-import { loadSessionList } from "./session-list"
+import { normalizeFetchInput } from "./fetch-input.ts"
+import { resolveServerPath } from "./path-utils"
+import { ApiAuthError, apiStatusFor, isAuthError } from "./api-error"
+import {
+  normalizeAgent,
+  normalizeCommand,
+  normalizeMessage,
+  normalizeProject,
+  normalizeProviderCatalog,
+  normalizeSession,
+  V2EventAdapter,
+  type Agent,
+  type Command,
+  type Event,
+  type FileEntry,
+  type Message,
+  type MessageWithParts,
+  type Part,
+  type Project,
+  type ProviderCatalog,
+  type Session,
+  isV2HealthResponse,
+  v2HealthError,
+} from "./protocol-v2"
 import type { FileRoot } from "./file-roots"
+import { promptRequest, selectedModel, type PromptPartInput } from "./session-request.ts"
 
-export { ApiAuthError, isAuthError } from "./api-error"
+export { ApiAuthError, isAuthError }
+export { V2_REQUIRED_ERROR } from "./protocol-v2"
+export type { Agent, Command, Event, FileEntry, Message, MessageWithParts, Part, Project, ProviderCatalog, Session }
 
 export interface ClientConfig {
   baseUrl: string
   directory?: string
-  auth?: {
-    username: string
-    password: string
-  }
-}
-
-export interface Session {
-  id: string
-  slug: string
-  projectID: string
-  directory: string
-  parentID?: string
-  title: string
-  version: string
-  share?: { url: string }
-  time: {
-    created: number
-    updated: number
-    compacting?: number
-    archived?: number
-  }
-  summary?: {
-    additions: number
-    deletions: number
-    files: number
-  }
-  // Present while a message (and everything after it) is pending revert —
-  // the server keeps the underlying messages until the next prompt/summarize
-  // call runs cleanup (or the revert is undone via session.unrevert).
-  revert?: {
-    messageID: string
-    partID?: string
-  }
-}
-
-export interface Message {
-  id: string
-  sessionID: string
-  role: "user" | "assistant"
-  parentID?: string
-  time: {
-    created: number
-    completed?: number
-  }
-  // User message fields
-  agent?: string
-  model?: { providerID: string; modelID: string }
-  // Assistant message fields
-  modelID?: string
-  providerID?: string
-  cost?: number
-  tokens?: {
-    input: number
-    output: number
-    reasoning?: number
-    cache?: { read: number; write: number }
-  }
-  error?: { message: string }
-  finish?: string
-}
-
-// API returns messages with parts embedded
-export interface MessageWithParts {
-  info: Message
-  parts: Part[]
-}
-
-export interface Part {
-  id: string
-  sessionID?: string
-  messageID: string
-  type:
-    | "text"
-    | "reasoning"
-    | "tool"
-    | "file"
-    | "snapshot"
-    | "patch"
-    | "step-start"
-    | "step-finish"
-    | "subtask"
-    | "retry"
-    | "compaction"
-    | "agent"
-  // Text / reasoning part
-  text?: string
-  // Tool part
-  tool?: string
-  callID?: string
-  state?: {
-    status: "pending" | "running" | "completed" | "error"
-    input?: unknown
-    output?: unknown
-    title?: string
-    error?: { message: string }
-    time?: { start?: number; end?: number }
-  }
-  // Timing
-  time?: { start?: number; end?: number }
-  // File part
-  mime?: string
-  url?: string
-  filename?: string
-}
-
-export interface Agent {
-  name: string
-  description?: string
-  mode: "subagent" | "primary" | "all"
-  native?: boolean
-  hidden?: boolean
-  topP?: number
-  temperature?: number
-  color?: string
-  model?: { modelID: string; providerID: string }
-  prompt?: string
-  options: Record<string, unknown>
-  steps?: number
-}
-
-export interface Command {
-  name: string
-  description?: string
-  agent?: string
-  model?: string
-  mcp?: boolean
-  template: string
-  subtask?: boolean
-  hints: string[]
-}
-
-export interface Project {
-  id: string
-  name?: string
-  path: {
-    cwd: string
-    root: string
-    absolute: string
-  }
-}
-
-export interface FileEntry {
-  name: string
-  path: string
-  absolute: string
-  type: "file" | "directory"
-  ignored: boolean
-}
-
-export interface Event {
-  type: string
-  properties: Record<string, unknown>
+  workspace?: string
+  auth?: { username: string; password: string }
 }
 
 export interface HealthResponse {
@@ -173,374 +44,301 @@ export interface HealthResponse {
   version: string
 }
 
-const REQUEST_TIMEOUT_MS = 30_000
+export interface CursorPage<T> {
+  data: T[]
+  cursor: { previous?: string | null; next?: string | null }
+}
 
-// Thrown by request() on a non-2xx response. Carries the HTTP status so
-// callers can distinguish e.g. 404 (older server, endpoint missing) from
-// other failures without parsing the message string.
 export class ApiError extends Error {
-  status: number
-  constructor(status: number, body: string) {
-    super(`API Error: ${status} - ${body}`)
+  readonly status: number
+  constructor(status: number, message: string) {
+    super(message)
     this.name = "ApiError"
     this.status = status
   }
 }
 
-function createHeaders(config: ClientConfig): HeadersInit {
-  return buildRequestHeaders(config)
+const DEFAULT_TIMEOUT_MS = 30_000
+
+function location(config: ClientConfig) {
+  if (!config.directory && !config.workspace) return undefined
+  return { directory: config.directory, workspace: config.workspace }
 }
 
-// `timeoutMs` lets specific callers (e.g. the onboarding health-check) fail
-// faster than the general REQUEST_TIMEOUT_MS used by real session calls.
-// Leave it unset to get the default.
-async function request<T>(
-  config: ClientConfig,
-  path: string,
-  options: RequestInit = {},
-  timeoutMs?: number,
-): Promise<T> {
-  const url = `${config.baseUrl}${path}`
-  const headers = { ...createHeaders(config), ...options.headers }
-  const response = await fetchWithTimeout(
-    url,
-    {
-      ...options,
-      headers,
-    },
-    timeoutMs,
-  )
-
-  if (!response.ok) {
-    const error = await response.text()
-    throw apiErrorFor(response.status, `API Error: ${response.status} - ${error}`)
-  }
-
-  return response.json()
-}
-
-async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Response> {
-  const parentSignal = options.signal
-  if (parentSignal?.aborted) throw new Error("Request aborted")
-
-  const controller = new AbortController()
-  let timedOut = false
-  const timeout = setTimeout(() => {
-    timedOut = true
-    controller.abort()
-  }, timeoutMs)
-  const onParentAbort = () => controller.abort()
-  parentSignal?.addEventListener("abort", onParentAbort)
-
+async function checked<T>(promise: Promise<T>): Promise<T> {
   try {
-    return await fetch(url, { ...options, signal: controller.signal })
+    return await promise
   } catch (error) {
-    if (timedOut) {
-      throw new Error(`Request timed out after ${timeoutMs}ms`)
-    }
+    const status = apiStatusFor(error)
+    if (status === 401 || status === 403) throw new ApiAuthError(status, "Authentication failed")
+    if (status !== undefined) throw new ApiError(status, `API Error: ${status}`)
     throw error
-  } finally {
-    clearTimeout(timeout)
-    parentSignal?.removeEventListener("abort", onParentAbort)
   }
 }
 
-export function createClient(config: ClientConfig) {
-  // Normalize once: a trailing slash on baseUrl (e.g. pasted into Advanced
-  // mode or the Edit screen) would otherwise survive into every
-  // `${config.baseUrl}${path}` concatenation below as a double slash, which
-  // every request then fails against (while the diagnostics probe, which
-  // reconstructs a clean URL, reports "works now"). A bare URL with no
-  // trailing slash is untouched.
-  config = { ...config, baseUrl: config.baseUrl.replace(/\/+$/, "") }
+function requestOptions(timeoutMs?: number): { options: { signal: AbortSignal }; dispose: () => void } {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), timeoutMs ?? DEFAULT_TIMEOUT_MS)
+  return { options: { signal: controller.signal }, dispose: () => clearTimeout(timeout) }
+}
+
+async function timed<T>(operation: (options: { signal: AbortSignal }) => Promise<T>, timeoutMs?: number): Promise<T> {
+  const request = requestOptions(timeoutMs)
+  try {
+    return await checked(operation(request.options))
+  } finally {
+    request.dispose()
+  }
+}
+
+export function createClient(input: ClientConfig) {
+  const config = { ...input, baseUrl: input.baseUrl.replace(/\/+$/, "") }
+  const headers = buildRequestHeaders({ auth: config.auth })
+  const raw = OpenCode.make({
+    baseUrl: config.baseUrl,
+    fetch: ((request, init) =>
+      expoFetch(normalizeFetchInput(request), init as Parameters<typeof expoFetch>[1])) as typeof globalThis.fetch,
+    headers,
+  })
+  const scopedLocation = location(config)
+  const permissionSessions = new Map<string, string>()
+  const questionSessions = new Map<string, string>()
+
+  const permissionSession = async (requestID: string): Promise<string> => {
+    const cached = permissionSessions.get(requestID)
+    if (cached) return cached
+    const response = await checked(raw.permission.request.list({ location: scopedLocation }))
+    const request = response.data.find((item) => item.id === requestID)
+    if (!request) throw new Error(`Unknown permission request: ${requestID}`)
+    permissionSessions.set(requestID, request.sessionID)
+    return request.sessionID
+  }
+
+  const questionSession = async (requestID: string): Promise<string> => {
+    const cached = questionSessions.get(requestID)
+    if (cached) return cached
+    const response = await checked(raw.question.request.list({ location: scopedLocation }))
+    const request = response.data.find((item) => item.id === requestID)
+    if (!request) throw new Error(`Unknown question request: ${requestID}`)
+    questionSessions.set(requestID, request.sessionID)
+    return request.sessionID
+  }
+
+  const messagePage = async (
+    sessionID: string,
+    params?: { limit?: number; cursor?: string; order?: "asc" | "desc" },
+  ): Promise<CursorPage<MessageWithParts>> => {
+    const response = await checked(raw.message.list({
+      sessionID,
+      limit: params?.limit,
+      cursor: params?.cursor,
+      order: params?.cursor ? undefined : params?.order,
+    }))
+    return { data: response.data.map((message) => normalizeMessage(message, sessionID)), cursor: response.cursor }
+  }
+
   return {
+    /** Official v2 Promise client for protocol surfaces not normalized by the app. */
+    protocol: raw,
     global: {
-      // `timeoutMs` overrides the default REQUEST_TIMEOUT_MS — used by the
-      // onboarding connection test to fail fast on a bad/unreachable IP
-      // instead of hanging for the full 30s (issue: first-run bounce).
-      health: (timeoutMs?: number) => request<HealthResponse>(config, "/global/health", {}, timeoutMs),
-      // SSE event stream - returns async iterator
-      // Pass an AbortSignal to cancel the connection
+       health: async (timeoutMs?: number): Promise<HealthResponse> => {
+         try {
+           const result = await timed((options) => raw.health.get(options), timeoutMs)
+           if (!isV2HealthResponse(result)) throw v2HealthError(result)
+           return result
+         } catch (error) {
+           if (error instanceof ApiError && error.status === 404) throw v2HealthError(error)
+           throw error
+         }
+       },
       async *events(signal?: AbortSignal): AsyncGenerator<Event> {
-        const url = `${config.baseUrl}/global/event`
-        const headers = createHeaders(config)
-        // Remove Content-Type for SSE (it's text/event-stream)
-        delete (headers as Record<string, string>)["Content-Type"]
-
-        // Must use expo/fetch for ReadableStream support on native
-        const response = await expoFetch(url, { headers, signal })
-        if (!response.ok || !response.body) {
-          throw apiErrorFor(response.status, `Failed to connect to event stream: ${response.status}`)
-        }
-
-        const reader = response.body.getReader()
-        const decoder = new TextDecoder()
-        const parser = new SSEParser()
-
-        let receivedFirstByte = false
+        const adapter = new V2EventAdapter()
         try {
-          while (true) {
-            const { done, value } = await reader.read()
-            if (done) {
-              console.log("[SSE] stream ended")
-              break
-            }
-
-            if (!receivedFirstByte) {
-              receivedFirstByte = true
-              console.log(`[SSE] first byte received (${value?.byteLength ?? 0} bytes)`)
-            }
-
-            for (const data of parser.push(decoder.decode(value, { stream: true }))) {
-              try {
-                yield JSON.parse(data)
-              } catch (err) {
-                console.warn("[SSE] Failed to parse event", {
-                  length: data.length,
-                  error: err instanceof Error ? err.message : String(err),
-                })
-              }
-            }
+          for await (const event of raw.event.subscribe({ signal })) {
+            for (const normalized of adapter.push(event)) yield normalized
           }
-        } finally {
-          reader.releaseLock()
+        } catch (error) {
+          const status = apiStatusFor(error)
+          if (status === 401 || status === 403) throw new ApiAuthError(status, "Authentication failed")
+          throw error
         }
       },
     },
-
     project: {
-      list: (timeoutMs?: number) => request<Project[]>(config, "/project", {}, timeoutMs),
-      current: (timeoutMs?: number) => request<Project>(config, "/project/current", {}, timeoutMs),
+      list: async (timeoutMs?: number): Promise<Project[]> =>
+         (await timed((options) => raw.project.list(options), timeoutMs)).map(normalizeProject),
+      current: async (timeoutMs?: number): Promise<Project> =>
+        normalizeProject(await timed((options) => raw.project.current({ location: scopedLocation }, options), timeoutMs)),
+      directories: (projectID: string) => checked(raw.project.directories({ projectID, location: scopedLocation })),
     },
-
-    // Server-side filesystem browsing, scoped to this client's directory
-    // (see ClientConfig.directory / x-opencode-directory header). Use
-    // clientForDirectory(dir) to get a client rooted at a specific folder,
-    // then list("." ) to enumerate its immediate children.
     file: {
-      list: (params: { path?: string } = {}) => {
-        const query = new URLSearchParams({ path: params.path ?? "." })
-        return request<FileEntry[]>(config, `/file?${query.toString()}`)
+      list: async (params: { path?: string } = {}): Promise<FileEntry[]> => {
+        const response = await checked(raw.file.list({ location: scopedLocation, path: params.path ?? "." }))
+        return response.data.map((entry) => ({
+          name: entry.path.split("/").filter(Boolean).at(-1) ?? entry.path,
+          path: entry.path,
+          absolute: resolveServerPath(config.directory, entry.path),
+          type: entry.type,
+          ignored: false,
+        }))
       },
-      // Enumerate the server's filesystem roots (mounted drives, home dir)
-      // to seed the directory browser's pinned top-level entries. Resolves
-      // to null on servers that don't yet expose GET /file/roots (older
-      // opencode builds) so callers fall back to manual path entry instead
-      // of crashing; other errors propagate like any other request.
-      roots: async (): Promise<FileRoot[] | null> => {
-        try {
-          return await request<FileRoot[]>(config, "/file/roots")
-        } catch (err) {
-          if (err instanceof ApiError && err.status === 404) return null
-          throw err
-        }
-      },
+      find: async (query: string, type?: "file" | "directory") =>
+        (await checked(raw.file.find({ location: scopedLocation, query, type }))).data,
+      read: (path: string) => checked(raw.file.read({ location: scopedLocation, path })),
+      roots: async (): Promise<FileRoot[] | null> => null,
     },
-
     path: {
-      get: (timeoutMs?: number) =>
-        request<{ home: string; state: string; config: string; worktree: string; directory: string }>(
-          config,
-          "/path",
-          {},
-          timeoutMs,
-        ),
+      get: async (timeoutMs?: number) => {
+        const result = await timed((options) => raw.location.get({ location: scopedLocation }, options), timeoutMs)
+        return { home: result.directory, state: "", config: "", worktree: result.project.directory, directory: result.directory }
+      },
     },
-
     session: {
-      // Prefer the GLOBAL experimental endpoint (all sessions across every
-      // directory) so the Recent Sessions list works without the user first
-      // picking a folder — a directory-less GET /session is directory-scoped
-      // and returns [] on servers whose active dir has no sessions. Shaping
-      // (roots filter, search, sort-by-updated, limit) happens client-side in
-      // loadSessionList; we fetch /experimental/session with no query params
-      // because the server applies `limit` before we can filter to roots.
-      // Falls back to the legacy /session path only on 404 (older servers).
-      list: (params?: { roots?: boolean; limit?: number; search?: string }, timeoutMs?: number): Promise<Session[]> =>
-        loadSessionList(
-          {
-            getExperimental: async (): Promise<Session[] | null> => {
-              const response = await fetchWithTimeout(
-                `${config.baseUrl}/experimental/session`,
-                {
-                  headers: createHeaders(config),
-                },
-                timeoutMs,
-              )
-              // Older servers lack this route — signal fallback to legacy /session.
-              if (response.status === 404) return null
-              if (!response.ok) {
-                const body = await response.text()
-                throw apiErrorFor(response.status, `API Error: ${response.status} - ${body}`)
-              }
-              return response.json()
-            },
-            getLegacy: (query) => request<Session[]>(config, `/session${query}`, {}, timeoutMs),
-          },
-          params,
-        ),
-
-      get: (sessionID: string) => request<Session>(config, `/session/${sessionID}`),
-
-      create: (params?: { title?: string }) =>
-        request<Session>(config, "/session", {
-          method: "POST",
-          body: JSON.stringify(params || {}),
-        }),
-
-      delete: (sessionID: string) => request<void>(config, `/session/${sessionID}`, { method: "DELETE" }),
-
-      update: (sessionID: string, params: { title?: string; time?: { archived?: number } }) =>
-        request<Session>(config, `/session/${sessionID}`, {
-          method: "PATCH",
-          body: JSON.stringify(params),
-        }),
-
-      messages: (sessionID: string, params?: { limit?: number }) => {
-        const query = new URLSearchParams()
-        if (params?.limit) query.set("limit", String(params.limit))
-        const qs = query.toString()
-        return request<MessageWithParts[]>(config, `/session/${sessionID}/message${qs ? `?${qs}` : ""}`)
+      page: async (
+        params?: { limit?: number; search?: string; cursor?: string; order?: "asc" | "desc" },
+        timeoutMs?: number,
+      ): Promise<CursorPage<Session>> => {
+        const response = await timed((options) => raw.session.list({
+            limit: params?.limit,
+            search: params?.search,
+            cursor: params?.cursor,
+             order: params?.cursor ? undefined : params?.order ?? "desc",
+            directory: config.directory,
+            workspace: config.workspace,
+          }, options), timeoutMs)
+        return { data: response.data.map(normalizeSession), cursor: response.cursor }
       },
-
-      // Sends a message and returns the response
-      // Fire-and-forget async prompt - SSE events drive all real-time updates
-      prompt: async (
-        sessionID: string,
-        params: {
-          parts: Array<{ type: "text"; text: string } | { type: "file"; mime: string; url: string; filename?: string }>
-          model?: { providerID: string; modelID: string }
-          agent?: string
-          variant?: string
-        },
-      ): Promise<void> => {
-        const url = `${config.baseUrl}/session/${sessionID}/prompt_async`
-        const headers = createHeaders(config)
-        const body = JSON.stringify(params)
-        const response = await fetchWithTimeout(url, {
-          method: "POST",
-          headers,
-          body,
-        })
-
-        if (!response.ok) {
-          const error = await response.text()
-          throw new Error(`Failed to send message: ${response.status} - ${error}`)
-        }
+      list: async (params?: { roots?: boolean; limit?: number; search?: string; cursor?: string }, timeoutMs?: number): Promise<Session[]> => {
+        const response = await timed((options) => raw.session.list({
+          limit: params?.limit,
+          search: params?.search,
+          cursor: params?.cursor,
+          order: params?.cursor ? undefined : "desc",
+          directory: config.directory,
+          workspace: config.workspace,
+        }, options), timeoutMs)
+        return response.data.map(normalizeSession)
       },
-
-      command: async (
-        sessionID: string,
-        params: {
-          command: string
-          arguments: string
-          agent?: string
-          model?: string
-          variant?: string
-          parts?: Array<{ type: "file"; mime: string; url: string; filename?: string }>
-        },
-      ): Promise<void> => {
-        const url = `${config.baseUrl}/session/${sessionID}/command`
-        const headers = createHeaders(config)
-
-        const response = await fetchWithTimeout(url, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({ ...params, sessionID }),
-        })
-
-        if (!response.ok) {
-          const error = await response.text()
-          throw new Error(`Failed to run command: ${response.status} - ${error}`)
-        }
+      get: async (sessionID: string): Promise<Session> => normalizeSession(await checked(raw.session.get({ sessionID }))),
+      create: async (params?: { title?: string }): Promise<Session> => normalizeSession(await checked(raw.session.create({
+        title: params?.title,
+        location: config.directory ? { directory: config.directory, workspaceID: config.workspace } : undefined,
+      }))),
+      delete: (sessionID: string) => checked(raw.session.remove({ sessionID })),
+      rename: async (sessionID: string, title: string): Promise<Session> => {
+        await checked(raw.session.rename({ sessionID, title }))
+        return normalizeSession(await checked(raw.session.get({ sessionID })))
       },
-
-      abort: (sessionID: string) => request<boolean>(config, `/session/${sessionID}/abort`, { method: "POST" }),
-
-      diff: (sessionID: string, messageID?: string) => {
-        const qs = messageID ? `?messageID=${messageID}` : ""
-        return request<unknown[]>(config, `/session/${sessionID}/diff${qs}`)
+      messagePage,
+      messages: async (sessionID: string, params?: { limit?: number; cursor?: string }): Promise<MessageWithParts[]> =>
+        (await messagePage(sessionID, { ...params, order: "asc" })).data,
+      active: () => checked(raw.session.active()),
+      prompt: async (sessionID: string, params: {
+        parts: PromptPartInput[]
+        model?: { providerID: string; modelID: string }
+        agent?: string
+        variant?: string
+      }): Promise<void> => {
+        if (params.agent) await checked(raw.session.switchAgent({ sessionID, agent: params.agent }))
+        if (params.model) await checked(raw.session.switchModel({
+          sessionID,
+          model: selectedModel(params.model, params.variant)!,
+        }))
+        await checked(raw.session.prompt({ sessionID, ...promptRequest(params.parts) }))
       },
-
-      // Marks messageID (and everything after it) as pending revert. The
-      // underlying messages aren't deleted until the next prompt runs
-      // cleanup, or the revert is undone with unrevert() below.
-      revert: (sessionID: string, messageID: string, partID?: string) =>
-        request<Session>(config, `/session/${sessionID}/revert`, {
-          method: "POST",
-          body: JSON.stringify(partID ? { messageID, partID } : { messageID }),
-        }),
-
-      unrevert: (sessionID: string) =>
-        request<Session>(config, `/session/${sessionID}/unrevert`, {
-          method: "POST",
-        }),
+      command: async (sessionID: string, params: {
+        command: string
+        arguments: string
+        agent?: string
+        model?: { providerID: string; modelID: string }
+        variant?: string
+        parts?: Array<{ type: "file"; mime: string; url: string; filename?: string }>
+      }): Promise<void> => {
+        await checked(raw.session.command({
+          sessionID,
+          command: params.command,
+          arguments: params.arguments,
+          agent: params.agent,
+          model: selectedModel(params.model, params.variant),
+          files: params.parts?.map((part) => ({ uri: part.url, name: part.filename })),
+        }))
+      },
+      switchModel: (sessionID: string, model: { providerID: string; modelID: string; variant?: string }) =>
+        checked(raw.session.switchModel({ sessionID, model: { providerID: model.providerID, id: model.modelID, variant: model.variant } })),
+      switchAgent: (sessionID: string, agent: string) => checked(raw.session.switchAgent({ sessionID, agent })),
+      interrupt: (sessionID: string, continueSession?: boolean) => checked(raw.session.interrupt({ sessionID, continue: continueSession })),
+      revert: async (sessionID: string, messageID: string): Promise<Session> => {
+        await checked(raw.session.revert.stage({ sessionID, messageID }))
+        return normalizeSession(await checked(raw.session.get({ sessionID })))
+      },
+      clearRevert: async (sessionID: string): Promise<Session> => {
+        await checked(raw.session.revert.clear({ sessionID }))
+        return normalizeSession(await checked(raw.session.get({ sessionID })))
+      },
+      commitRevert: (sessionID: string) => checked(raw.session.revert.commit({ sessionID })),
     },
-
     permission: {
-      list: () =>
-        request<Array<{ id: string; sessionID: string; tool: string; input: unknown }>>(config, "/permission"),
-
-      reply: (requestID: string, reply: "once" | "always" | "reject") =>
-        request<boolean>(config, `/permission/${requestID}/reply`, {
-          method: "POST",
-          body: JSON.stringify({ reply }),
-        }),
+      list: async () => {
+        const response = await checked(raw.permission.request.list({ location: scopedLocation }))
+        for (const request of response.data) permissionSessions.set(request.id, request.sessionID)
+        return response.data.map((request) => ({
+          ...request,
+          tool: request.source && { messageID: request.source.messageID, callID: request.source.id },
+          permission: request.action,
+          patterns: request.resources,
+        }))
+      },
+      reply: async (requestID: string, reply: "once" | "always" | "reject", explicitSessionID?: string) => {
+        const sessionID = explicitSessionID ?? await permissionSession(requestID)
+        await checked(raw.permission.reply({ sessionID, requestID, reply }))
+        permissionSessions.delete(requestID)
+        return true
+      },
     },
-
     question: {
-      list: () => request<Array<{ id: string; sessionID: string; questions: unknown[] }>>(config, "/question"),
-
-      reply: (requestID: string, answers: string[][]) =>
-        request<boolean>(config, `/question/${requestID}/reply`, {
-          method: "POST",
-          body: JSON.stringify({ answers }),
-        }),
-
-      reject: (requestID: string) =>
-        request<boolean>(config, `/question/${requestID}/reject`, {
-          method: "POST",
-        }),
+      list: async () => {
+        const response = await checked(raw.question.request.list({ location: scopedLocation }))
+        for (const request of response.data) questionSessions.set(request.id, request.sessionID)
+        return response.data.map((request) => ({ ...request, tool: request.tool && { messageID: request.tool.messageID, callID: request.tool.id } }))
+      },
+      reply: async (requestID: string, answers: string[][], explicitSessionID?: string) => {
+        const sessionID = explicitSessionID ?? await questionSession(requestID)
+        await checked(raw.question.reply({ sessionID, requestID, answers }))
+        questionSessions.delete(requestID)
+        return true
+      },
+      reject: async (requestID: string, explicitSessionID?: string) => {
+        const sessionID = explicitSessionID ?? await questionSession(requestID)
+        await checked(raw.question.reject({ sessionID, requestID }))
+        questionSessions.delete(requestID)
+        return true
+      },
     },
-
-    agent: {
-      list: () => request<Agent[]>(config, "/agent"),
+    agent: { list: async (): Promise<Agent[]> => (await checked(raw.agent.list({ location: scopedLocation }))).data.map(normalizeAgent) },
+    command: { list: async (): Promise<Command[]> => (await checked(raw.command.list({ location: scopedLocation }))).data.map(normalizeCommand) },
+    model: {
+      list: async () => (await checked(raw.model.list({ location: scopedLocation }))).data,
+      default: async () => (await checked(raw.model.default({ location: scopedLocation }))).data,
     },
-
-    command: {
-      list: () => request<Command[]>(config, "/command"),
-    },
-
     provider: {
-      list: () =>
-        request<{
-          all: Array<{
-            id: string
-            name: string
-            models: Record<
-              string,
-              {
-                id: string
-                name: string
-                attachment: boolean
-                reasoning: boolean
-                tool_call: boolean
-                cost?: { input: number; output: number }
-                limit: { context: number; output: number }
-                status?: "alpha" | "beta" | "deprecated" | "active"
-                variants?: Record<string, { reasoningEffort?: string }>
-              }
-            >
-          }>
-          default: Record<string, string>
-          connected: string[]
-        }>(config, "/provider"),
+      list: async (): Promise<ProviderCatalog> => {
+        const [providers, models, defaultModel] = await Promise.all([
+          checked(raw.provider.list({ location: scopedLocation })),
+          checked(raw.model.list({ location: scopedLocation })),
+          checked(raw.model.default({ location: scopedLocation })),
+        ])
+        return normalizeProviderCatalog(providers.data, models.data, defaultModel.data)
+      },
     },
-
-    config: {
-      get: () => request<unknown>(config, "/config"),
+    config: { get: () => checked(raw.config.get({ location: scopedLocation })) },
+    vcs: {
+      get: async () => (await checked(raw.vcs.get({ location: scopedLocation }))).data,
+      status: async () => (await checked(raw.vcs.status({ location: scopedLocation }))).data,
+      diff: async (mode: "working" | "branch" = "working", context?: number) =>
+        (await checked(raw.vcs.diff({ location: scopedLocation, mode, context }))).data,
     },
   }
 }
 
 export type Client = ReturnType<typeof createClient>
+export type RawClient = OpenCodeClient

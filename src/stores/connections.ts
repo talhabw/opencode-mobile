@@ -2,7 +2,7 @@ import { create } from "zustand"
 import * as SecureStore from "expo-secure-store"
 import * as Crypto from "expo-crypto"
 import type { ServerConnection, ConnectionType } from "../lib/types"
-import { createClient, type Client, type Project } from "../lib/sdk"
+import { createClient, type Client, type Project, V2_REQUIRED_ERROR } from "../lib/sdk"
 import { addBreadcrumb } from "../lib/sentry"
 import { AnalyticsEvent, classifyConnectionError, track, type ConnectionTestSource } from "../lib/analytics"
 import { buildAuth } from "../lib/auth"
@@ -15,7 +15,7 @@ const MAX_RECENT_DIRS = 10
 // A bad IP (unreachable host, wrong port) otherwise hangs for the full 30s
 // general request timeout before the user sees a "connection failed" error —
 // a first-run bounce driver. The interactive connect flow can afford to fail
-// faster since a real server responds to /global/health in well under a
+// faster since a real v2 server responds to /api/health in well under a
 // second; this does NOT affect the timeout used for real session traffic.
 const CONNECTION_TEST_TIMEOUT_MS = 12_000
 // Startup metadata probe (project.current / path.get). A dead/unreachable
@@ -98,8 +98,14 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
         SecureStore.getItemAsync(CONNECTIONS_KEY),
         SecureStore.getItemAsync(RECENT_DIRS_KEY),
       ])
-      const connections: ServerConnection[] = stored ? JSON.parse(stored) : []
-      const recentDirectories: string[] = recentRaw ? JSON.parse(recentRaw) : []
+       const parsedConnections: unknown = stored ? JSON.parse(stored) : []
+       const connections: ServerConnection[] = Array.isArray(parsedConnections)
+         ? parsedConnections.filter((value): value is ServerConnection => isSavedConnection(value))
+         : []
+       const parsedRecent: unknown = recentRaw ? JSON.parse(recentRaw) : []
+       const recentDirectories: string[] = Array.isArray(parsedRecent)
+         ? parsedRecent.filter((value): value is string => typeof value === "string")
+         : []
 
       // Find active connection
       const active = connections.find((c) => c.active) || null
@@ -288,9 +294,9 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
       track(AnalyticsEvent.ConnectionSucceeded, { source })
       return { ok: true }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+       const message = error instanceof Error ? error.message : String(error)
       track(AnalyticsEvent.ConnectionFailed, { source, error_class: classifyConnectionError(message) })
-      return { ok: false, error: message }
+       return { ok: false, error: message === "API Error: 404" ? V2_REQUIRED_ERROR : message }
     }
   },
 
@@ -385,3 +391,9 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
     await SecureStore.setItemAsync(RECENT_DIRS_KEY, JSON.stringify(updated))
   },
 }))
+
+function isSavedConnection(value: unknown): value is ServerConnection {
+  if (!value || typeof value !== "object") return false
+  const connection = value as Partial<ServerConnection>
+  return typeof connection.id === "string" && typeof connection.url === "string" && typeof connection.name === "string"
+}

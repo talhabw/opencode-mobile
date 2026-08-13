@@ -16,6 +16,7 @@ const TOOL_ICONS: Record<string, string> = {
   write: "create-outline",
   apply_patch: "git-merge-outline",
   bash: "terminal-outline",
+  shell: "terminal-outline",
   task: "git-branch-outline",
   todowrite: "checkbox-outline",
   todoread: "checkbox-outline",
@@ -281,6 +282,7 @@ function ToolDetail({ tool, isDark }: { tool: Part; isDark: boolean }) {
 
   switch (name) {
     case "bash":
+    case "shell":
       return <BashDetail input={input} output={output} isDark={isDark} />
     case "read":
       return <ReadDetail input={input} isDark={isDark} />

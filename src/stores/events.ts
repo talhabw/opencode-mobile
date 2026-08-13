@@ -9,10 +9,13 @@ import { AnalyticsEvent, track } from "../lib/analytics"
 import { recordSuccessfulSession } from "../lib/store-review"
 import { isAuthError } from "../lib/api-error"
 import { isSessionActuallyIdle } from "../lib/session-status-reconcile"
-import type { Client, Part, Session, Message } from "../lib/sdk"
+import { eventSessionID, mergeSendingState, reconnectDelay, resyncPlan, shouldRefreshCanonicalMessages } from "../lib/event-reconcile"
+import type { Client, Event, Part, Session, Message } from "../lib/sdk"
 
 // Session status from the server
 type SessionStatus = { type: "idle" } | { type: "busy" } | { type: "retry"; attempt: number; message: string }
+type PendingPermission = Awaited<ReturnType<Client["permission"]["list"]>>[number]
+type PendingQuestion = Awaited<ReturnType<Client["question"]["list"]>>[number]
 
 interface EventsState {
   connected: boolean
@@ -28,32 +31,8 @@ interface EventsState {
   sessionStatus: Record<string, SessionStatus>
   statusText: Record<string, string>
   // Permissions & questions (pending per session)
-  permissions: Record<
-    string,
-    Array<{
-      id: string
-      sessionID: string
-      permission: string
-      patterns: string[]
-      metadata: Record<string, unknown>
-      tool?: { messageID: string; callID: string }
-    }>
-  >
-  questions: Record<
-    string,
-    Array<{
-      id: string
-      sessionID: string
-      questions: Array<{
-        question: string
-        header: string
-        options: Array<{ label: string; description: string }>
-        multiple?: boolean
-        custom?: boolean
-      }>
-      tool?: { messageID: string; callID: string }
-    }>
-  >
+  permissions: Record<string, PendingPermission[]>
+  questions: Record<string, PendingQuestion[]>
 
   connect: () => void
   disconnect: () => void
@@ -61,6 +40,16 @@ interface EventsState {
 
 let controller: AbortController | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+const messageRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>()
+let sessionRefreshTimer: ReturnType<typeof setTimeout> | null = null
+const resolvedPermissions = new Set<string>()
+const resolvedQuestions = new Set<string>()
+
+export function markPendingResolved(kind: "permission" | "question", requestID: string, resolved: boolean) {
+  const requests = kind === "permission" ? resolvedPermissions : resolvedQuestions
+  if (resolved) requests.add(requestID)
+  else requests.delete(requestID)
+}
 
 // Sessions that emitted session.error since they last went busy. SessionStatus
 // has no error variant — an errored session still ends with a busy -> idle
@@ -68,7 +57,6 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 // toward the once-ever store review prompt.
 const erroredSessions = new Set<string>()
 
-const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 15000] as const
 const STABLE_CONNECTION_MS = 10_000
 const PROLONGED_DISCONNECT_MS = 30_000
 
@@ -78,16 +66,101 @@ const PROLONGED_DISCONNECT_MS = 30_000
 export async function refreshPending(client: Client, sessionID: string) {
   try {
     const [perms, questions] = await Promise.all([client.permission.list(), client.question.list()])
-    const sessionPerms = (perms || []).filter((p: Record<string, unknown>) => p.sessionID === sessionID)
-    const sessionQuestions = (questions || []).filter((q: Record<string, unknown>) => q.sessionID === sessionID)
+    const permissionIDs = new Set(perms.map((request) => request.id))
+    const questionIDs = new Set(questions.map((request) => request.id))
+    for (const id of resolvedPermissions) if (!permissionIDs.has(id)) resolvedPermissions.delete(id)
+    for (const id of resolvedQuestions) if (!questionIDs.has(id)) resolvedQuestions.delete(id)
+    const sessionPerms = perms.filter((request) => request.sessionID === sessionID && !resolvedPermissions.has(request.id))
+    const sessionQuestions = questions.filter((request) => request.sessionID === sessionID && !resolvedQuestions.has(request.id))
     useEvents.setState((state) => ({
-      permissions: { ...state.permissions, [sessionID]: sessionPerms as any },
-      questions: { ...state.questions, [sessionID]: sessionQuestions as any },
+      permissions: { ...state.permissions, [sessionID]: sessionPerms },
+      questions: { ...state.questions, [sessionID]: sessionQuestions },
     }))
   } catch (err) {
     console.warn("[Events] Failed to refresh pending:", err)
   }
 }
+
+function groupPending<T extends { id: string; sessionID: string }>(items: T[], resolved: Set<string>): Record<string, T[]> {
+  const grouped: Record<string, T[]> = {}
+  for (const item of items) {
+    if (resolved.has(item.id)) continue
+    grouped[item.sessionID] = [...(grouped[item.sessionID] ?? []), item]
+  }
+  return grouped
+}
+
+async function authoritativeResync(client: Client) {
+  const sessions = useSessions.getState()
+  const plan = resyncPlan(Boolean(sessions.currentSession))
+  const pending = plan.pending ? Promise.all([client.permission.list(), client.question.list()]) : null
+  const active = plan.active ? client.session.active() : null
+  await Promise.all([
+    plan.sessions ? sessions.loadSessions() : undefined,
+    plan.messages ? sessions.refreshMessages() : undefined,
+    pending?.then(([permissions, questions]) => {
+      const permissionIDs = new Set(permissions.map((request) => request.id))
+      const questionIDs = new Set(questions.map((request) => request.id))
+      for (const id of resolvedPermissions) if (!permissionIDs.has(id)) resolvedPermissions.delete(id)
+      for (const id of resolvedQuestions) if (!questionIDs.has(id)) resolvedQuestions.delete(id)
+      useEvents.setState({
+        permissions: groupPending(permissions, resolvedPermissions),
+        questions: groupPending(questions, resolvedQuestions),
+      })
+    }),
+    active?.then((running) => {
+      useEvents.setState((state) => {
+        const sessionStatus = { ...state.sessionStatus }
+        for (const sessionID of Object.keys(sessionStatus)) {
+          if (!(sessionID in running) && sessionStatus[sessionID].type === "busy") sessionStatus[sessionID] = { type: "idle" }
+        }
+        for (const sessionID of Object.keys(running)) sessionStatus[sessionID] = { type: "busy" }
+        return { sessionStatus }
+      })
+      useSessions.setState((state) => ({ sending: mergeSendingState(state.sending, running) }))
+    }),
+  ])
+}
+
+function scheduleCanonicalRefresh(event: Event) {
+  if (!shouldRefreshCanonicalMessages(event)) return
+  const sessionID = eventSessionID(event)
+  if (!sessionID || useSessions.getState().currentSession?.id !== sessionID) return
+  const previous = messageRefreshTimers.get(sessionID)
+  if (previous) clearTimeout(previous)
+  messageRefreshTimers.set(sessionID, setTimeout(() => {
+    messageRefreshTimers.delete(sessionID)
+    if (useSessions.getState().currentSession?.id === sessionID) void useSessions.getState().refreshMessages()
+  }, 150))
+}
+
+function scheduleSessionRefresh(type: string) {
+  if (!["session.created", "session.renamed", "session.moved", "session.deleted"].includes(type)) return
+  if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
+  sessionRefreshTimer = setTimeout(() => {
+    sessionRefreshTimer = null
+    void useSessions.getState().loadSessions()
+  }, 150)
+}
+
+function value<T>(properties: Record<string, unknown>, key: string, guard: (input: unknown) => input is T): T | undefined {
+  const input = properties[key]
+  return guard(input) ? input : undefined
+}
+
+const isString = (input: unknown): input is string => typeof input === "string"
+const isSessionStatus = (input: unknown): input is SessionStatus =>
+  Boolean(input && typeof input === "object" && "type" in input && ["idle", "busy", "retry"].includes(String(input.type)))
+const isMessage = (input: unknown): input is Message =>
+  Boolean(input && typeof input === "object" && "id" in input && typeof input.id === "string" && "sessionID" in input && typeof input.sessionID === "string")
+const isPart = (input: unknown): input is Part =>
+  Boolean(input && typeof input === "object" && "id" in input && typeof input.id === "string" && "messageID" in input && typeof input.messageID === "string")
+const isSession = (input: unknown): input is Session =>
+  Boolean(input && typeof input === "object" && "id" in input && typeof input.id === "string" && "directory" in input && typeof input.directory === "string")
+const isPermission = (input: unknown): input is PendingPermission =>
+  Boolean(input && typeof input === "object" && "id" in input && typeof input.id === "string" && "sessionID" in input && typeof input.sessionID === "string" && "permission" in input && typeof input.permission === "string" && "patterns" in input && Array.isArray(input.patterns))
+const isQuestion = (input: unknown): input is PendingQuestion =>
+  Boolean(input && typeof input === "object" && "id" in input && typeof input.id === "string" && "sessionID" in input && typeof input.sessionID === "string" && "questions" in input && Array.isArray(input.questions))
 
 // Re-sync any session currently marked "busy" against the server after an
 // SSE reconnect. sessionStatus/sending are SSE-driven and there is normally
@@ -175,12 +248,7 @@ export const useEvents = create<EventsState>((set, get) => ({
     // Run in background
     ;(async () => {
       let reconnectScheduled = false
-      // True if this connect() call is resuming after a prior disconnect —
-      // gates the one-time busy-session resync below so a cold app start
-      // (sessionStatus is always empty then) never triggers it, and a run of
-      // failed retries can't re-arm the check on every attempt.
-      const isReconnect = get().reconnectAttempts > 0
-      let resyncedAfterReconnect = false
+      let resynced = false
       const stableTimer = setTimeout(() => {
         if (!currentController.signal.aborted) {
           set({ reconnectAttempts: 0, lastDisconnectAt: null })
@@ -207,8 +275,7 @@ export const useEvents = create<EventsState>((set, get) => ({
           })
         }
 
-        const baseDelay = RECONNECT_DELAYS_MS[Math.min(reconnectAttempts - 1, RECONNECT_DELAYS_MS.length - 1)]
-        const jitteredDelay = Math.min(15_000, Math.round(baseDelay * (0.75 + Math.random() * 0.5)))
+        const jitteredDelay = reconnectDelay(reconnectAttempts, Math.random())
         console.warn(`[SSE] Connection lost, reconnecting in ${jitteredDelay}ms:`, reason)
         addBreadcrumb({
           category: "sse",
@@ -226,23 +293,25 @@ export const useEvents = create<EventsState>((set, get) => ({
         for await (const event of client.global.events(currentController.signal)) {
           if (currentController.signal.aborted) break
 
-          // The stream is genuinely live again (we're actually receiving
-          // data, not just optimistically marked "connected") — resync once
-          // per reconnect, not on every event.
-          if (isReconnect && !resyncedAfterReconnect) {
-            resyncedAfterReconnect = true
-            void resyncBusySessions()
+          // The stream is now live. Rebuild volatile state once per physical
+          // subscription so cold starts and reconnects cannot retain gaps.
+          if (!resynced) {
+            resynced = true
+            void authoritativeResync(client).then(resyncBusySessions).catch((error) => {
+              console.warn("[Events] Failed authoritative resync:", error)
+            })
           }
 
-          const payload = (event as any).payload || event
-          const type = payload.type as string
-          const props = payload.properties || {}
+          const type = event.type
+          const props = event.properties
+          scheduleCanonicalRefresh(event)
+          scheduleSessionRefresh(type)
 
           switch (type) {
             case "session.status": {
-              const sessionID = props.sessionID as string
-              const status = props.status as SessionStatus
-              if (!sessionID) break
+              const sessionID = value(props, "sessionID", isString)
+              const status = value(props, "status", isSessionStatus)
+              if (!sessionID || !status) break
 
               // Detect busy → idle transition for completion notification
               const previous = get().sessionStatus[sessionID]
@@ -302,37 +371,37 @@ export const useEvents = create<EventsState>((set, get) => ({
             }
 
             case "message.updated": {
-              const info = props.info as Message | undefined
+              const info = value(props, "info", isMessage)
               if (!info) break
-              useSessions.getState().handleEvent({ type, properties: { info } } as any)
+              useSessions.getState().handleEvent({ type, properties: { info } })
               break
             }
 
             case "message.part.updated": {
-              const part = props.part as Part | undefined
+              const part = value(props, "part", isPart)
               if (!part) break
 
               // Update status text from the latest part
-              const sessionID = (part as any).sessionID as string
+              const sessionID = part.sessionID
               if (sessionID) {
                 set((state) => ({
                   statusText: { ...state.statusText, [sessionID]: statusFromPart(part) },
                 }))
               }
 
-              useSessions.getState().handleEvent({ type, properties: { part } } as any)
+              useSessions.getState().handleEvent({ type, properties: { part } })
               break
             }
 
             case "session.updated": {
-              const info = props.info as Session | undefined
+              const info = value(props, "info", isSession)
               if (!info) break
-              useSessions.getState().handleEvent({ type, properties: { info } } as any)
+              useSessions.getState().handleEvent({ type, properties: { info } })
               break
             }
 
             case "session.created": {
-              const info = props.info as Session | undefined
+              const info = value(props, "info", isSession)
               if (!info) break
               // Add to sessions list
               useSessions.setState((state) => {
@@ -344,8 +413,11 @@ export const useEvents = create<EventsState>((set, get) => ({
             }
 
             case "session.error": {
-              const error = props.error as { message?: string } | undefined
-              const sessionID = props.sessionID as string
+              const errorValue = props.error
+              const error = errorValue && typeof errorValue === "object" && "message" in errorValue && typeof errorValue.message === "string"
+                ? { message: errorValue.message }
+                : undefined
+              const sessionID = value(props, "sessionID", isString)
               if (!sessionID) break
               // Mark so the eventual busy -> idle transition is not counted
               // as a success for the store review prompt
@@ -371,8 +443,9 @@ export const useEvents = create<EventsState>((set, get) => ({
             }
 
             case "permission.asked": {
-              const req = props as any
-              if (!req.id || !req.sessionID) break
+              if (!isPermission(props)) break
+              const req = props
+              if (resolvedPermissions.has(req.id)) break
               const existing = get().permissions[req.sessionID] || []
               if (existing.some((item) => item.id === req.id)) break
               set((state) => ({
@@ -400,9 +473,10 @@ export const useEvents = create<EventsState>((set, get) => ({
             }
 
             case "permission.replied": {
-              const sessionID = props.sessionID as string
-              const requestID = props.requestID as string
+              const sessionID = value(props, "sessionID", isString)
+              const requestID = value(props, "requestID", isString)
               if (!sessionID || !requestID) break
+              resolvedPermissions.add(requestID)
               set((state) => ({
                 permissions: {
                   ...state.permissions,
@@ -413,8 +487,9 @@ export const useEvents = create<EventsState>((set, get) => ({
             }
 
             case "question.asked": {
-              const req = props as any
-              if (!req.id || !req.sessionID) break
+              if (!isQuestion(props)) break
+              const req = props
+              if (resolvedQuestions.has(req.id)) break
               const existing = get().questions[req.sessionID] || []
               if (existing.some((item) => item.id === req.id)) break
               set((state) => ({
@@ -436,9 +511,10 @@ export const useEvents = create<EventsState>((set, get) => ({
 
             case "question.replied":
             case "question.rejected": {
-              const sessionID = props.sessionID as string
-              const requestID = props.requestID as string
+              const sessionID = value(props, "sessionID", isString)
+              const requestID = value(props, "requestID", isString)
               if (!sessionID || !requestID) break
+              resolvedQuestions.add(requestID)
               set((state) => ({
                 questions: {
                   ...state.questions,
@@ -488,6 +564,12 @@ export const useEvents = create<EventsState>((set, get) => ({
     }
     controller?.abort()
     controller = null
+    for (const timer of messageRefreshTimers.values()) clearTimeout(timer)
+    messageRefreshTimers.clear()
+    if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
+    sessionRefreshTimer = null
+    resolvedPermissions.clear()
+    resolvedQuestions.clear()
     erroredSessions.clear()
     abortedSessions.clear()
     set({

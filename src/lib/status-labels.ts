@@ -14,6 +14,7 @@ export const TOOL_STATUS: Record<string, string> = {
   write: "Making edits...",
   apply_patch: "Making edits...",
   bash: "Running command...",
+  shell: "Running command...",
   task: "Delegating...",
   todowrite: "Planning...",
   todoread: "Planning...",

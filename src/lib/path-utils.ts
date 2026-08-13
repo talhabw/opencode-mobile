@@ -36,3 +36,10 @@ export function nameOf(dir: string): string {
   const lastSlash = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"))
   return lastSlash >= 0 ? trimmed.slice(lastSlash + 1) || trimmed : trimmed
 }
+
+/** Resolve a v2 relative filesystem entry against its absolute location. */
+export function resolveServerPath(directory: string | undefined, path: string): string {
+  if (/^[\\/]/.test(path) || /^[a-zA-Z]:[\\/]/.test(path) || !directory) return path
+  const separator = directory.includes("\\") && !directory.includes("/") ? "\\" : "/"
+  return `${stripTrailingSlash(directory)}${separator}${path.replace(/^[\\/]+/, "")}`
+}
