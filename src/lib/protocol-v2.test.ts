@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { OpenCode, type SessionInfo, type SessionMessageInfo } from "@opencode-ai/client"
-import { V2EventAdapter, normalizeEvent, normalizeMessage, normalizeSession, isV2HealthResponse, normalizeProviderCatalog, V2_REQUIRED_ERROR } from "./protocol-v2.ts"
+import { V2EventAdapter, normalizeAgent, normalizeEvent, normalizeMessage, normalizeSession, isV2HealthResponse, normalizeProviderCatalog, V2_REQUIRED_ERROR } from "./protocol-v2.ts"
 
 test("official client uses v2 /api paths and location query", async () => {
   const requests: URL[] = []
@@ -113,6 +113,16 @@ test("normalizes v2 sessions into app-owned location shape", () => {
   assert.equal(session.directory, "/work")
   assert.equal(session.title, "Session")
   assert.equal(session.version, "2")
+})
+
+test("normalizes built-in and custom agents to their id with a display label", () => {
+  const builtIn = normalizeAgent({ id: "build", name: "Build", mode: "primary" } as never)
+  assert.equal(builtIn.name, "build")
+  assert.equal(builtIn.label, "Build")
+  const custom = normalizeAgent({ id: "code-reviewer", name: "Code Reviewer", mode: "primary" } as never)
+  assert.equal(custom.name, "code-reviewer")
+  assert.equal(custom.label, "Code Reviewer")
+  assert.equal(normalizeAgent({ id: "plan", name: "Plan", mode: "primary" } as never).name, "plan")
 })
 
 test("normalizes known and unknown message variants without throwing", () => {

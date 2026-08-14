@@ -76,7 +76,11 @@ export interface Event {
 }
 
 export interface Agent {
+  // Canonical id used for wire selection (AgentInfo.id). Custom ids are
+  // preserved exactly; built-ins keep their lowercase ids ("build").
   name: string
+  // Human-readable label (AgentInfo.name, e.g. "Build") for display only.
+  label?: string
   description?: string
   mode: "subagent" | "primary" | "all"
   hidden?: boolean
@@ -275,7 +279,11 @@ export function normalizeMessage(value: SessionMessageInfo, sessionID: string): 
 
 export function normalizeAgent(value: AgentInfo): Agent {
   return {
-    name: value.name,
+    // The server selects agents by id — never the display name. Built-ins
+    // like { id: "build", name: "Build" } and custom agents whose id differs
+    // from their label both round-trip exactly.
+    name: value.id,
+    label: value.name,
     description: value.description,
     mode: value.mode,
     hidden: value.hidden,

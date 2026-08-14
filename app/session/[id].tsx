@@ -373,7 +373,10 @@ export default function SessionScreen() {
   // than inferring a model from message history (which loses the variant).
   useEffect(() => {
     if (!currentSession || !catalog.loaded) return
-    setAgent(currentSession.agent && agents.some((item) => item.name === currentSession.agent) ? currentSession.agent : "")
+    const sessionAgent = currentSession.agent
+      ? agents.find((item) => item.name === currentSession.agent || item.label === currentSession.agent)?.name
+      : undefined
+    setAgent(sessionAgent ?? "")
     setModel(currentSession.model
       ? { providerID: currentSession.model.providerID, modelID: currentSession.model.modelID }
       : null)
@@ -673,7 +676,8 @@ export default function SessionScreen() {
     [setModel],
   )
 
-  // Current agent display
+  // Current agent display: catalog.agent is the canonical id used for wire
+  // selection; the toolbar shows the human-readable label when available.
   const currentAgent = agents.find((a) => a.name === agent)
   const agentColor = currentAgent?.color || acc.cur.accent
   const modelLabel = model?.modelID ? model.modelID.split("/").pop() || model.modelID : "default"
@@ -882,7 +886,7 @@ export default function SessionScreen() {
             onLongPress={() => cycleAgent(-1)}
           >
             <View style={[s.agentDot, { backgroundColor: agentColor }]} />
-            <Text style={[s.agentLabel, isDark && s.textWhite]}>{agent || t("session.toolbar.auto")}</Text>
+            <Text style={[s.agentLabel, isDark && s.textWhite]}>{currentAgent?.label || agent || t("session.toolbar.auto")}</Text>
             <Ionicons name="swap-horizontal-outline" size={12} color={isDark ? "#888888" : "#666666"} />
           </TouchableOpacity>
 

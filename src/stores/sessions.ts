@@ -17,7 +17,7 @@ import { AnalyticsEvent, track } from "../lib/analytics"
 import { extractPromptFromParts, type PromptFromParts } from "../lib/prompt-from-parts"
 import { mergeIncomingMessage } from "../lib/message-merge"
 import { isColdSessionLoad, isLiveEventForSession } from "../lib/session-load-reconcile"
-import { appendCursorPage, dedupePage, mergeCursorRefresh, prependCursorPage, truncateCommittedRevert } from "../lib/cursor-pagination"
+import { appendCursorPage, dedupePage, mergeCursorRefresh, mergeCursorRefreshSnapshot, mergePartsRefreshSnapshot, prependCursorPage, truncateCommittedRevert } from "../lib/cursor-pagination"
 import { attachmentUri } from "../lib/session-request"
 
 // Fast-fail bound for the sessions list on app start/open. A dead or
@@ -99,6 +99,7 @@ export const abortedSessions = new Set<string>()
 // overwrite the messages/currentSession of a newer selection. Each call takes
 // the next value and only commits its result if still the latest.
 let selectSeq = 0
+let canonicalPageSeq = 0
 
 // Get the right client for a session's directory
 function clientFor(directory?: string): Client | null {
@@ -200,6 +201,14 @@ export const useSessions = create<SessionsState>((set, get) => ({
         sending: { ...state.sending, [sessionID]: false },
       }))
 
+      // Snapshot what is on screen when the request begins. The canonical
+      // page repairs/reorders messages that existed then, while anything
+      // added live meanwhile (optimistic temp sends, real SSE arrivals) is
+      // retained after it — a stale response must not drop or misorder those.
+      const snapshot = get().messages
+      const partsSnapshot = get().parts
+      const pageSeq = ++canonicalPageSeq
+
       const [session, messagePage] = await Promise.all([
         client.session.get(sessionID),
         client.session.messagePage(sessionID, { limit: pageSize(), order: "desc" }),
@@ -209,6 +218,8 @@ export const useSessions = create<SessionsState>((set, get) => ({
       // stale result so it can't clobber the newer selection.
       if (seq !== selectSeq) return
 
+      const pageIsCurrent = pageSeq === canonicalPageSeq || get().currentSession?.id !== sessionID
+
       const firstPage = mergeCursorRefresh([], {
         data: messagePage.data.map((item) => item.info),
         cursor: messagePage.cursor,
@@ -216,15 +227,19 @@ export const useSessions = create<SessionsState>((set, get) => ({
       const { parts } = parseMessages(messagePage.data)
 
       set((state) => {
+        if (!pageIsCurrent && state.currentSession?.id === sessionID) {
+          return { currentSession: session, isLoading: false }
+        }
         if (!isColdLoad && state.currentSession?.id === sessionID) {
-          const merged = mergeCursorRefresh(
-            state.messages.filter((message) => !message.id.startsWith("temp-")),
+          const merged = mergeCursorRefreshSnapshot(
+            state.messages,
+            snapshot,
             { data: messagePage.data.map((item) => item.info), cursor: messagePage.cursor },
           )
           return {
             currentSession: session,
             messages: merged,
-            parts: { ...state.parts, ...parts },
+            parts: mergePartsRefreshSnapshot(merged, state.parts, partsSnapshot, parts),
             isLoading: false,
             hasMore: Boolean(messagePage.cursor.next),
             messageCursor: messagePage.cursor,
@@ -233,7 +248,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
         return {
           currentSession: session,
           messages: firstPage,
-          parts,
+          parts: pageIsCurrent ? parts : state.parts,
           isLoading: false,
           hasMore: Boolean(messagePage.cursor.next),
           messageCursor: messagePage.cursor,
@@ -412,7 +427,13 @@ export const useSessions = create<SessionsState>((set, get) => ({
           }
         })
       }
-      await client.session.prompt(session.id, { parts: promptParts, model, agent, variant })
+      const selectedAgent = agent && agent !== session.agent ? agent : undefined
+      const selectedModel = model && (
+        session.model?.providerID !== model.providerID ||
+        session.model.modelID !== model.modelID ||
+        session.model.variant !== variant
+      ) ? model : undefined
+      await client.session.prompt(session.id, { parts: promptParts, model: selectedModel, agent: selectedAgent, variant })
     } catch (err) {
       console.error("[sendMessage] error:", err)
       const stillCurrent = get().currentSession?.id === session.id
@@ -446,27 +467,34 @@ export const useSessions = create<SessionsState>((set, get) => ({
     const session = get().currentSession
     if (!client || !session) return
 
+    // Snapshot the messages that existed when the request began so a stale
+    // response repairs/reorders only those, and any optimistic or real SSE
+    // messages added or replaced in flight survive after the canonical data.
+    const snapshot = get().messages
+    const partsSnapshot = get().parts
+    const pageSeq = ++canonicalPageSeq
+
     try {
       const page = await client.session.messagePage(session.id, { limit: pageSize(), order: "desc" })
       const { parts } = parseMessages(page.data)
       set((state) => {
-        if (state.currentSession?.id !== session.id) return state
-        const messages = mergeCursorRefresh(
-          state.messages.filter((message) => !message.id.startsWith("temp-")),
+        if (state.currentSession?.id !== session.id || pageSeq !== canonicalPageSeq) return state
+        const messages = mergeCursorRefreshSnapshot(
+          state.messages,
+          snapshot,
           { data: page.data.map((item) => item.info), cursor: page.cursor },
         )
-        const messageIDs = new Set(messages.map((message) => message.id))
         return {
           messages,
-          parts: Object.fromEntries(
-            Object.entries({ ...state.parts, ...parts }).filter(([messageID]) => messageIDs.has(messageID)),
-          ),
+          parts: mergePartsRefreshSnapshot(messages, state.parts, partsSnapshot, parts),
           hasMore: Boolean(page.cursor.next),
           messageCursor: page.cursor,
         }
       })
     } catch (error) {
-      set({ error: "Failed to refresh messages" })
+      if (get().currentSession?.id === session.id && pageSeq === canonicalPageSeq) {
+        set({ error: "Failed to refresh messages" })
+      }
     }
   },
 
@@ -512,10 +540,39 @@ export const useSessions = create<SessionsState>((set, get) => ({
   },
 
   handleEvent: (event) => {
+    const props = event.properties
+
+    if (event.type === "session.agent.selected" || event.type === "session.model.selected") {
+      const sessionID = typeof props.sessionID === "string" ? props.sessionID : undefined
+      if (!sessionID) return
+      const agent = event.type === "session.agent.selected"
+        ? (typeof props.agent === "string" ? props.agent : typeof props.name === "string" ? props.name : undefined)
+        : undefined
+      const rawModel = props.model && typeof props.model === "object" ? props.model as Record<string, unknown> : props
+      const model = event.type === "session.model.selected" && typeof rawModel.providerID === "string" && typeof (rawModel.modelID ?? rawModel.id) === "string"
+        ? {
+            providerID: rawModel.providerID,
+            modelID: String(rawModel.modelID ?? rawModel.id),
+            ...(typeof rawModel.variant === "string" ? { variant: rawModel.variant } : {}),
+          }
+        : undefined
+      set((state) => ({
+        sessions: state.sessions.map((session) => session.id !== sessionID ? session : {
+          ...session,
+          ...(agent !== undefined ? { agent } : {}),
+          ...(model !== undefined ? { model } : {}),
+        }),
+        currentSession: state.currentSession?.id !== sessionID ? state.currentSession : {
+          ...state.currentSession,
+          ...(agent !== undefined ? { agent } : {}),
+          ...(model !== undefined ? { model } : {}),
+        },
+      }))
+      return
+    }
+
     const { currentSession } = get()
     if (!currentSession) return
-
-    const props = event.properties
 
     switch (event.type) {
       case "message.updated": {

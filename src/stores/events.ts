@@ -400,6 +400,12 @@ export const useEvents = create<EventsState>((set, get) => ({
               break
             }
 
+            case "session.agent.selected":
+            case "session.model.selected": {
+              useSessions.getState().handleEvent({ type, properties: props })
+              break
+            }
+
             case "session.created": {
               const info = value(props, "info", isSession)
               if (!info) break
