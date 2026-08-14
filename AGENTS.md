@@ -13,9 +13,6 @@ infrastructure.
 - Never search for or use credentials belonging to the upstream developer.
 - Use only tools, devices, environment variables, and credentials available in the
   current environment. Ask the user when access is genuinely required.
-- Treat `context.md`, `HANDOFF.md`, `.agents/`, `.autopilot/`, `.supervisor/`, and
-  `.tasks/` as historical upstream material unless the user explicitly asks to use
-  them. Verify any claim in those files against the current code and environment.
 
 ## Overview
 

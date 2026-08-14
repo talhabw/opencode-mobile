@@ -25,7 +25,6 @@ import {
 } from "../../src/lib/notifications"
 import type { Category } from "../../src/lib/notifications"
 import { hasTelemetryConsent, setTelemetryConsent } from "../../src/lib/telemetry"
-import { PRIVACY_POLICY_URL } from "../../src/lib/links"
 import type { LocalePreference } from "../../src/lib/i18n/locale-resolve"
 
 function SettingRow({
@@ -404,14 +403,6 @@ export default function SettingsScreen() {
               trackColor={{ false: "#767577", true: "#22c55e" }}
             />
           }
-        />
-        <SettingRow
-          icon="document-text"
-          label={t("settings.privacy.privacyPolicy.label")}
-          description={t("settings.privacy.privacyPolicy.description")}
-          isDark={isDark}
-          onPress={() => Linking.openURL(PRIVACY_POLICY_URL)}
-          right={<Ionicons name="open-outline" size={20} color={isDark ? "#666666" : "#999999"} />}
         />
       </SettingSection>
 

@@ -37,11 +37,7 @@
     "privacy": {
       "crashReporting": {
         "label": "Crash Reports & Usage Analytics",
-        "description": "Share anonymous crash reports (Sentry) and usage analytics (PostHog) to help improve OpenCode. Diagnostic reports you share are also delivered to our support inbox. No code or prompts are included."
-      },
-      "privacyPolicy": {
-        "label": "Privacy Policy",
-        "description": "What data we collect and how"
+        "description": "Share anonymous crash reports (Sentry) and usage analytics (PostHog) to help improve OpenCode. No code or prompts are included."
       }
     },
     "about": {
@@ -192,16 +188,7 @@
         "helpProtocolMiddle": " for local and Tailscale addresses unless TLS is configured, then use ",
         "helpProtocolSuffix": ".",
         "helpRunningPrefix": "Make sure OpenCode is running:",
-        "connectCardTitle": "OpenCode Connect",
-        "connectCardBadge": "Coming Soon",
-        "connectCardDesc": "Bridge your phone to your opencode server — no tunnel setup, no firewall config. One-tap connect from anywhere.",
         "advancedLink": "Advanced options (tunnels, cloud, auth)"
-      },
-      "waitlist": {
-        "successText": "You're on the list — we'll email you when OpenCode Connect is ready.",
-        "joinButton": "Join Waitlist",
-        "alertTitle": "Join Waitlist",
-        "fallbackMessage": "Could not reach the signup service or open an email app. Please email support@agentlabs.cc with subject \"OpenCode Connect Waitlist\"."
       },
       "advanced": {
         "backToQuick": "Simple mode",
@@ -283,7 +270,6 @@
     "empty": {
       "noConnectionTitle": "No Connection",
       "noConnectionSubtitle": "Connect to a computer running opencode serve on your network or via Tailscale to get started.",
-      "setupGuideLink": "How to set up a server",
       "addConnectionButton": "Add Connection",
       "tryDemoButton": "Try a demo (no server needed)",
       "authFailedTitle": "Authentication Failed",
@@ -345,7 +331,7 @@
   },
   "telemetryConsent": {
     "title": "Help improve OpenCode?",
-    "body": "Share anonymous crash reports and usage analytics to help us find and fix bugs faster. Diagnostic reports you share are also delivered to our support inbox. No code, prompts, or server addresses are ever included.",
+    "body": "Share anonymous crash reports and usage analytics to help us find and fix bugs faster. No code, prompts, or server addresses are ever included.",
     "bullets": {
       "deviceInfo": "Device model, OS version, app version",
       "stackTraces": "Stack traces of crashes (no variable values)",
@@ -353,7 +339,6 @@
       "noCode": "Your code, prompts, or chat messages",
       "noServerUrls": "Server URLs or authentication tokens"
     },
-    "privacyLink": "Read our full privacy policy",
     "declineA11yLabel": "No thanks, decline crash reporting and analytics",
     "declineButton": "No thanks",
     "allowA11yLabel": "Allow anonymous crash reports and usage analytics",
@@ -459,8 +444,6 @@
     "banner": "Demo — sample conversation, no server connected",
     "ctaTitle": "Like what you see?",
     "ctaSubtitle": "This was a scripted demo. Connect your own opencode server to do this for real.",
-    "connectButton": "Connect your own server",
-    "setupGuideLink": "How to set up a server",
-    "hostedCtaLink": "No server? Join the OpenCode Connect waitlist — hosted, no setup"
+    "connectButton": "Connect your own server"
   }
 }

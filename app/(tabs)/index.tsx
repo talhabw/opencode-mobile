@@ -14,7 +14,6 @@ import {
   Alert,
   KeyboardAvoidingView,
   Platform,
-  Linking,
 } from "react-native"
 import { router, useFocusEffect } from "expo-router"
 import { Ionicons } from "@expo/vector-icons"
@@ -28,7 +27,6 @@ import type { Session, Project } from "../../src/lib/sdk"
 import { DirectorySwitcher, DirectoryBrowserSheet } from "../../src/components/chat"
 import { groupByDirectory } from "../../src/lib/session-grouping"
 import { nameOf } from "../../src/lib/path-utils"
-import { SETUP_GUIDE_URL } from "../../src/lib/links"
 import { useAccent, type AccentState } from "../../src/lib/accents"
 
 function formatTime(timestamp: number, t: (key: string, opts?: Record<string, unknown>) => string): string {
@@ -467,13 +465,6 @@ export default function SessionsScreen() {
           <Text style={[styles.addButtonText, isDark && styles.addButtonTextDark]}>
             {t("sessionsList.empty.addConnectionButton")}
           </Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={styles.setupGuideLink}
-          onPress={() => Linking.openURL(SETUP_GUIDE_URL)}
-          testID="setup-guide-link"
-        >
-          <Text style={styles.setupGuideLinkText}>{t("sessionsList.empty.setupGuideLink")}</Text>
         </TouchableOpacity>
         {/* No-server activation path (retention): a fully offline scripted
             demo, isolated from real connect/session state — see app/demo.tsx. */}
@@ -1092,14 +1083,6 @@ function makeStyles(acc: AccentState) {
   },
   addButtonTextDark: {
     color: "#0a0a0a",
-  },
-  setupGuideLink: {
-    marginTop: 16,
-  },
-  setupGuideLinkText: {
-    fontSize: 14,
-    fontWeight: "600",
-    color: "#6366f1",
   },
   tryDemoButton: {
     flexDirection: "row",

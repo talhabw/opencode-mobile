@@ -15,7 +15,7 @@ export function scrubString(s: string): string {
   return s.replace(/https?:\/\/\S+/g, (m) => scrubUrl(m))
 }
 
-// Harder redaction for text that leaves the device (support inbox): drop
+// Harder redaction for text that leaves the device: drop
 // every URL wholesale, erase every known server host (bare `host=…` fragments
 // and log lines carry hosts without a scheme, which the URL regex misses),
 // and blank bare IPv4 addresses as a catch-all for hosts we never parsed.

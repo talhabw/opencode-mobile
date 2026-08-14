@@ -92,7 +92,7 @@ export enum AnalyticsEvent {
   DemoStepAdvanced = "demo_step_advanced",
   /** The scripted demo reached its end (completion or denial message shown
    *  after the permission reply). The key activation metric for the demo —
-   *  see distribution/retention-analysis.md. Always paired with `outcome`. */
+   *  Always paired with `outcome`. */
   DemoCompleted = "demo_completed",
   /** User tapped "Connect your own server" on the demo's CTA card. */
   DemoExitedToConnect = "demo_exited_to_connect",

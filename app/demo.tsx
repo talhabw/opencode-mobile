@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
-import { View, Text, ScrollView, TouchableOpacity, StyleSheet, useColorScheme, Linking } from "react-native"
+import { View, Text, ScrollView, TouchableOpacity, StyleSheet, useColorScheme } from "react-native"
 import { Stack, useRouter } from "expo-router"
 import { Ionicons } from "@expo/vector-icons"
 import { useTranslation } from "react-i18next"
 import { MessageBubble, PermissionPrompt } from "../src/components/chat"
 import { buildDemoScript, buildDemoCompletionMessage, buildDemoDenialMessage } from "../src/lib/demo-script"
-import { SETUP_GUIDE_URL } from "../src/lib/links"
 import { track, AnalyticsEvent } from "../src/lib/analytics"
 import { useAccent, type AccentState } from "../src/lib/accents"
 import {
@@ -88,20 +87,6 @@ export default function DemoScreen() {
             >
               <Text style={s.connectButtonText}>{t("demo.connectButton")}</Text>
             </TouchableOpacity>
-            <TouchableOpacity
-              style={s.hostedCtaLink}
-              onPress={handleConnectPress}
-              testID="demo-hosted-cta"
-            >
-              <Text style={s.hostedCtaLinkText}>{t("demo.hostedCtaLink")}</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={s.setupGuideLink}
-              onPress={() => Linking.openURL(SETUP_GUIDE_URL)}
-              testID="demo-setup-guide-link"
-            >
-              <Text style={s.setupGuideLinkText}>{t("demo.setupGuideLink")}</Text>
-            </TouchableOpacity>
           </View>
         </ScrollView>
       </View>
@@ -151,9 +136,5 @@ function makeStyles(acc: AccentState) {
       alignItems: "center",
     },
     connectButtonText: { color: "#ffffff", fontWeight: "600", fontSize: 15 },
-    hostedCtaLink: { marginTop: 14 },
-    hostedCtaLinkText: { fontSize: 14, fontWeight: "600", color: acc.light.accent, textAlign: "center" },
-    setupGuideLink: { marginTop: 14 },
-    setupGuideLinkText: { fontSize: 14, fontWeight: "600", color: "#6366f1" },
   })
 }

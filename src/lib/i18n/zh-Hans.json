@@ -37,11 +37,7 @@
     "privacy": {
       "crashReporting": {
         "label": "崩溃报告与使用分析",
-        "description": "分享匿名崩溃报告（Sentry）和使用分析（PostHog），帮助改进 OpenCode。您分享的诊断报告也会发送至我们的支持收件箱。不包含代码或提示词内容。"
-      },
-      "privacyPolicy": {
-        "label": "隐私政策",
-        "description": "我们收集哪些数据及收集方式"
+        "description": "分享匿名崩溃报告（Sentry）和使用分析（PostHog），帮助改进 OpenCode。不包含代码或提示词内容。"
       }
     },
     "about": {
@@ -192,16 +188,7 @@
         "helpProtocolMiddle": "，除非已配置 TLS，此时请使用 ",
         "helpProtocolSuffix": "。",
         "helpRunningPrefix": "请确保 OpenCode 正在运行：",
-        "connectCardTitle": "OpenCode Connect",
-        "connectCardBadge": "即将上线",
-        "connectCardDesc": "将手机桥接到您的 opencode 服务器 — 无需配置隧道或防火墙。一键连接，随时随地。",
         "advancedLink": "高级选项（隧道、云端、身份验证）"
-      },
-      "waitlist": {
-        "successText": "您已加入候补名单 — OpenCode Connect 准备就绪时我们会通过邮件通知您。",
-        "joinButton": "加入候补名单",
-        "alertTitle": "加入候补名单",
-        "fallbackMessage": "无法连接注册服务或打开邮件应用。请发送邮件至 support@agentlabs.cc，主题为 \"OpenCode Connect Waitlist\"。"
       },
       "advanced": {
         "backToQuick": "简易模式",
@@ -283,7 +270,6 @@
     "empty": {
       "noConnectionTitle": "无连接",
       "noConnectionSubtitle": "连接到运行 opencode serve 的电脑（同一网络或通过 Tailscale）以开始使用。",
-      "setupGuideLink": "如何设置服务器",
       "addConnectionButton": "添加连接",
       "tryDemoButton": "试用演示（无需服务器）",
       "authFailedTitle": "身份验证失败",
@@ -345,7 +331,7 @@
   },
   "telemetryConsent": {
     "title": "帮助改进 OpenCode？",
-    "body": "分享匿名崩溃报告和使用分析，帮助我们更快地发现并修复问题。您分享的诊断报告也会发送至我们的支持收件箱。绝不包含代码、提示词或服务器地址。",
+    "body": "分享匿名崩溃报告和使用分析，帮助我们更快地发现并修复问题。绝不包含代码、提示词或服务器地址。",
     "bullets": {
       "deviceInfo": "设备型号、系统版本、应用版本",
       "stackTraces": "崩溃堆栈跟踪（不含变量值）",
@@ -353,7 +339,6 @@
       "noCode": "您的代码、提示词或聊天消息",
       "noServerUrls": "服务器地址或身份验证令牌"
     },
-    "privacyLink": "阅读完整隐私政策",
     "declineA11yLabel": "不用了，拒绝崩溃报告和使用分析",
     "declineButton": "不用了",
     "allowA11yLabel": "允许匿名崩溃报告和使用分析",
@@ -459,8 +444,6 @@
     "banner": "演示 — 示例对话，未连接服务器",
     "ctaTitle": "喜欢这个体验吗？",
     "ctaSubtitle": "这是一个脚本化的演示。连接您自己的 opencode 服务器即可真正体验。",
-    "connectButton": "连接您自己的服务器",
-    "setupGuideLink": "如何设置服务器",
-    "hostedCtaLink": "没有服务器？加入 OpenCode Connect 候补名单 — 托管，无需搭建"
+    "connectButton": "连接您自己的服务器"
   }
 }
