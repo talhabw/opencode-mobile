@@ -478,3 +478,65 @@ project. PostHog project acceptance of the activation events and provider-side
 payload audit also remain unverified. These are explicit user checkpoints, not
 claims of completion; follow the release matrix in
 `docs/TELEMETRY-OPERATIONS.md` after provisioning.
+
+---
+
+## Addendum: Bug Fix Round 2 (device test findings, 2026-08-14)
+
+Plan: docs/REQUESTS-BUGFIX-PLAN-2.md. All six issues fixed and verified on the
+physical device (OnePlus A063) against the user's real OpenCode v2 server
+(opencode2 v0.0.0-next-17444).
+
+1. UI unresponsive during tool calls / thinking blocks
+   - Tool part updates now coalesce through a second LatestValueBuffer (flush on
+     lifecycle transitions), replacing per-delta zustand writes.
+   - session.tool.input.delta no longer JSON.parse per delta (raw accumulation;
+     parse at called/success/failed).
+   - Mid-run canonical message refreshes are gated while the session is busy;
+     the terminal busy->idle transition still refreshes so nothing is lost.
+   - Verified: 206 ms adb text input during an active real-server run.
+
+2. Questions render as a stuck tool call, no question UI
+   - Root cause: the server's question tool now surfaces requests via forms
+     (form.created events), not question.asked.
+   - Added a forms transport mapped onto the existing pending-question store
+     shape (src/lib/question-inputs.ts), form.* SDK wrappers, form.created/
+     replied/cancelled event handling, form reply/cancel in the session screen,
+     and form recovery in refreshPending + authoritativeResync.
+   - Legacy question.asked path kept for the fixture and older servers.
+   - Verified: form-based question rendered as question UI, answered, run
+     continued end-to-end on the real server. Also confirmed the question
+     permission prompt (Once/Always/Reject) surfaces for non-default agents.
+
+3. read tool call content empty
+   - ReadDetail now renders the read tool's output (file content) in a
+     monospace block like BashDetail. Verified on device.
+
+4. Subagent rows show a chevron that vanishes when empty
+   - Sessions store now derives child counts from a directory-wide session
+     prefetch (client.session.list without parentID) maintained by
+     session.created/deleted events; loaded children stay authoritative.
+   - Chevron shows only when the count is known > 0. Verified on real data.
+
+5. <shell ...> / <subagent ...> rendered as info text
+   - protocol-v2 parses the two server-injected synthetic marker shapes
+     (including wrapped <tag>...</tag> content) into structured rows:
+     shell markers render as terminal rows ($ command, truthful state, output,
+     background label); subagent markers as a dedicated row with description,
+     state, and Open-subagent navigation to the child session id.
+   - session.synthetic events now drive a canonical refresh (safe row id).
+   - Verified live: background shell marker rendered as "shell / completed /
+     $ sleep 8 / background job".
+
+6. Expanding a tool call moved the tapped header up
+   - Expandable rows report toggles to the session screen; the next
+     content-size change adjusts the scroll offset by the signed height delta
+     (suppressing bottom pinning) so the tapped header stays anchored and the
+     detail opens downward. Unit-tested policy in session-scroll.ts.
+   - Verified on the deterministic fixture: header y stayed exactly 1303 while
+     the detail opened below it.
+
+Validation: typecheck, 316 unit tests, fixture contract tests, and on-device
+real-server flows all green. Temporary test sessions were created and removed;
+existing user sessions untouched. A release build with these fixes has been
+installed on the device (same signature, data preserved).
