@@ -32,7 +32,7 @@ export interface Message {
   id: string
   sessionID: string
   role: "user" | "assistant"
-  presentation: "user" | "assistant" | "shell" | "system"
+  presentation: "user" | "assistant" | "shell" | "system" | "subagent"
   systemKind?: "agent" | "model" | "location" | "compaction" | "synthetic" | "skill" | "system"
   parentID?: string
   time: { created: number; completed?: number }
@@ -45,16 +45,26 @@ export interface Message {
   error?: { message: string }
   finish?: string
   shell?: ShellMessage
+  subagent?: SubagentMessage
 }
 
 export interface ShellMessage {
   id: string
   shellID: string
   command: string
-  status: "running" | "exited" | "timeout" | "killed"
+  status: "running" | "exited" | "timeout" | "killed" | "completed" | "error" | "cancelled"
   exit?: number | "Infinity" | "-Infinity" | "NaN"
   output?: { output: string; cursor: number; size: number; truncated: boolean }
   time: { created: number; completed?: number }
+}
+
+export interface SubagentMessage {
+  id: string
+  refID: string
+  state: SyntheticTagState
+  description?: string
+  result?: string
+  time: { created: number }
 }
 
 export interface Part {
@@ -164,6 +174,38 @@ export function v2HealthError(value: unknown): Error {
   return new Error(V2_REQUIRED_ERROR)
 }
 
+export type SyntheticTagState = "completed" | "error" | "cancelled"
+
+export type SyntheticTag =
+  | { kind: "shell"; id: string; state: SyntheticTagState; command: string; content?: string }
+  | { kind: "subagent"; id: string; state: SyntheticTagState; description?: string; content?: string }
+
+const SYNTHETIC_TAG_STATES: readonly SyntheticTagState[] = ["completed", "error", "cancelled"]
+
+// Only the two documented synthetic marker shapes are recognized; anything
+// else (including other XML-ish text) falls back to the plain system row.
+// The server emits `<shell ...>\n${output}\n</shell>` and
+// `<subagent ...>\n${result}\n</subagent>`, so a matching closing tag with
+// content between it and the opening tag is part of the documented shape.
+export function parseSyntheticTag(text: string): SyntheticTag | undefined {
+  if (typeof text !== "string") return undefined
+  const match = /^<(shell|subagent)(\s[^<>]*)?\s*>(?:\n?([\s\S]*?)\n?<\/\1>)?$/u.exec(text.trim())
+  if (!match) return undefined
+  const kind = match[1] as "shell" | "subagent"
+  const attrs = new Map<string, string>()
+  for (const attr of (match[2] ?? "").matchAll(/([a-zA-Z][a-zA-Z0-9_-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/gu)) {
+    attrs.set(attr[1], attr[2] ?? attr[3] ?? "")
+  }
+  const id = attrs.get("id")
+  const state = attrs.get("state")
+  if (!id || !state || !SYNTHETIC_TAG_STATES.includes(state as SyntheticTagState)) return undefined
+  const content = match[3]?.trim()
+  const withContent = content ? { content } : {}
+  if (kind === "shell") return { kind, id, state: state as SyntheticTagState, command: attrs.get("command") ?? "", ...withContent }
+  const description = attrs.get("description")
+  return { kind, id, state: state as SyntheticTagState, ...(description ? { description } : {}), ...withContent }
+}
+
 export function normalizeSession(value: SessionInfo): Session {
   return {
     id: value.id,
@@ -216,6 +258,46 @@ function baseMessage(value: SessionMessageInfo, sessionID: string): Message {
         ...(value.output !== undefined ? { output: value.output } : {}),
         time: value.time,
       },
+    }
+  }
+  if (value.type === "synthetic") {
+    const tag = parseSyntheticTag(value.text)
+    if (tag?.kind === "shell") {
+      // Shell-tool completion marker: the tag id is the tool-call id, and the
+      // tag state is preserved verbatim so the visible label stays truthful.
+      return {
+        id: value.id,
+        sessionID,
+        role: "assistant",
+        presentation: "shell",
+        time: value.time,
+        shell: {
+          id: value.id,
+          shellID: tag.id,
+          command: tag.command,
+          status: tag.state,
+          ...(tag.content ? { output: { output: tag.content, cursor: tag.content.length, size: tag.content.length, truncated: false } } : {}),
+          time: value.time,
+        },
+      }
+    }
+    if (tag?.kind === "subagent") {
+      const description = tag.description ?? value.description
+      return {
+        id: value.id,
+        sessionID,
+        role: "assistant",
+        presentation: "subagent",
+        time: value.time,
+        subagent: {
+          id: value.id,
+          refID: tag.id,
+          state: tag.state,
+          ...(description ? { description } : {}),
+          ...(tag.content ? { result: tag.content } : {}),
+          time: value.time,
+        },
+      }
     }
   }
   const systemKind = value.type === "agent-switched"
@@ -306,6 +388,8 @@ export function normalizeMessage(value: SessionMessageInfo, sessionID: string): 
   } else if (value.type === "shell") {
     // Shell messages are protocol records, not assistant prose or tool calls.
     // Their structured fields are retained on info.shell for a dedicated row.
+  } else if (info.presentation === "shell" || info.presentation === "subagent") {
+    // Structured synthetic markers render from their payload, never raw tag text.
   } else {
     const text = "text" in value && typeof value.text === "string"
       ? value.text
@@ -510,22 +594,27 @@ export class V2EventAdapter {
       const callID = stringValue(data.id)
       const key = toolKey(sessionID, messageID, callID)
       const previous = this.tools.get(key) ?? { rawInput: "" }
+      // Deltas only accumulate the raw JSON text. Parsing the whole buffer on
+      // every delta is quadratic for large write/edit inputs, and the parsed
+      // value is delivered anyway by session.tool.called — the streamed text
+      // stays visible as-is in the meantime (same as partial-JSON chunks).
       const rawInput = `${previous.rawInput}${stringValue(data.delta)}`
-      let input: unknown = rawInput
-      try {
-        input = JSON.parse(rawInput)
-      } catch {
-        // Input is streamed as JSON, so partial chunks remain visible as text.
-      }
       const metadata = mergeMetadata(previous.metadata, data.metadata)
-      this.tools.set(key, { ...previous, rawInput, input, metadata })
-      return [toolEvent(sessionID, messageID, callID, previous.tool, "pending", input, undefined, undefined, metadata, false)]
+      this.tools.set(key, { ...previous, rawInput, input: rawInput, metadata })
+      return [toolEvent(sessionID, messageID, callID, previous.tool, "pending", rawInput, undefined, undefined, metadata, false)]
     }
     if (raw.type === "session.tool.called" && sessionID && messageID) {
       const callID = stringValue(data.id)
       const key = toolKey(sessionID, messageID, callID)
       const previous = this.tools.get(key) ?? { rawInput: "" }
-      const state: ToolState = { tool: previous.tool ?? stringValue(data.name), rawInput: previous.rawInput, input: data.input ?? previous.input, metadata: mergeMetadata(previous.metadata, data.metadata) }
+      const state: ToolState = {
+        tool: previous.tool ?? stringValue(data.name),
+        rawInput: previous.rawInput,
+        // The server normally sends the parsed input here; fall back to
+        // parsing the accumulated raw stream only when it does not.
+        input: data.input ?? parsedToolInput(previous.rawInput) ?? previous.input,
+        metadata: mergeMetadata(previous.metadata, data.metadata),
+      }
       this.tools.set(key, state)
       return [toolEvent(sessionID, messageID, callID, state.tool, "running", state.input, undefined, undefined, state.metadata, true)]
     }
@@ -549,7 +638,9 @@ export class V2EventAdapter {
         callID,
         state?.tool,
         failed ? "error" : "completed",
-        state?.input,
+        // Terminal fallback only: one parse per call when the server skipped
+        // session.tool.called — never per delta.
+        state === undefined ? undefined : parsedToolInput(state.rawInput) ?? state.input,
         contentOutput(data.content),
         failed ? stringValue(error?.message) : undefined,
         mergeMetadata(state?.metadata, data.metadata),
@@ -593,6 +684,14 @@ function toolEvent(
 
 function recordValue(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+}
+
+function parsedToolInput(rawInput: string): unknown {
+  try {
+    return JSON.parse(rawInput)
+  } catch {
+    return undefined
+  }
 }
 
 function mergeMetadata(previous: Record<string, unknown> | undefined, incoming: unknown): Record<string, unknown> | undefined {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { mock } from "bun:test"
+import { fromQuestionForm, isQuestionForm, toFormAnswer } from "../../src/lib/question-inputs"
 
 // Expo's fetch module imports React Native internals under Bun; the production
 // SDK still gets instantiated, with the platform fetch replaced for this test.
@@ -80,4 +81,116 @@ test("v2 fixture matches the generated client protocol", async (context) => {
   const reset = await fetch(`${base}/fixture/reset`, { method: "POST", headers: auth })
   assert.equal(reset.status, 200)
   assert.equal((await client.question.list()).length, 1)
+})
+
+test("v2 fixture emits a tool input storm that accumulates and resolves canonically", async (context) => {
+  const process = await start()
+  context.after(() => process.kill())
+
+  // Mirrors the payload the fixture server streams for fixture:tool-stress.
+  const payload = JSON.stringify({
+    filePath: "/fixture/workspace/stress.txt",
+    content: Array.from({ length: 64 }, (_, index) => `tool stress line ${index + 1}: ${"y".repeat(96)}`).join("\n"),
+  })
+
+  const events = client.global.events()
+  const collected: Array<{ type: string; properties: Record<string, unknown> }> = []
+  const done = (async () => {
+    for await (const event of events) {
+      collected.push(event)
+      if (event.type === "session.status" && event.properties.status && (event.properties.status as { type: string }).type === "idle") return
+    }
+    throw new Error("event stream ended before the tool stress run completed")
+  })()
+
+  await client.session.prompt("fixture-root", { parts: [{ type: "text", text: "fixture:tool-stress" }] })
+  await done
+
+  const parts = collected
+    .filter((event) => event.type === "message.part.updated")
+    .map((event) => event.properties.part as { id: string; type: string; callID: string; state: { status: string; input?: unknown; output?: unknown; metadata?: unknown } })
+    .filter((part) => part.type === "tool" && part.callID === "call-tool-stress")
+  const pending = parts.filter((part) => part.state.status === "pending")
+  const running = parts.filter((part) => part.state.status === "running")
+  const completed = parts.filter((part) => part.state.status === "completed")
+
+  // input.started plus exactly 2,000 deltas, all coalesced into pending parts.
+  assert.equal(pending.length, 2_001)
+  // Deltas accumulate the raw text; the last pending part carries the full payload.
+  assert.equal(pending[pending.length - 1]?.state.input, payload)
+  assert.equal(parts.length, 2_001 + running.length + completed.length)
+
+  // called installs the parsed object, progress stays running, success carries output.
+  const called = parts.find((part) => part.state.status === "running")
+  assert.deepEqual(called?.state.input, JSON.parse(payload))
+  assert.equal(running.length, 51) // called + 50 progress events
+  assert.equal(completed.length, 1)
+  assert.equal(completed[0]?.state.status, "completed")
+  assert.equal(completed[0]?.state.output, `wrote ${payload.length} bytes`)
+
+  // The run ends canonically: step.ended then the normalized idle status.
+  assert.equal(collected.some((event) => event.type === "session.step.ended"), true)
+  assert.equal(collected[collected.length - 1]?.type, "session.status")
+
+  // The canonical page shows the persisted completed tool call.
+  const messages = await client.session.messages("fixture-root")
+  const tool = messages.flatMap((message) => message.parts).find((part) => part.callID === "call-tool-stress")
+  assert.deepEqual(tool?.state?.input, JSON.parse(payload))
+  assert.equal(tool?.state?.output, `wrote ${payload.length} bytes`)
+
+  const reset = await fetch(`${base}/fixture/reset`, { method: "POST", headers: auth })
+  assert.equal(reset.status, 200)
+})
+
+test("v2 fixture exposes the forms-based question surface end to end", async (context) => {
+  const process = await start()
+  context.after(() => process.kill())
+  const waitFor = async (match: (event: { type: string }) => boolean) => {
+    for await (const event of client.global.events()) if (match(event)) return event
+    throw new Error("event stream ended before match")
+  }
+
+  // The forms surface starts empty; the seeded legacy question stays on the
+  // question endpoints.
+  assert.deepEqual(await client.form.requestList(), [])
+
+  const created = waitFor((event) => event.type === "form.created")
+  await client.session.prompt("fixture-child", { parts: [{ type: "text", text: "fixture:form-question" }] })
+  const createdEvent = await created
+  const form = createdEvent.properties.form as { id?: string; sessionID?: string; metadata?: { kind?: string } }
+  assert.equal(form.sessionID, "fixture-child")
+  assert.equal(form.metadata?.kind, "question")
+
+  const listed = await client.form.requestList()
+  assert.equal(listed.length, 1)
+  assert.equal(isQuestionForm(listed[0]), true)
+  assert.deepEqual(await client.form.list("fixture-child"), listed)
+  const view = fromQuestionForm(listed[0])
+  const formID = view.formID ?? ""
+  assert.equal(view.id, form.id)
+  assert.equal(view.transport, "form")
+  assert.deepEqual(view.fieldKeys, ["q0", "q1"])
+  assert.deepEqual(view.fieldTypes, ["string", "multiselect"])
+  assert.deepEqual(view.questions.map((question) => [question.header, question.multiple ?? false]), [["Deploy target", false], ["Regions", true]])
+
+  // Multiselect answers encode as arrays (custom entries included), string
+  // answers as scalars.
+  const answer = toFormAnswer(view, [["Staging"], ["EU", "Custom region"]])
+  assert.deepEqual(answer, { q0: "Staging", q1: ["EU", "Custom region"] })
+
+  const replied = waitFor((event) => event.type === "form.replied")
+  await client.form.reply({ sessionID: "fixture-child", formID, answer })
+  assert.deepEqual((await replied).properties, { id: formID, sessionID: "fixture-child", answer })
+  assert.deepEqual(await client.form.requestList(), [])
+
+  const cancelled = waitFor((event) => event.type === "form.cancelled")
+  await client.session.prompt("fixture-child", { parts: [{ type: "text", text: "fixture:form-question" }] })
+  const second = (await client.form.requestList())[0]
+  await client.form.cancel({ sessionID: "fixture-child", formID: second.id })
+  assert.deepEqual((await cancelled).properties, { id: second.id, sessionID: "fixture-child" })
+  assert.deepEqual(await client.form.requestList(), [])
+
+  const reset = await fetch(`${base}/fixture/reset`, { method: "POST", headers: auth })
+  assert.equal(reset.status, 200)
+  assert.deepEqual(await client.form.requestList(), [])
 })

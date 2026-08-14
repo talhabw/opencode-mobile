@@ -70,13 +70,14 @@ function BashDetail({ input, output, isDark }: { input: unknown; output: unknown
   )
 }
 
-function ReadDetail({ input, isDark }: { input: unknown; isDark: boolean }) {
+function ReadDetail({ input, output, isDark }: { input: unknown; output: unknown; isDark: boolean }) {
   const acc = useAccent()
   const s = makeStyles(acc)
   const file = typeof input === "object" && input !== null ? (input as Record<string, unknown>).filePath : undefined
   const offset = typeof input === "object" && input !== null ? (input as Record<string, unknown>).offset : undefined
   const limit = typeof input === "object" && input !== null ? (input as Record<string, unknown>).limit : undefined
   const range = offset || limit ? ` (${offset || 0}..${limit || "end"})` : ""
+  const out = typeof output === "string" ? output : undefined
   return (
     <View style={s.detailSection}>
       {typeof file === "string" && (
@@ -84,6 +85,13 @@ function ReadDetail({ input, isDark }: { input: unknown; isDark: boolean }) {
           {file}
           {range}
         </Text>
+      )}
+      {out !== undefined && out.length > 0 && (
+        <View style={[s.codeBlock, isDark && s.codeBlockDark, { marginTop: 6 }]}>
+          <Text style={[s.codePre, isDark && s.codePteDark]} selectable numberOfLines={80}>
+            {out}
+          </Text>
+        </View>
       )}
     </View>
   )
@@ -293,7 +301,7 @@ function ToolDetail({ tool, isDark }: { tool: Part; isDark: boolean }) {
     case "shell":
       return <BashDetail input={input} output={output} isDark={isDark} />
     case "read":
-      return <ReadDetail input={input} isDark={isDark} />
+      return <ReadDetail input={input} output={output} isDark={isDark} />
     case "write":
       return <WriteDetail input={input} isDark={isDark} />
     case "edit":
@@ -343,9 +351,15 @@ function duration(start?: number, end?: number): string | null {
 interface Props {
   tool: Part
   isDark: boolean
+  /**
+   * Fired with the NEW expanded state right before the row's layout change
+   * lands, so the transcript can anchor the header. Must be stable across
+   * renders (useCallback in the screen) to keep MessageBubble's memo correct.
+   */
+  onToggleExpand?: (id: string, expanded: boolean) => void
 }
 
-function TaskSubagentCard({ tool, isDark }: Props) {
+function TaskSubagentCard({ tool, isDark, onToggleExpand }: Props) {
   const { t } = useTranslation()
   const acc = useAccent()
   const s = makeStyles(acc)
@@ -392,7 +406,11 @@ function TaskSubagentCard({ tool, isDark }: Props) {
     <View style={[s.card, s.taskCard, isDark && s.cardDark]} testID={`task-card-${tool.id}`}>
       <TouchableOpacity
         style={s.header}
-        onPress={() => setExpanded((value) => !value)}
+        onPress={() => {
+          const next = !expanded
+          setExpanded(next)
+          onToggleExpand?.(tool.id, next)
+        }}
         accessibilityRole="button"
         accessibilityLabel={summary || t("chat.toolCallCard.taskTitle")}
         accessibilityState={{ expanded }}
@@ -439,7 +457,7 @@ function TaskSubagentCard({ tool, isDark }: Props) {
   )
 }
 
-export function ToolCallCard({ tool, isDark }: Props) {
+export function ToolCallCard({ tool, isDark, onToggleExpand }: Props) {
   const { t } = useTranslation()
   const acc = useAccent()
   const s = makeStyles(acc)
@@ -452,10 +470,13 @@ export function ToolCallCard({ tool, isDark }: Props) {
   const hasDetail = tool.state?.input !== undefined || tool.state?.output !== undefined || error
 
   const toggle = useCallback(() => {
-    if (hasDetail) setExpanded((v) => !v)
-  }, [hasDetail])
+    if (!hasDetail) return
+    const next = !expanded
+    setExpanded(next)
+    onToggleExpand?.(tool.id, next)
+  }, [hasDetail, expanded, tool.id, onToggleExpand])
 
-  if (tool.tool === "task") return <TaskSubagentCard tool={tool} isDark={isDark} />
+  if (tool.tool === "task") return <TaskSubagentCard tool={tool} isDark={isDark} onToggleExpand={onToggleExpand} />
 
   return (
     <TouchableOpacity

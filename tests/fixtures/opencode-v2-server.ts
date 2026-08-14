@@ -34,8 +34,10 @@ let sessions: Json[]
 let messages = new Map<string, Json[]>()
 let questions: Json[]
 let permissions: Json[]
+let forms: Json[]
 let eventSequence = 0
 let messageSequence = 1
+let formSequence = 0
 
 const session = (id: string, title: string, parentID?: string): SessionInfo => ({ id, ...(parentID ? { parentID } : {}), projectID: project.id, agent: "build", model: { id: "fixture-model", providerID: "fixture", variant: "fast" }, location: { directory: root }, title, cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }, time: { created: now, updated: now } })
 const user = (id: string, _sessionID: string, text: string): SessionMessageUser => ({ type: "user", id, text, time: { created: now } })
@@ -53,8 +55,10 @@ function reset() {
   messages.get(rootSession.id as string)!.push({ type: "shell", id: "fixture-shell", shellID: "fixture-shell-1", command: "printf fixture", status: "exited", exit: 0, output: { output: "fixture\n", cursor: 8, size: 8, truncated: false }, time: { created: now, completed: now + 1 } } satisfies SessionMessageShell)
   questions = [{ id: "fixture-question-1", sessionID: child.id, questions: [{ question: "Continue the child task?", header: "Continue", options: [{ label: "Yes", description: "Continue" }, { label: "No", description: "Stop" }], multiple: false }], tool: { messageID: "fixture-child-assistant", id: "call-child" } }]
   permissions = []
+  forms = []
   eventSequence = 0
   messageSequence = 1
+  formSequence = 0
 }
 reset()
 
@@ -63,6 +67,19 @@ const empty = (status = 204) => new Response(null, { status })
 async function body(request: Request): Promise<Json> { try { return await request.json() as Json } catch { return {} } }
 function location() { return { directory: root, project } }
 function id(path: string, marker: string) { return decodeURIComponent(path.split(`/api/session/`)[1].split(`/`)[0]) }
+function questionForm(sessionID: string, messageID: string): Json {
+  formSequence += 1
+  return {
+    id: `fixture-form-${formSequence}`,
+    sessionID,
+    title: "Questions",
+    metadata: { kind: "question", tool: { messageID, id: `call-form-${formSequence}` } },
+    fields: [
+      { key: "q0", title: "Deploy target", description: "Which environment should receive the deploy?", type: "string", options: [{ value: "Staging", label: "Staging", description: "Deploy to staging first" }, { value: "Production", label: "Production", description: "Ship to production" }], custom: true },
+      { key: "q1", title: "Regions", description: "Which regions should be notified?", type: "multiselect", options: [{ value: "EU", label: "EU", description: "Europe" }, { value: "US", label: "US", description: "United States" }], custom: true },
+    ],
+  }
+}
 function emit(type: string, data: Json) {
   const event = JSON.stringify({ id: `fixture-event-${++eventSequence}`, created: Date.now(), type, data })
   for (const client of clients) client.controller.enqueue(client.encoder.encode(`data: ${event}\n\n`))
@@ -74,7 +91,7 @@ async function handle(request: Request): Promise<Response> {
   const url = new URL(request.url)
   const path = url.pathname
   if (path === "/health" || path === "/api/health") return json({ healthy: true, version: "2.0.0-fixture", pid: 1 })
-  if (path === "/fixture/status") return json({ ready: true, sessions: sessions.length, questions: questions.length, permissions: permissions.length })
+  if (path === "/fixture/status") return json({ ready: true, sessions: sessions.length, questions: questions.length, permissions: permissions.length, forms: forms.length })
   if (path === "/fixture/reset" && request.method === "POST") { reset(); emit("server.connected", {}); return json({ reset: true }) }
   if (path === "/api/event") {
     const stream = new ReadableStream<Uint8Array>({ start(controller) { const client = { controller, encoder: new TextEncoder() }; clients.add(client); controller.enqueue(client.encoder.encode(`data: ${JSON.stringify({ id: "fixture-connected", created: Date.now(), type: "server.connected", data: {} })}\n\n`)); request.signal.addEventListener("abort", () => { clients.delete(client); try { controller.close() } catch {} }) }, cancel() {} })
@@ -95,6 +112,7 @@ async function handle(request: Request): Promise<Response> {
   if (path === "/api/vcs/diff") return json({ location: location(), data: "" })
   if (path === "/api/permission/request") return json({ data: permissions })
   if (path === "/api/question/request") return json({ data: questions })
+  if (path === "/api/form/request") return json({ location: location(), data: forms })
   if (path === "/api/session/active") return json({ data: {} })
   if (path === "/api/session" && request.method === "GET") {
     const parentID = url.searchParams.get("parentID")
@@ -127,14 +145,58 @@ async function sessionRoute(request: Request, path: string): Promise<Response> {
     const userID = `fixture-user-${messageID}`
     const assistantID = `fixture-assistant-${messageID}`
     const streamingStressTest = text.toLowerCase() === "fixture:stream-stress"
+    const formQuestion = text.toLowerCase() === "fixture:form-question"
+    const toolStressTest = text.toLowerCase() === "fixture:tool-stress"
     const chunks = streamingStressTest
       ? Array.from({ length: 1_200 }, (_, index) => `${index % 12 === 0 ? `\n\n### Stream block ${index / 12 + 1}\n\n` : ""}Responsive streaming fixture text ${index}. \`inline code\` remains readable.\n`)
       : ["Fixture reply"]
     const reply = streamingStressTest ? chunks.join("") : `Fixture reply to: ${text}`
 
-    messages.get(sid)!.push(user(userID, sid, text), assistant(assistantID, reply))
+    // A several-KB write input streamed as ~2,000 deltas plus a progress burst
+    // — the "busy run" shape that used to stall the UI with per-delta store
+    // writes and mid-run canonical refreshes.
+    const toolStressPayload = JSON.stringify({
+      filePath: "/fixture/workspace/stress.txt",
+      content: Array.from({ length: 64 }, (_, index) => `tool stress line ${index + 1}: ${"y".repeat(96)}`).join("\n"),
+    })
+    const toolStressChunks = Array.from({ length: 2_000 }, (_, index) => toolStressPayload.slice(index * 4, index * 4 + 4))
+
+    messages.get(sid)!.push(user(userID, sid, text), toolStressTest
+      ? {
+          type: "assistant",
+          id: assistantID,
+          agent: "build",
+          model: { providerID: "fixture", id: "fixture-model" },
+          content: [{ type: "tool", id: "call-tool-stress", name: "write", time: { created: now, completed: now + 1 }, state: { status: "completed", input: JSON.parse(toolStressPayload), content: [{ type: "text", text: `wrote ${toolStressPayload.length} bytes` }] } }],
+          time: { created: now, completed: now + 1 },
+        }
+      : assistant(assistantID, reply))
+    if (formQuestion) {
+      const form = questionForm(sid, assistantID)
+      forms.push(form)
+      emit("form.created", { form })
+    }
     emit("session.execution.started", { sessionID: sid })
     emit("session.step.started", { sessionID: sid, assistantMessageID: assistantID, agent: "build", model: { providerID: "fixture", id: "fixture-model" } })
+
+    if (toolStressTest) {
+      emit("session.tool.input.started", { sessionID: sid, assistantMessageID: assistantID, id: "call-tool-stress", name: "write" })
+      let deltaIndex = 0
+      const toolInterval = setInterval(() => {
+        for (let burst = 0; burst < 10 && deltaIndex < toolStressChunks.length; burst++) {
+          emit("session.tool.input.delta", { sessionID: sid, assistantMessageID: assistantID, id: "call-tool-stress", delta: toolStressChunks[deltaIndex++] })
+        }
+        if (deltaIndex < toolStressChunks.length) return
+        clearInterval(toolInterval)
+        emit("session.tool.called", { sessionID: sid, assistantMessageID: assistantID, id: "call-tool-stress", input: JSON.parse(toolStressPayload), metadata: { tool: "write" } })
+        for (let index = 0; index < 50; index++) emit("session.tool.progress", { sessionID: sid, assistantMessageID: assistantID, id: "call-tool-stress", metadata: { stage: index } })
+        emit("session.tool.success", { sessionID: sid, assistantMessageID: assistantID, id: "call-tool-stress", content: [{ type: "text", text: `wrote ${toolStressPayload.length} bytes` }] })
+        emit("session.step.ended", { sessionID: sid, assistantMessageID: assistantID })
+        emit("session.execution.succeeded", { sessionID: sid })
+      }, 2)
+      return json({ data: user(userID, sid, text) })
+    }
+
     emit("session.text.started", { sessionID: sid, assistantMessageID: assistantID, ordinal: 0 })
 
     let index = 0
@@ -150,6 +212,15 @@ async function sessionRoute(request: Request, path: string): Promise<Response> {
   if (rest === "/revert/stage" || rest === "/revert/clear" || rest === "/revert/commit") return rest === "/revert/stage" ? json({ messageID: input.messageID }) : empty()
   if (rest.startsWith("/permission/") && rest.endsWith("/reply")) { const requestID = rest.split("/")[2]; permissions = permissions.filter((item) => item.id !== requestID); emit("permission.replied", { sessionID: sid, requestID, reply: input.reply }); return empty() }
   if (rest.startsWith("/question/") && (rest.endsWith("/reply") || rest.endsWith("/reject"))) { const requestID = rest.split("/")[2]; questions = questions.filter((item) => item.id !== requestID); emit(rest.endsWith("reply") ? "question.replied" : "question.rejected", { sessionID: sid, requestID, answers: input.answers }); return empty() }
+  if (rest === "/form" && request.method === "GET") return json({ data: forms.filter((item) => item.sessionID === sid) })
+  if (rest.startsWith("/form/") && (rest.endsWith("/reply") || rest.endsWith("/cancel"))) {
+    const [, , formID, action] = rest.split("/")
+    if (!forms.some((item) => item.id === formID)) return json({ error: "form not found" }, 404)
+    forms = forms.filter((item) => item.id !== formID)
+    if (action === "reply") emit("form.replied", { id: formID, sessionID: sid, answer: input.answer })
+    else emit("form.cancelled", { id: formID, sessionID: sid })
+    return empty()
+  }
   if (rest === "/delete") { sessions = sessions.filter((item) => item.id !== sid); emit("session.deleted", { sessionID: sid }); return empty() }
   return empty()
 }

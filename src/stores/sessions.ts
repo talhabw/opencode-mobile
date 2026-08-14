@@ -19,7 +19,7 @@ import { mergeIncomingMessage } from "../lib/message-merge"
 import { isColdSessionLoad, isLiveEventForSession } from "../lib/session-load-reconcile"
 import { appendCursorPage, dedupePage, mergeCursorRefresh, mergeCursorRefreshSnapshot, mergePartsRefreshSnapshot, prependCursorPage, truncateCommittedRevert } from "../lib/cursor-pagination"
 import { attachmentUri } from "../lib/session-request"
-import { findCachedSession, purgeSessionHierarchy, upsertSessionHierarchy } from "../lib/session-hierarchy"
+import { childCountsFromSessions, decrementChildCount, findCachedSession, incrementChildCount, purgeSessionHierarchy, upsertSessionHierarchy } from "../lib/session-hierarchy"
 
 // Fast-fail bound for the sessions list on app start/open. A dead or
 // unreachable saved server otherwise holds the sessions tab's spinner for the
@@ -52,6 +52,9 @@ interface SessionsState {
   childrenHasMore: Record<string, boolean>
   childrenCursor: Record<string, CursorPage<Session>["cursor"]>
   childrenGeneration: Record<string, number>
+  // Directory-wide prefetched child counts (parentID -> known children). A
+  // fallback chevron hint until a parent's children are actually loaded.
+  childCounts: Record<string, number>
   currentSession: Session | null
   messages: Message[]
   parts: Record<string, Part[]>
@@ -146,6 +149,7 @@ function purgeHierarchy(state: SessionsState, sessionID: string): Partial<Sessio
     childrenHasMore: Object.fromEntries(Object.entries(state.childrenHasMore).filter(([id]) => !ids.has(id))),
     childrenCursor: Object.fromEntries(Object.entries(state.childrenCursor).filter(([id]) => !ids.has(id))),
     childrenGeneration: generations,
+    childCounts: Object.fromEntries(Object.entries(state.childCounts).filter(([id]) => !ids.has(id))),
     currentSession: state.currentSession && ids.has(state.currentSession.id) ? null : state.currentSession,
     messages: state.currentSession && ids.has(state.currentSession.id) ? [] : state.messages,
     parts: state.currentSession && ids.has(state.currentSession.id) ? {} : state.parts,
@@ -169,6 +173,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
   childrenHasMore: {},
   childrenCursor: {},
   childrenGeneration: {},
+  childCounts: {},
   currentSession: null,
   messages: [],
   parts: {},
@@ -202,6 +207,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
         childrenLoaded: {},
         childrenHasMore: {},
         childrenCursor: {},
+        childCounts: {},
         childrenGeneration: Object.fromEntries(Object.entries(state.childrenGeneration).map(([id, generation]) => [id, generation + 1])),
       }))
     }
@@ -217,6 +223,18 @@ export const useSessions = create<SessionsState>((set, get) => ({
         hasMoreSessions: Boolean(page.cursor.next),
         isSessionsLoading: false,
       })
+      // Prefetch directory-wide child counts: an unfiltered list includes
+      // child sessions, so rows can show (or omit) the expand chevron without
+      // per-parent fetches. Fire-and-forget — the same seq/scope/connection
+      // guards as the root page keep a stale response from writing counts for
+      // another connection or directory. On failure counts stay unknown and
+      // chevrons simply don't show until the next successful load.
+      void client.session.list({ limit: 300 }, SESSION_LIST_TIMEOUT_MS)
+        .then((allSessions) => {
+          if (seq !== rootListSeq || scope !== connectionScope() || connection !== useConnections.getState().clientBase) return
+          set({ childCounts: childCountsFromSessions(allSessions) })
+        })
+        .catch(() => {})
     } catch (error) {
       if (seq === rootListSeq && scope === connectionScope() && connection === useConnections.getState().clientBase) set({ error: "Failed to load sessions", isSessionsLoading: false })
     }
@@ -476,7 +494,16 @@ export const useSessions = create<SessionsState>((set, get) => ({
 
     try {
       await client.session.delete(sessionID)
-      set((current) => purgeHierarchy(current, sessionID))
+      set((current) => {
+        // Decrement the parent's count only if the session is still cached —
+        // a session.deleted SSE event that won the race already purged and
+        // decremented, so doing it again here would double-count.
+        const cached = findCachedSession(sessionID, current.sessions, current.childrenByParent, current.currentSession)
+        return {
+          ...purgeHierarchy(current, sessionID),
+          childCounts: decrementChildCount(current.childCounts, cached?.parentID),
+        }
+      })
     } catch (error) {
       set({ error: "Failed to delete session" })
       throw error
@@ -713,6 +740,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
       if (!session?.id) return
       set((state) => ({
         ...upsertHierarchy(state, session),
+        childCounts: event.type === "session.created" ? incrementChildCount(state.childCounts, session.parentID) : state.childCounts,
         currentSession: state.currentSession?.id === session.id ? session : state.currentSession,
         isSessionLoading: isLiveEventForSession(session.id, state.currentSession?.id) ? false : state.isSessionLoading,
       }))
@@ -722,7 +750,15 @@ export const useSessions = create<SessionsState>((set, get) => ({
     if (event.type === "session.deleted") {
       const sessionID = typeof props.sessionID === "string" ? props.sessionID : undefined
       if (!sessionID) return
-      set((state) => purgeHierarchy(state, sessionID))
+      set((state) => {
+        // Resolve the parent before the purge drops the session from cache so
+        // its count can be decremented alongside the recursive removal.
+        const cached = findCachedSession(sessionID, state.sessions, state.childrenByParent, state.currentSession)
+        return {
+          ...purgeHierarchy(state, sessionID),
+          childCounts: decrementChildCount(state.childCounts, cached?.parentID),
+        }
+      })
       return
     }
 

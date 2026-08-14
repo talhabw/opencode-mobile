@@ -72,6 +72,31 @@ export function pendingSessionCounts(
   return { own, descendants: Math.max(0, total - own), total }
 }
 
+// Directory-wide child counts derived from an unfiltered session list (which
+// contains roots and children). Rows without a parentID are roots and never
+// count toward any parent; sessions with a parentID each count once for it.
+export function childCountsFromSessions(sessions: Session[]): Record<string, number> {
+  const counts: Record<string, number> = {}
+  for (const session of sessions) {
+    if (!session.parentID) continue
+    counts[session.parentID] = (counts[session.parentID] ?? 0) + 1
+  }
+  return counts
+}
+
+export function incrementChildCount(counts: Record<string, number>, parentID?: string | null): Record<string, number> {
+  if (!parentID) return counts
+  return { ...counts, [parentID]: (counts[parentID] ?? 0) + 1 }
+}
+
+// Only decrements parents with a known count — an absent entry means "unknown",
+// so nothing is decremented (and no -1 sentinel is created) until a prefetch
+// or a create event establishes the count.
+export function decrementChildCount(counts: Record<string, number>, parentID?: string | null): Record<string, number> {
+  if (!parentID || counts[parentID] === undefined) return counts
+  return { ...counts, [parentID]: Math.max(0, counts[parentID] - 1) }
+}
+
 export function unassociatedDescendantPending<T extends { sessionID: string }>(
   sessionID: string,
   childrenByParent: Record<string, Session[]>,

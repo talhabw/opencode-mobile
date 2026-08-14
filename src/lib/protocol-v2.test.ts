@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { OpenCode, type SessionInfo, type SessionMessageInfo } from "@opencode-ai/client"
-import { V2EventAdapter, normalizeAgent, normalizeEvent, normalizeMessage, normalizeSession, isV2HealthResponse, normalizeProviderCatalog, V2_REQUIRED_ERROR } from "./protocol-v2.ts"
+import { V2EventAdapter, normalizeAgent, normalizeEvent, normalizeMessage, normalizeSession, isV2HealthResponse, normalizeProviderCatalog, parseSyntheticTag, V2_REQUIRED_ERROR } from "./protocol-v2.ts"
 
 test("official client uses v2 /api paths and location query", async () => {
   const requests: URL[] = []
@@ -321,6 +321,30 @@ test("keeps raw input buffer independent of parsed input across deltas", () => {
   assert.deepEqual((called.properties.part as { state: { input: unknown } }).state.input, '{"command":"ls"},"cwd":"/tmp"}')
 })
 
+test("streams tool input without parsing every delta", () => {
+  const adapter = new V2EventAdapter()
+  const payload = JSON.stringify({ filePath: "/tmp/a.ts", content: "x".repeat(4_096) })
+  adapter.push({ type: "session.tool.input.started", data: { sessionID: "s1", assistantMessageID: "m1", id: "c1", name: "write" } })
+
+  let finalDelta: unknown
+  for (let offset = 0; offset < payload.length; offset += 7) {
+    const [event] = adapter.push({ type: "session.tool.input.delta", data: { sessionID: "s1", assistantMessageID: "m1", id: "c1", delta: payload.slice(offset, offset + 7) } })
+    finalDelta = (event.properties.part as { state: { input: unknown } }).state.input
+    // The raw accumulated text is visible while streaming; nothing is parsed.
+    assert.equal(typeof finalDelta, "string")
+  }
+  assert.equal(finalDelta, payload)
+
+  const called = adapter.push({ type: "session.tool.called", data: { sessionID: "s1", assistantMessageID: "m1", id: "c1" } })[0]
+  assert.deepEqual((called.properties.part as { state: { input: unknown } }).state.input, JSON.parse(payload))
+
+  const success = adapter.push({ type: "session.tool.success", data: { sessionID: "s1", assistantMessageID: "m1", id: "c1", content: [{ type: "text", text: "done" }] } })[0]
+  const state = (success.properties.part as { state: { status: string; input: unknown; output: unknown } }).state
+  assert.equal(state.status, "completed")
+  assert.deepEqual(state.input, JSON.parse(payload))
+  assert.equal(state.output, "done")
+})
+
 test("releases tool state after terminal success or failure", () => {
   const adapter = new V2EventAdapter()
   adapter.push({ type: "session.tool.input.started", data: { sessionID: "s1", assistantMessageID: "m1", id: "c1", name: "bash" } })
@@ -390,4 +414,161 @@ test("canonical tool parts flatten mixed content into visible output text", () =
   } satisfies SessionMessageInfo, "s1")
   assert.equal(message.parts[0].state?.output, "out\n[file: x.txt (text/plain)]")
   assert.deepEqual(message.parts[0].state?.metadata, { sessionId: "child" })
+})
+
+test("classifies synthetic shell tags into structured shell rows with truthful state", () => {
+  for (const state of ["completed", "error", "cancelled"] as const) {
+    const result = normalizeMessage({
+      id: `msg_${state}`,
+      type: "synthetic",
+      time: { created: 5 },
+      text: `<shell id="call_x_${state}" state="${state}" command="bun run dev:env">`,
+    } satisfies SessionMessageInfo, "s1")
+    assert.equal(result.info.presentation, "shell", state)
+    assert.deepEqual(result.info.shell, {
+      id: `msg_${state}`,
+      shellID: `call_x_${state}`,
+      command: "bun run dev:env",
+      status: state,
+      time: { created: 5 },
+    }, state)
+    assert.deepEqual(result.parts, [], state)
+  }
+})
+
+test("classifies synthetic subagent tags into structured subagent rows", () => {
+  for (const state of ["completed", "error", "cancelled"] as const) {
+    const result = normalizeMessage({
+      id: `msg_${state}`,
+      type: "synthetic",
+      time: { created: 7 },
+      text: `<subagent id="ses_child_${state}" state="${state}" description="Trace streaming UI freeze">`,
+    } satisfies SessionMessageInfo, "s1")
+    assert.equal(result.info.presentation, "subagent", state)
+    assert.deepEqual(result.info.subagent, {
+      id: `msg_${state}`,
+      refID: `ses_child_${state}`,
+      state,
+      description: "Trace streaming UI freeze",
+      time: { created: 7 },
+    }, state)
+    assert.deepEqual(result.parts, [], state)
+  }
+})
+
+test("synthetic tag parser tolerates attribute order, quoting, and unknown attributes", () => {
+  assert.deepEqual(
+    parseSyntheticTag(`<shell command='bun run dev:env' state="completed" id="call_1" extra="ignored">`),
+    { kind: "shell", id: "call_1", state: "completed", command: "bun run dev:env" },
+  )
+  assert.deepEqual(
+    parseSyntheticTag(`  <subagent  state='error'  id='ses_1'  description='Investigate freeze'  unknown="x" >  `),
+    { kind: "subagent", id: "ses_1", state: "error", description: "Investigate freeze" },
+  )
+  assert.deepEqual(
+    parseSyntheticTag(`<shell id="call_2" state="completed">`),
+    { kind: "shell", id: "call_2", state: "completed", command: "" },
+  )
+})
+
+test("synthetic tag parser captures wrapped marker content between open and close tags", () => {
+  assert.deepEqual(
+    parseSyntheticTag(`<shell id="call_1" state="completed" command="bun run dev:env">\nDone in 412ms\n</shell>`),
+    { kind: "shell", id: "call_1", state: "completed", command: "bun run dev:env", content: "Done in 412ms" },
+  )
+  assert.deepEqual(
+    parseSyntheticTag(`<subagent id="ses_1" state="completed" description="Trace freeze">\nSubagent finished the trace\n</subagent>`),
+    { kind: "subagent", id: "ses_1", state: "completed", description: "Trace freeze", content: "Subagent finished the trace" },
+  )
+  // Empty content between the tags is treated as no content, not "".
+  assert.deepEqual(
+    parseSyntheticTag(`<shell id="call_2" state="error" command="ls">\n</shell>`),
+    { kind: "shell", id: "call_2", state: "error", command: "ls" },
+  )
+})
+
+test("wrapped synthetic markers map content into shell output and subagent result", () => {
+  const shell = normalizeMessage({
+    id: "m1",
+    type: "synthetic",
+    time: { created: 1 },
+    text: `<shell id="call_1" state="completed" command="bun run dev:env">\nDone in 412ms\n</shell>`,
+  } satisfies SessionMessageInfo, "s1")
+  assert.equal(shell.info.presentation, "shell")
+  assert.equal(shell.info.shell?.output?.output, "Done in 412ms")
+
+  const subagent = normalizeMessage({
+    id: "m2",
+    type: "synthetic",
+    time: { created: 1 },
+    text: `<subagent id="ses_1" state="completed" description="Trace">\nFound the race\n</subagent>`,
+  } satisfies SessionMessageInfo, "s1")
+  assert.equal(subagent.info.presentation, "subagent")
+  assert.equal(subagent.info.subagent?.result, "Found the race")
+})
+
+test("malformed or non-marker synthetic text keeps the system-row fallback", () => {
+  const fallbacks = [
+    "plain synthetic text",
+    '<shell id="call_1" state="completed"',
+    '<shell id="call_1" state="finished" command="ls">',
+    '<foo id="x" state="completed">',
+    '<subagent state="completed">',
+    '<subagent id="ses_1">',
+    'prefix <shell id="c" state="completed">',
+  ]
+  for (const text of fallbacks) {
+    const result = normalizeMessage({ id: "m", type: "synthetic", time: { created: 1 }, text } satisfies SessionMessageInfo, "s1")
+    assert.equal(result.info.presentation, "system", text)
+    assert.equal(result.info.systemKind, "synthetic", text)
+    assert.equal(result.parts.length, 1, text)
+    assert.equal(result.parts[0].text, text, text)
+  }
+})
+
+test("subagent payload prefers the tag description and falls back to the persisted description", () => {
+  const fromPersisted = normalizeMessage({
+    id: "m1",
+    type: "synthetic",
+    time: { created: 1 },
+    text: `<subagent id="ses_1" state="completed">`,
+    description: "Persisted description",
+  } satisfies SessionMessageInfo, "s1")
+  assert.equal(fromPersisted.info.subagent?.description, "Persisted description")
+
+  const fromTag = normalizeMessage({
+    id: "m2",
+    type: "synthetic",
+    time: { created: 1 },
+    text: `<subagent id="ses_2" state="cancelled" description="From tag">`,
+    description: "Persisted description",
+  } satisfies SessionMessageInfo, "s1")
+  assert.equal(fromTag.info.subagent?.description, "From tag")
+
+  const none = normalizeMessage({
+    id: "m3",
+    type: "synthetic",
+    time: { created: 1 },
+    text: `<subagent id="ses_3" state="error">`,
+  } satisfies SessionMessageInfo, "s1")
+  assert.equal(none.info.subagent?.description, undefined)
+})
+
+test("preserves synthetic tag ids exactly", () => {
+  const shell = normalizeMessage({
+    id: "msgA",
+    type: "synthetic",
+    time: { created: 1 },
+    text: `<shell id="call_weird/id=1" state="completed" command="x">`,
+  } satisfies SessionMessageInfo, "s1")
+  assert.equal(shell.info.shell?.shellID, "call_weird/id=1")
+
+  const subagent = normalizeMessage({
+    id: "msgB",
+    type: "synthetic",
+    time: { created: 1 },
+    text: `<subagent id="ses_abc/DEF-123" state="completed" description="d">`,
+  } satisfies SessionMessageInfo, "s1")
+  assert.equal(subagent.info.subagent?.refID, "ses_abc/DEF-123")
+  assert.equal(subagent.info.id, "msgB")
 })

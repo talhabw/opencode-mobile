@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import type { Session } from "./sdk.ts"
-import { descendantIDs, flattenSessionHierarchy, pendingSessionCounts, purgeSessionHierarchy, unassociatedDescendantPending, upsertSessionHierarchy } from "./session-hierarchy.ts"
+import { childCountsFromSessions, decrementChildCount, descendantIDs, flattenSessionHierarchy, incrementChildCount, pendingSessionCounts, purgeSessionHierarchy, unassociatedDescendantPending, upsertSessionHierarchy } from "./session-hierarchy.ts"
 
 const session = (id: string, parentID?: string): Session => ({
   id, slug: id, projectID: "p", directory: "/work", parentID, title: id, version: "2", time: { created: 1, updated: 1 },
@@ -57,4 +57,45 @@ test("purges a subtree without touching unrelated roots", () => {
   assert.deepEqual(result.roots, [other])
   assert.deepEqual(result.childrenByParent, {})
   assert.deepEqual([...result.removed], ["root", "child", "grand"])
+})
+
+test("derives child counts from an unfiltered directory list", () => {
+  const list = [
+    session("root1"),
+    session("root2"),
+    session("childA", "root1"),
+    session("childB", "root1"),
+    session("grandchild", "childA"),
+    session("childC", "root2"),
+  ]
+  assert.deepEqual(childCountsFromSessions(list), { root1: 2, childA: 1, root2: 1 })
+  assert.deepEqual(childCountsFromSessions([]), {})
+  assert.deepEqual(childCountsFromSessions([session("onlyRoot")]), {})
+})
+
+test("ignores sessions without a parentID when counting", () => {
+  const list = [session("root"), { ...session("orphan"), parentID: undefined }]
+  assert.deepEqual(childCountsFromSessions(list), {})
+})
+
+test("increments child counts on created sessions", () => {
+  const counts = { root: 1 }
+  assert.deepEqual(incrementChildCount(counts, "root"), { root: 2 })
+  assert.deepEqual(counts, { root: 1 })
+  // A parent whose count was never prefetched is established at 1.
+  assert.deepEqual(incrementChildCount(counts, "fresh"), { root: 1, fresh: 1 })
+  // Roots and unknown parents don't change anything.
+  assert.equal(incrementChildCount(counts, undefined), counts)
+  assert.equal(incrementChildCount(counts, null), counts)
+})
+
+test("decrements child counts on deleted sessions", () => {
+  const counts = { root: 2, child: 1 }
+  assert.deepEqual(decrementChildCount(counts, "root"), { root: 1, child: 1 })
+  // Never drops below zero even if events race.
+  assert.deepEqual(decrementChildCount({ root: 0 }, "root"), { root: 0 })
+  // Unknown parents stay unknown rather than going negative.
+  assert.equal(decrementChildCount(counts, "neverCounted"), counts)
+  assert.equal(decrementChildCount(counts, undefined), counts)
+  assert.equal(decrementChildCount(counts, null), counts)
 })

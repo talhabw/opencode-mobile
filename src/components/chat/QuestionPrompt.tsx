@@ -7,7 +7,7 @@ import { questionValidationMessage, updateQuestionAnswer, updateQuestionDraft } 
 
 interface QuestionOption {
   label: string
-  description: string
+  description?: string
 }
 
 interface Question {

@@ -316,6 +316,14 @@ export function createClient(input: ClientConfig) {
         return true
       },
     },
+    form: {
+      list: (sessionID: string) => checked(raw.form.list({ sessionID })),
+      requestList: async () => (await checked(raw.form.request.list({ location: scopedLocation }))).data,
+      reply: (params: { sessionID: string; formID: string; answer: Record<string, string | string[]> }) =>
+        checked(raw.form.reply({ sessionID: params.sessionID, formID: params.formID, answer: params.answer })),
+      cancel: (params: { sessionID: string; formID: string }) =>
+        checked(raw.form.cancel({ sessionID: params.sessionID, formID: params.formID })),
+    },
     agent: { list: async (): Promise<Agent[]> => (await checked(raw.agent.list({ location: scopedLocation }))).data.map(normalizeAgent) },
     command: { list: async (): Promise<Command[]> => (await checked(raw.command.list({ location: scopedLocation }))).data.map(normalizeCommand) },
     model: {

@@ -13,13 +13,20 @@ import { eventSessionID, mergeSendingState, reconnectDelay, resyncPlan, shouldRe
 import { canAutoResume } from "../lib/transport-lifecycle"
 import type { TransportPhase } from "../lib/transport-lifecycle"
 import type { Client, Event, Part, Session, Message } from "../lib/sdk"
+import {
+  dedupePendingInputs,
+  fromQuestionForm,
+  fromQuestionRequest,
+  isQuestionForm,
+  type PendingInput,
+  type QuestionRequestLike,
+} from "../lib/question-inputs"
 import { findCachedSession } from "../lib/session-hierarchy"
 import { LatestValueBuffer } from "../lib/latest-value-buffer"
 
 // Session status from the server
 type SessionStatus = { type: "idle" } | { type: "busy" } | { type: "retry"; attempt: number; message: string }
 type PendingPermission = Awaited<ReturnType<Client["permission"]["list"]>>[number]
-type PendingQuestion = Awaited<ReturnType<Client["question"]["list"]>>[number]
 
 interface EventsState {
   connected: boolean
@@ -39,7 +46,7 @@ interface EventsState {
   statusText: Record<string, string>
   // Permissions & questions (pending per session)
   permissions: Record<string, PendingPermission[]>
-  questions: Record<string, PendingQuestion[]>
+  questions: Record<string, PendingInput[]>
 
   connect: () => void
   pause: () => void
@@ -57,6 +64,15 @@ const resolvedQuestions = new Set<string>()
 // Rendering every token reparses and relays out the whole accumulated response.
 // Ten visual updates per second keeps streaming fluid without starving input.
 const streamedParts = new LatestValueBuffer<Part>(100, (parts) => {
+  const sessions = useSessions.getState()
+  for (const part of parts) sessions.handleEvent({ type: "message.part.updated", properties: { part } })
+})
+// Tool parts stream through the same coalescing so a busy run's
+// session.tool.input.delta / session.tool.progress storms commit at most ten
+// times per second instead of once per SSE event (each commit is a full
+// zustand set that re-renders the row). Lifecycle events (input.started,
+// called, success, failed) flush the buffer immediately via canonicalRefresh.
+const streamedToolParts = new LatestValueBuffer<Part>(100, (parts) => {
   const sessions = useSessions.getState()
   for (const part of parts) sessions.handleEvent({ type: "message.part.updated", properties: { part } })
 })
@@ -81,19 +97,33 @@ const PROLONGED_DISCONNECT_MS = 30_000
 // optimistic removals.
 export async function refreshPending(client: Client, sessionID: string) {
   try {
-    const [perms, questions] = await Promise.all([client.permission.list(), client.question.list()])
+    const [perms, questions, forms] = await Promise.all([client.permission.list(), client.question.list(), pendingFormInputs(client)])
+    const inputs = dedupePendingInputs([...questions.map(fromQuestionRequest), ...forms])
     const permissionIDs = new Set(perms.map((request) => request.id))
-    const questionIDs = new Set(questions.map((request) => request.id))
+    const inputIDs = new Set(inputs.map((input) => input.id))
     for (const id of resolvedPermissions) if (!permissionIDs.has(id)) resolvedPermissions.delete(id)
-    for (const id of resolvedQuestions) if (!questionIDs.has(id)) resolvedQuestions.delete(id)
+    for (const id of resolvedQuestions) if (!inputIDs.has(id)) resolvedQuestions.delete(id)
     const sessionPerms = perms.filter((request) => request.sessionID === sessionID && !resolvedPermissions.has(request.id))
-    const sessionQuestions = questions.filter((request) => request.sessionID === sessionID && !resolvedQuestions.has(request.id))
+    const sessionQuestions = inputs.filter((input) => input.sessionID === sessionID && !resolvedQuestions.has(input.id))
     useEvents.setState((state) => ({
       permissions: { ...state.permissions, [sessionID]: sessionPerms },
       questions: { ...state.questions, [sessionID]: sessionQuestions },
     }))
   } catch (err) {
     console.warn("[Events] Failed to refresh pending:", err)
+  }
+}
+
+// Pending question forms from the global, location-scoped form request list so
+// child-session-owned forms are recovered too. Older servers do not expose
+// the forms API; a failure there must not block legacy question recovery.
+async function pendingFormInputs(client: Client): Promise<PendingInput[]> {
+  try {
+    const forms = await client.form.requestList()
+    return forms.filter(isQuestionForm).map(fromQuestionForm).filter((input) => input.questions.length > 0)
+  } catch (err) {
+    console.warn("[Events] Failed to refresh pending forms:", err)
+    return []
   }
 }
 
@@ -115,20 +145,23 @@ async function authoritativeResync(client: Client, isCurrent: () => boolean) {
   if (!isCurrent()) return
   const sessions = useSessions.getState()
   const plan = resyncPlan(Boolean(sessions.currentSession))
-  const pending = plan.pending ? Promise.all([client.permission.list(), client.question.list()]) : null
+  const pending = plan.pending
+    ? Promise.all([client.permission.list(), client.question.list(), pendingFormInputs(client)])
+    : null
   const active = plan.active ? client.session.active() : null
   await Promise.all([
     plan.sessions ? sessions.loadSessions() : undefined,
     plan.messages ? sessions.refreshMessages() : undefined,
-    pending?.then(([permissions, questions]) => {
+    pending?.then(([permissions, questions, forms]) => {
       if (!isCurrent()) return
+      const inputs = dedupePendingInputs([...questions.map(fromQuestionRequest), ...forms])
       const permissionIDs = new Set(permissions.map((request) => request.id))
-      const questionIDs = new Set(questions.map((request) => request.id))
+      const inputIDs = new Set(inputs.map((input) => input.id))
       for (const id of resolvedPermissions) if (!permissionIDs.has(id)) resolvedPermissions.delete(id)
-      for (const id of resolvedQuestions) if (!questionIDs.has(id)) resolvedQuestions.delete(id)
+      for (const id of resolvedQuestions) if (!inputIDs.has(id)) resolvedQuestions.delete(id)
       useEvents.setState({
         permissions: groupPending(permissions, resolvedPermissions),
-        questions: groupPending(questions, resolvedQuestions),
+        questions: groupPending(inputs, resolvedQuestions),
       })
     }),
     active?.then((running) => {
@@ -147,8 +180,15 @@ async function authoritativeResync(client: Client, isCurrent: () => boolean) {
 }
 
 function scheduleCanonicalRefresh(event: Event, isCurrent: () => boolean) {
-  if (!shouldRefreshCanonicalMessages(event)) return
   const sessionID = eventSessionID(event)
+  // A run mid-flight counts as busy even while its live parts stream in.
+  // Terminal events (execution succeeded/failed/interrupted, session.error)
+  // are exempt from the gate — the busy -> idle transition is the
+  // authoritative end-of-run refresh, so nothing is lost by skipping the
+  // redundant mid-run refreshes.
+  const busy = sessionID !== undefined &&
+    (useEvents.getState().sessionStatus[sessionID]?.type === "busy" || Boolean(useSessions.getState().sending[sessionID]))
+  if (!shouldRefreshCanonicalMessages(event, busy)) return
   if (!sessionID || useSessions.getState().currentSession?.id !== sessionID) return
   const previous = messageRefreshTimers.get(sessionID)
   if (previous) clearTimeout(previous)
@@ -185,7 +225,7 @@ const isSession = (input: unknown): input is Session =>
   Boolean(input && typeof input === "object" && "id" in input && typeof input.id === "string" && "directory" in input && typeof input.directory === "string")
 const isPermission = (input: unknown): input is PendingPermission =>
   Boolean(input && typeof input === "object" && "id" in input && typeof input.id === "string" && "sessionID" in input && typeof input.sessionID === "string" && "permission" in input && typeof input.permission === "string" && "patterns" in input && Array.isArray(input.patterns))
-const isQuestion = (input: unknown): input is PendingQuestion =>
+const isQuestion = (input: unknown): input is QuestionRequestLike =>
   Boolean(input && typeof input === "object" && "id" in input && typeof input.id === "string" && "sessionID" in input && typeof input.sessionID === "string" && "questions" in input && Array.isArray(input.questions))
 
 // Re-sync any session currently marked "busy" against the server after an
@@ -262,6 +302,7 @@ export const useEvents = create<EventsState>((set, get) => ({
   connect: () => {
     const streamGeneration = ++generation
     streamedParts.clear()
+    streamedToolParts.clear()
     controller?.abort()
     controller = null
     if (reconnectTimer) {
@@ -441,7 +482,7 @@ export const useEvents = create<EventsState>((set, get) => ({
               if (part.type === "text" || part.type === "reasoning") {
                 streamedParts.push(`${part.sessionID ?? ""}\u0000${part.messageID}\u0000${part.id}`, part, props.canonicalRefresh === true)
               } else {
-                useSessions.getState().handleEvent({ type, properties: { part } })
+                streamedToolParts.push(`${part.sessionID ?? ""}\u0000${part.messageID}\u0000${part.id}`, part, props.canonicalRefresh === true)
               }
               break
             }
@@ -559,7 +600,7 @@ export const useEvents = create<EventsState>((set, get) => ({
 
             case "question.asked": {
               if (!isQuestion(props)) break
-              const req = props
+              const req = fromQuestionRequest(props)
               if (resolvedQuestions.has(req.id)) break
               const existing = get().questions[req.sessionID] || []
               if (existing.some((item) => item.id === req.id)) break
@@ -590,6 +631,48 @@ export const useEvents = create<EventsState>((set, get) => ({
                 questions: {
                   ...state.questions,
                   [sessionID]: (state.questions[sessionID] || []).filter((q) => q.id !== requestID),
+                },
+              }))
+              break
+            }
+
+            case "form.created": {
+              // Newer servers surface the question tool through forms
+              // (metadata.kind === "question") instead of question.asked.
+              const form = props.form
+              if (!isQuestionForm(form)) break
+              const req = fromQuestionForm(form)
+              if (req.questions.length === 0) break
+              if (resolvedQuestions.has(req.id)) break
+              const existing = get().questions[req.sessionID] || []
+              if (existing.some((item) => item.id === req.id)) break
+              set((state) => ({
+                questions: {
+                  ...state.questions,
+                  [req.sessionID]: [...(state.questions[req.sessionID] || []), req],
+                },
+              }))
+              notify({
+                category: "questions",
+                title: req.questions[0]?.header || "Input needed",
+                body: sanitizeBody(req.questions[0]?.question, "The assistant has a question"),
+                sessionId: req.sessionID,
+                dedupeKey: `question-${req.id}`,
+                dedupeCooldownMs: 60_000,
+              })
+              break
+            }
+
+            case "form.replied":
+            case "form.cancelled": {
+              const sessionID = value(props, "sessionID", isString)
+              const formID = value(props, "id", isString)
+              if (!sessionID || !formID) break
+              resolvedQuestions.add(formID)
+              set((state) => ({
+                questions: {
+                  ...state.questions,
+                  [sessionID]: (state.questions[sessionID] || []).filter((q) => q.id !== formID),
                 },
               }))
               break
@@ -629,6 +712,7 @@ export const useEvents = create<EventsState>((set, get) => ({
   pause: () => {
     generation += 1
     streamedParts.clear()
+    streamedToolParts.clear()
     if (reconnectTimer) {
       clearTimeout(reconnectTimer)
       reconnectTimer = null
@@ -665,6 +749,7 @@ export const useEvents = create<EventsState>((set, get) => ({
     if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
     sessionRefreshTimer = null
     streamedParts.clear()
+    streamedToolParts.clear()
     resolvedPermissions.clear()
     resolvedQuestions.clear()
     erroredSessions.clear()

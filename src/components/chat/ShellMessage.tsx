@@ -7,8 +7,9 @@ import { useAccent } from "../../lib/accents"
 const mono = Platform.OS === "ios" ? "Menlo" : "monospace"
 
 function statusColor(status: NonNullable<Message["shell"]>["status"]): string {
-  if (status === "exited") return "#22c55e"
+  if (status === "exited" || status === "completed") return "#22c55e"
   if (status === "running") return "#f59e0b"
+  if (status === "cancelled") return "#888888"
   return "#ef4444"
 }
 
@@ -45,7 +46,11 @@ export function ShellMessage({ message, isDark }: { message: Message; isDark: bo
         </ScrollView>
       )}
       {shell.output?.truncated && <Text style={[styles.truncated, isDark && styles.metaDark]}>{t("chat.shellMessage.outputTruncated")}</Text>}
-      {shell.output && <Text style={[styles.meta, isDark && styles.metaDark]}>cursor {shell.output.cursor} / {shell.output.size}</Text>}
+      {/* Cursor semantics belong to real shell message records; synthetic
+          completion markers carry plain output without a cursor. */}
+      {shell.output && shell.exit !== undefined && (
+        <Text style={[styles.meta, isDark && styles.metaDark]}>cursor {shell.output.cursor} / {shell.output.size}</Text>
+      )}
     </View>
   )
 }

@@ -391,7 +391,18 @@
         "running": "运行中",
         "exited": "已退出",
         "timeout": "已超时",
-        "killed": "已终止"
+        "killed": "已终止",
+        "completed": "已完成",
+        "error": "失败",
+        "cancelled": "已取消"
+      }
+    },
+    "subagentMessage": {
+      "title": "子代理",
+      "status": {
+        "completed": "已完成",
+        "error": "失败",
+        "cancelled": "已取消"
       }
     },
     "permissionPrompt": {

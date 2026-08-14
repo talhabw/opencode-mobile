@@ -391,7 +391,18 @@
         "running": "Running",
         "exited": "Exited",
         "timeout": "Timed out",
-        "killed": "Killed"
+        "killed": "Killed",
+        "completed": "Completed",
+        "error": "Failed",
+        "cancelled": "Cancelled"
+      }
+    },
+    "subagentMessage": {
+      "title": "Subagent",
+      "status": {
+        "completed": "Completed",
+        "error": "Failed",
+        "cancelled": "Cancelled"
       }
     },
     "permissionPrompt": {

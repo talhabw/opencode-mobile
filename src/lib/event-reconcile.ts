@@ -31,10 +31,32 @@ const CANONICAL_REFRESH_EVENTS = new Set([
   "session.tool.called",
   "session.tool.success",
   "session.tool.failed",
+  "session.synthetic",
 ])
 
-export function shouldRefreshCanonicalMessages(event: Event): boolean {
-  return CANONICAL_REFRESH_EVENTS.has(event.type) || event.properties.canonicalRefresh === true
+// Terminal/error events always refresh the canonical page: they are the only
+// authoritative end-of-run state, so they must not be gated by busy-ness.
+// "session.status" here means the normalized idle transition — normalizeEvent
+// only ever stamps canonicalRefresh on status events for
+// execution.succeeded/interrupted/idle (and the failed -> idle pair), and a
+// plain status event never passes shouldRefreshCanonicalMessages.
+const TERMINAL_REFRESH_EVENTS = new Set([
+  "session.error",
+  "session.execution.succeeded",
+  "session.execution.failed",
+  "session.execution.interrupted",
+  "session.status",
+])
+
+export function shouldRefreshCanonicalMessages(event: Event, sessionBusy?: boolean): boolean {
+  if (!CANONICAL_REFRESH_EVENTS.has(event.type) && event.properties.canonicalRefresh !== true) return false
+  // While a session is mid-run, its live events already carry the same data
+  // the canonical page would, and each mid-run refresh re-parses and re-renders
+  // the whole thread (Markdown included) for no new information. The terminal
+  // busy -> idle execution transition triggers the authoritative refresh, so
+  // skipping mid-run refreshes loses nothing.
+  if (sessionBusy === true && !TERMINAL_REFRESH_EVENTS.has(event.type)) return false
+  return true
 }
 
 export function eventSessionID(event: Event): string | undefined {

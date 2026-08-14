@@ -5,6 +5,7 @@ import { Markdown } from "../markdown"
 import { ToolCallCard } from "./ToolCallCard"
 import { ReasoningBlock } from "./ReasoningBlock"
 import { ShellMessage, SystemMessage } from "./ShellMessage"
+import { SubagentMessage } from "./SyntheticMessage"
 import type { Message, Part } from "../../lib/sdk"
 import { useAccent, type AccentState } from "../../lib/accents"
 
@@ -25,12 +26,17 @@ interface Props {
   // revert action sheet. Identified by messageID (not a closure over parts)
   // so it stays correct even if the memo below bails on a stale render.
   onLongPress?: (messageID: string) => void
+  // Fired by expandable rows (reasoning, tool/task cards) right before their
+  // layout change lands, so the screen can keep the tapped header anchored.
+  // The screen MUST pass a stable useCallback: the memo comparator below
+  // bails on identity, and this prop is compared the same way as onLongPress.
+  onToggleExpand?: (id: string, expanded: boolean) => void
 }
 
 // TODO: Replace with streamdown-rn once React 19 types PR lands - it has
 // built-in block-level memoization that eliminates re-renders for stable blocks
 export const MessageBubble = memo(
-  function MessageBubble({ message, parts, isDark, fontSize = 15, isStreaming = false, onLongPress }: Props) {
+  function MessageBubble({ message, parts, isDark, fontSize = 15, isStreaming = false, onLongPress, onToggleExpand }: Props) {
     const { t } = useTranslation()
     const isUser = message.role === "user"
     const acc = useAccent()
@@ -49,6 +55,7 @@ export const MessageBubble = memo(
       : text
 
     if (message.presentation === "shell") return <ShellMessage message={message} isDark={isDark} />
+    if (message.presentation === "subagent") return <SubagentMessage message={message} isDark={isDark} />
     if (message.presentation === "system") return <SystemMessage message={message} parts={parts} isDark={isDark} />
 
     return (
@@ -94,7 +101,9 @@ export const MessageBubble = memo(
         )}
 
         {/* Reasoning (collapsible) */}
-        {reasoning.length > 0 && <ReasoningBlock text={reasoning} isDark={isDark} />}
+        {reasoning.length > 0 && (
+          <ReasoningBlock text={reasoning} isDark={isDark} id={message.id} onToggleExpand={onToggleExpand} />
+        )}
 
         {/* Message text */}
         {text.length > 0 &&
@@ -114,7 +123,7 @@ export const MessageBubble = memo(
 
         {/* Tool calls */}
         {toolParts.map((tool) => (
-          <ToolCallCard key={tool.id} tool={tool} isDark={isDark} />
+          <ToolCallCard key={tool.id} tool={tool} isDark={isDark} onToggleExpand={onToggleExpand} />
         ))}
 
         {message.error && (
@@ -146,6 +155,9 @@ export const MessageBubble = memo(
     if (prev.fontSize !== next.fontSize) return false
     if (prev.isStreaming !== next.isStreaming) return false
     if (prev.onLongPress !== next.onLongPress) return false
+    // Identity-compared like onLongPress: the screen must pass a stable
+    // useCallback so expansion toggles never invalidate the memo.
+    if (prev.onToggleExpand !== next.onToggleExpand) return false
     if (prev.parts.length !== next.parts.length) return false
     for (let i = 0; i < prev.parts.length; i++) {
       if (prev.parts[i] !== next.parts[i]) return false

@@ -39,7 +39,7 @@ import {
   type Attachment,
 } from "../../src/components/chat"
 import { computeSessionUsage } from "../../src/lib/session-usage"
-import { shouldPinToBottom } from "../../src/lib/session-scroll"
+import { shouldPinToBottom, expansionAnchorDelta } from "../../src/lib/session-scroll"
 import { useSessions } from "../../src/stores/sessions"
 import { useEvents, refreshPending, markPendingResolved } from "../../src/stores/events"
 import { useConnections } from "../../src/stores/connections"
@@ -56,6 +56,7 @@ import { stripTrailingSlash } from "../../src/lib/path-utils"
 import { selectorLabel } from "../../src/lib/selection-ui"
 import { findCachedSession, unassociatedDescendantPending } from "../../src/lib/session-hierarchy"
 import { taskSubagentLink } from "../../src/lib/task-subagent"
+import { toFormAnswer, type PendingInput } from "../../src/lib/question-inputs"
 
 // Header title marquee. When the session title overflows the header title
 // area it scrolls, but never continuously: it slides left, returns, pauses a
@@ -64,6 +65,12 @@ const TITLE_SCROLL_MS = 2200
 const TITLE_END_READ_MS = 2000
 const TITLE_PAUSE_MS = 3000
 const TITLE_GAP = 16
+
+// How long an expansion anchor may wait for its layout change to land before
+// being discarded. Real layout changes arrive within a frame or two; the bound
+// only guards against a rapid expand+collapse that nets to zero height change
+// and may never produce a content-size event at all.
+const ANCHOR_PENDING_TIMEOUT_MS = 500
 
 const headerTitleStyles = StyleSheet.create({
   wrap: { flex: 1, overflow: "hidden", justifyContent: "flex-start" },
@@ -619,12 +626,52 @@ export default function SessionScreen() {
   // atBottomRef mirrors that (in a ref, so onContentSizeChange below can read the
   // latest value without being recreated on every scroll).
   const atBottomRef = useRef(true)
+  // Current scroll offset in the inverted list (0 = newest content at the visual
+  // bottom), kept in a ref so the expansion anchor below can read the latest
+  // value without being recreated on every scroll.
+  const offsetRef = useRef(0)
   const handleScroll = useCallback((event: any) => {
     const { contentOffset } = event.nativeEvent
+    offsetRef.current = contentOffset.y
     const atBottom = contentOffset.y <= 200
     atBottomRef.current = atBottom
     setShowScrollButton(!atBottom)
   }, [])
+
+  // Last reported content height, for computing signed deltas when an expanded
+  // row grows or shrinks the content (see handleToggleExpand below).
+  const lastContentHeightRef = useRef(0)
+
+  // A row expansion/collapse awaiting its layout change. onToggleExpand fires
+  // BEFORE the height change lands; the pending anchor then makes the next
+  // nonzero content-height change scroll by its own signed delta instead of
+  // bottom-pinning, so the tapped header stays under the finger. Bounded by a
+  // timeout so a rapid expand+collapse that nets to zero height change (which
+  // may never emit a content-size event) cannot leave the anchor pending.
+  const pendingAnchorRef = useRef<{ expanded: boolean } | null>(null)
+  const pendingAnchorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const clearPendingAnchor = useCallback(() => {
+    pendingAnchorRef.current = null
+    if (pendingAnchorTimerRef.current) {
+      clearTimeout(pendingAnchorTimerRef.current)
+      pendingAnchorTimerRef.current = null
+    }
+  }, [])
+
+  // Stable across renders (reads refs only) so MessageBubble's custom memo
+  // comparator can bail safely without risking a stale handler.
+  const handleToggleExpand = useCallback((_id: string, expanded: boolean) => {
+    if (pendingAnchorTimerRef.current) clearTimeout(pendingAnchorTimerRef.current)
+    pendingAnchorRef.current = { expanded }
+    pendingAnchorTimerRef.current = setTimeout(() => {
+      pendingAnchorRef.current = null
+      pendingAnchorTimerRef.current = null
+    }, ANCHOR_PENDING_TIMEOUT_MS)
+  }, [])
+
+  // Clear the anchor timer if the screen unmounts before the layout lands.
+  useEffect(() => () => clearPendingAnchor(), [clearPendingAnchor])
 
   // Auto-scroll to the newest content as it streams in — but only when the user
   // is already at the bottom; never yank them out of history they're reading.
@@ -632,11 +679,26 @@ export default function SessionScreen() {
   // an existing bubble). Without this, maintainVisibleContentPosition anchors
   // the viewport on the previously-visible item, so newly streamed text stays
   // hidden just below the fold.
-  const handleContentSizeChange = useCallback(() => {
+  const handleContentSizeChange = useCallback((_contentWidth: number, contentHeight: number) => {
+    // Signed delta is 0 on the very first event (no previous height to compare).
+    const delta = lastContentHeightRef.current > 0 ? contentHeight - lastContentHeightRef.current : 0
+    lastContentHeightRef.current = contentHeight
+    // Expansion anchor: the tapped row just grew or shrunk by `delta`. In the
+    // inverted list the content above the row slides by `delta` against the
+    // bottom-anchored viewport, so the offset must move by the same signed
+    // delta (a collapse reports a negative delta and moves back) — clamped at
+    // 0 and unanimated so it lands in the same frame as the layout change.
+    // This change must also NOT bottom-pin, or the snap to offset 0 would fight
+    // the anchor.
+    if (expansionAnchorDelta({ delta, pending: pendingAnchorRef.current !== null }) !== null) {
+      flatListRef.current?.scrollToOffset({ offset: Math.max(0, offsetRef.current + delta), animated: false })
+      clearPendingAnchor()
+      return
+    }
     if (shouldPinToBottom({ trigger: "content-change", nearBottom: atBottomRef.current })) {
       flatListRef.current?.scrollToOffset({ offset: 0, animated: false })
     }
-  }, [])
+  }, [clearPendingAnchor])
 
   const handleListLayout = useCallback(() => {
     if (shouldPinToBottom({ trigger: "layout-change", nearBottom: atBottomRef.current })) {
@@ -695,26 +757,34 @@ export default function SessionScreen() {
     }
   }
 
-  const handleQuestionReply = async (requestID: string, answers: string[][], ownerSessionID: string) => {
+  const handleQuestionReply = async (request: PendingInput, answers: string[][]) => {
     if (!sessionClient) throw new Error("No session client")
-    await sessionClient.question.reply(requestID, answers, ownerSessionID)
-    markPendingResolved("question", requestID, true)
+    if (request.transport === "form" && request.formID) {
+      await sessionClient.form.reply({ sessionID: request.sessionID, formID: request.formID, answer: toFormAnswer(request, answers) })
+    } else {
+      await sessionClient.question.reply(request.id, answers, request.sessionID)
+    }
+    markPendingResolved("question", request.id, true)
     useEvents.setState((state) => ({
       questions: {
         ...state.questions,
-        [ownerSessionID]: (state.questions[ownerSessionID] || []).filter((q) => q.id !== requestID),
+        [request.sessionID]: (state.questions[request.sessionID] || []).filter((q) => q.id !== request.id),
       },
     }))
   }
 
-  const handleQuestionReject = async (requestID: string, ownerSessionID: string) => {
+  const handleQuestionReject = async (request: PendingInput) => {
     if (!sessionClient) throw new Error("No session client")
-    await sessionClient.question.reject(requestID, ownerSessionID)
-    markPendingResolved("question", requestID, true)
+    if (request.transport === "form" && request.formID) {
+      await sessionClient.form.cancel({ sessionID: request.sessionID, formID: request.formID })
+    } else {
+      await sessionClient.question.reject(request.id, request.sessionID)
+    }
+    markPendingResolved("question", request.id, true)
     useEvents.setState((state) => ({
       questions: {
         ...state.questions,
-        [ownerSessionID]: (state.questions[ownerSessionID] || []).filter((q) => q.id !== requestID),
+        [request.sessionID]: (state.questions[request.sessionID] || []).filter((q) => q.id !== request.id),
       },
     }))
   }
@@ -869,6 +939,7 @@ export default function SessionScreen() {
                   fontSize={Math.round(15 * (fontScale / 100))}
                   isStreaming={item.message.id === streamingMessageID}
                   onLongPress={handleMessageLongPress}
+                  onToggleExpand={handleToggleExpand}
                 />
               )}
               contentContainerStyle={s.messageList}
@@ -949,8 +1020,8 @@ export default function SessionScreen() {
             key={q.id}
             request={q}
             isDark={isDark}
-            onReply={(answers) => handleQuestionReply(q.id, answers, q.sessionID)}
-            onReject={() => handleQuestionReject(q.id, q.sessionID)}
+            onReply={(answers) => handleQuestionReply(q, answers)}
+            onReject={() => handleQuestionReject(q)}
           />
         ))}
 

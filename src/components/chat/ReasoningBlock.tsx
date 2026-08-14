@@ -6,16 +6,28 @@ import { useTranslation } from "react-i18next"
 interface Props {
   text: string
   isDark: boolean
+  /** Stable identifier reported to onToggleExpand (e.g. the owning message id). */
+  id?: string
+  /**
+   * Fired with the NEW expanded state right before the row's layout change
+   * lands, so the transcript can anchor the header. Must be stable across
+   * renders (useCallback in the screen) to keep MessageBubble's memo correct.
+   */
+  onToggleExpand?: (id: string, expanded: boolean) => void
 }
 
-export function ReasoningBlock({ text, isDark }: Props) {
+export function ReasoningBlock({ text, isDark, id, onToggleExpand }: Props) {
   const { t } = useTranslation()
   const [expanded, setExpanded] = useState(false)
 
   return (
     <TouchableOpacity
       style={[s.block, isDark && s.blockDark]}
-      onPress={() => setExpanded(!expanded)}
+      onPress={() => {
+        const next = !expanded
+        setExpanded(next)
+        onToggleExpand?.(id ?? "", next)
+      }}
       activeOpacity={0.7}
     >
       <View style={s.header}>

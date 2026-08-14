@@ -230,6 +230,7 @@ export default function SessionsScreen() {
     childrenLoading,
     childrenLoaded,
     childrenHasMore,
+    childCounts,
     isSessionsLoading,
     loadingMoreSessions,
     hasMoreSessions,
@@ -647,7 +648,9 @@ export default function SessionsScreen() {
               session={row.session}
               depth={row.depth}
               expanded={expandedSessions.has(row.session.id)}
-              canExpand={!childrenLoaded[row.session.id] || (childrenByParent[row.session.id]?.length ?? 0) > 0}
+              canExpand={childrenLoaded[row.session.id]
+                ? (childrenByParent[row.session.id]?.length ?? 0) > 0 || Boolean(childrenHasMore[row.session.id])
+                : (childCounts[row.session.id] ?? 0) > 0}
               onToggle={() => toggleSession(row.session.id)}
               isDark={isDark}
               onRename={() => handleRename(row.session)}
