@@ -99,6 +99,8 @@ docs/                    Current implementation plans and QA notes
 See `AGENTS.md` for architecture, code conventions, validation requirements,
 and environment-specific guidance.
 
+For phone-free agent testing, see `docs/DEVELOPMENT-ENVIRONMENT.md`.
+
 ## License
 
 MIT. See `LICENSE`.

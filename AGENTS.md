@@ -93,6 +93,34 @@ Use the Android SDK paths already configured in the local environment. Do not as
 a particular SDK, AVD, Gradle cache path, operating system, or disk layout, and do
 not install or relocate SDK components without the user's approval.
 
+## Testing Without The User's Phone
+
+When the user's physical phone is unavailable, do not pause Android work or skip
+device validation. Use the repository's provisioned phone-free environment described
+in `docs/DEVELOPMENT-ENVIRONMENT.md`.
+
+- Use `bun run dev:env` to start the fixture server, headless Android emulator,
+  Metro, build/install the debug APK, and launch the app.
+- Use `bun run dev:env:reset` when a test requires deterministic seeded state or a
+  fresh install. Normal `start` preserves emulator and fixture state.
+- Connect the app to `http://10.0.2.2:4100` with username `opencode` and password
+  `devpassword`. These are fixture-only credentials for synthetic data.
+- Drive and verify the app with `agent-device` against AVD
+  `opencode-mobile-api36`; prefer accessibility selectors and `testID` values over
+  coordinates.
+- Run `bun run dev:fixture:test` when changing API, SSE, session, permission, or
+  question behavior.
+- Use the fixture for routine validation. Use a real OpenCode v2 server only when
+  the fixture cannot represent the behavior, and never point automation at the
+  user's normal server or sessions.
+- Stop the managed environment with `bun run dev:env:stop` when testing is complete.
+
+The AVD, API 36 image, Android SDK components, and `agent-device` are already
+provisioned in this workspace. Do not reinstall or relocate them unless inspection
+shows they are missing or broken. If a requirement genuinely depends on physical
+hardware, validate everything possible in the emulator and clearly report the
+remaining physical-device check instead of claiming it passed.
+
 ## Connecting To OpenCode
 
 Start a local server that is reachable from the Android device:
@@ -119,9 +147,11 @@ bun run typecheck
 bun test
 ```
 
-For Android behavior, build and test on the connected local device or emulator. Use
-the automation tools available in the current environment when appropriate; do not
-assume access to upstream Azure OpenAI deployments or CUA credentials.
+For Android behavior, build and test on the connected local device. When no physical
+device is available, the phone-free emulator environment above is the required
+fallback. Use the automation tools available in the current environment when
+appropriate; do not assume access to upstream Azure OpenAI deployments or CUA
+credentials.
 
 Before claiming a bug is fixed, ensure the validation would fail if the bug were
 still present. For session-list regressions, pre-create known server state and verify

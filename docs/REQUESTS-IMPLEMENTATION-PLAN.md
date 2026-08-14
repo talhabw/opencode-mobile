@@ -430,7 +430,13 @@ git diff --check
 
 Device/release validation should include:
 
-- Physical Android device and, where practical, an emulator.
+- Use the phone-free environment in `docs/DEVELOPMENT-ENVIRONMENT.md` whenever the
+  user's physical phone is unavailable. Emulator validation is required in that
+  case; do not pause a work package or skip device checks merely because the phone
+  cannot be accessed.
+- Use a physical Android device when it is available. For hardware-only behavior,
+  complete all practical emulator checks and explicitly record the remaining
+  physical-device validation rather than claiming it passed.
 - Fresh install and upgrade-over-existing-data paths.
 - Light/dark themes, all accents, 50%/100%/150% message font scale, keyboard open/closed, and narrow screen.
 - Real OpenCode v2 server state pre-created before assertions; an empty screen is not a passing session-list test.
