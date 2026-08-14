@@ -26,13 +26,21 @@
 import PostHog from "posthog-react-native"
 import * as SecureStore from "expo-secure-store"
 import { log } from "./logbuffer"
+import {
+  AnalyticsEvent,
+  isAnalyticsEvent,
+  sanitizeAnalyticsProperties,
+  type AnalyticsProps,
+  type ConnectionTestSource,
+} from "./analytics-events"
 
 export { classifyConnectionError, type ConnectionErrorClass } from "./analytics-classify"
+export { AnalyticsEvent, sanitizeAnalyticsProperties, type AnalyticsProps, type ConnectionTestSource } from "./analytics-events"
 
 const API_KEY = process.env.EXPO_PUBLIC_POSTHOG_KEY
 // EU by default (GDPR-friendly region for opencode's mostly-EU/self-hosted user base).
 // Override with EXPO_PUBLIC_POSTHOG_HOST for a self-hosted instance.
-const HOST = process.env.EXPO_PUBLIC_POSTHOG_HOST || "https://eu.i.posthog.com"
+const HOST = process.env.EXPO_PUBLIC_POSTHOG_HOST?.trim() || "https://eu.i.posthog.com"
 
 const FIRST_OPEN_KEY = "opencode_analytics_first_open_done"
 
@@ -68,55 +76,29 @@ let appOpenedTracked = false
 
 /** Activation-funnel events. Keep this list in 1:1 sync with the funnel steps
  *  tracked in the product analytics dashboard. */
-export enum AnalyticsEvent {
-  /** Fired once per app session, as soon as analytics is enabled (either at
-   *  cold start with prior consent, or right after consent is granted). */
-  AppOpened = "app_opened",
-  /** User tapped Connect/Save with a non-empty server URL (quick or advanced mode). */
-  ConnectionFormSubmitted = "connection_form_submitted",
-  /** A real network call to test/establish the connection started. */
-  ConnectionAttempted = "connection_attempted",
-  /** The connection attempt succeeded (health check / project fetch responded). */
-  ConnectionSucceeded = "connection_succeeded",
-  /** The connection attempt failed. Always paired with `error_class`. */
-  ConnectionFailed = "connection_failed",
-  /** User sent a prompt/message to an agent session (excludes slash commands). */
-  MessageSent = "message_sent",
-  /** An agent response finished streaming (session transitioned busy -> idle),
-   *  excluding user-aborted runs. */
-  ResponseReceived = "response_received",
-  /** Fired once when the offline `/demo` screen mounts. */
-  DemoStarted = "demo_started",
-  /** User advanced a step in the scripted demo (currently: replied to the
-   *  demo's permission prompt). Always paired with `step_index`/`step_name`. */
-  DemoStepAdvanced = "demo_step_advanced",
-  /** The scripted demo reached its end (completion or denial message shown
-   *  after the permission reply). The key activation metric for the demo —
-   *  Always paired with `outcome`. */
-  DemoCompleted = "demo_completed",
-  /** User tapped "Connect your own server" on the demo's CTA card. */
-  DemoExitedToConnect = "demo_exited_to_connect",
-}
-
 /** Where a connection test/failure was initiated from. The activation funnel
  *  filters to source=onboarding only; edit_test (Test button on the
  *  existing-connection edit screen) and sse (background reconnect loop,
  *  see events.ts) would otherwise pollute the funnel with repeat-tester and
  *  post-activation noise. */
-export type ConnectionTestSource = "onboarding" | "edit_test" | "sse"
-
 export function initAnalytics() {
   if (enabled) return
-  if (!API_KEY) {
+  const apiKey = API_KEY?.trim()
+  if (!apiKey) {
     log.info("analytics", "no API key configured — analytics disabled")
     return
   }
   try {
     dropNetwork = false
-    client = new ConsentGatedPostHog(API_KEY, {
+    client = new ConsentGatedPostHog(apiKey, {
       host: HOST,
       // We call track() explicitly at each funnel step — no implicit capture.
       captureAppLifecycleEvents: false,
+      // A later re-enable must never resurrect events buffered before revoke.
+      persistence: "memory",
+      personProfiles: "never",
+      disableGeoip: true,
+      customAppProperties: {},
     })
     // A previous revoke persisted the SDK-level opt-out flag; clear it so the
     // re-granted client can enqueue again. No-op on a fresh install.
@@ -154,14 +136,12 @@ export function analyticsEnabled(): boolean {
 
 /** Flat, JSON-safe event properties — keep it to primitives so nothing
  *  accidentally nests an object that could carry a URL/token. */
-export type AnalyticsProps = Record<string, string | number | boolean | null>
-
 /** No-op unless consent has been granted (initAnalytics() was called) and a
  *  key is configured. Never throws. */
 export function track(event: AnalyticsEvent, props?: AnalyticsProps) {
-  if (!enabled || !client) return
+  if (!enabled || !client || !isAnalyticsEvent(event)) return
   try {
-    client.capture(event, props)
+    client.capture(event, sanitizeAnalyticsProperties(event, props))
   } catch (e) {
     log.warn("analytics", "capture failed", String(e))
   }

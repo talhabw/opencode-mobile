@@ -9,6 +9,8 @@ import { I18nextProvider, useTranslation } from "react-i18next"
 import i18n from "../src/lib/i18n/config"
 import { useAuth } from "../src/stores/auth"
 import { useConnections } from "../src/stores/connections"
+import { useSessions } from "../src/stores/sessions"
+import { findCachedSession } from "../src/lib/session-hierarchy"
 import { useEvents } from "../src/stores/events"
 import { useCatalog } from "../src/stores/catalog"
 import { useSettings } from "../src/stores/settings"
@@ -47,8 +49,31 @@ function RootLayout() {
     // notifications carry no sessionId (they aren't about a session) — route
     // to the home tab instead of "/session/" (an empty, dead-end route).
     const unsubNotifications = notifications.onTap((data) => {
-      if (data.sessionId) router.push(`/session/${data.sessionId}`)
-      else router.push("/")
+      if (!data.sessionId) {
+        router.push("/")
+        return
+      }
+      void (async () => {
+        const state = useSessions.getState()
+        let session = findCachedSession(data.sessionId, state.sessions, state.childrenByParent, state.currentSession)
+        if (!session) {
+          const connections = useConnections.getState()
+          const scopedClient = data.directory ? connections.clientForDirectory(data.directory) : connections.client
+          if (scopedClient) {
+            try {
+              const fetched = await scopedClient.session.get(data.sessionId)
+              if (fetched.id === data.sessionId) {
+                session = fetched
+                state.handleEvent({ type: "session.updated", properties: { info: fetched } })
+              }
+            } catch {
+              // The session may have been deleted; keep the tap safe and do not guess a directory.
+            }
+          }
+        }
+        const targetDirectory = session?.directory || data.directory
+        router.push({ pathname: "/session/[id]", params: { id: data.sessionId, ...(targetDirectory ? { directory: targetDirectory } : {}) } })
+      })()
     })
 
     // Load telemetry consent — initialise Sentry only if previously granted
@@ -88,6 +113,8 @@ function RootLayout() {
   // prompt / app switcher / control center produce) to avoid spurious re-locks.
   useEffect(() => {
     const sub = AppState.addEventListener("change", (next) => {
+      if (next === "background") useEvents.getState().pause()
+      if (next === "active") useEvents.getState().resume()
       if (next === "background" && useAuth.getState().settings.requireBiometric) {
         useAuth.getState().lock()
       }
@@ -99,7 +126,15 @@ function RootLayout() {
   useEffect(() => {
     if (client && !sseStarted.current) {
       sseStarted.current = true
-      useEvents.getState().connect()
+      // A cold start can begin with the app already backgrounded (e.g. launch
+      // from a notification while the phone is locked). Don't open an SSE
+      // stream in that state — pause instead; the AppState "active" listener
+      // above will resume() and connect once the app reaches the foreground.
+      if (AppState.currentState === "background") {
+        useEvents.getState().pause()
+      } else {
+        useEvents.getState().connect()
+      }
       useCatalog.getState().load()
       // Request OS notification permission once we have a live connection —
       // the in-context moment the user will start running agent tasks they'll

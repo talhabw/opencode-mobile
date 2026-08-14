@@ -59,6 +59,7 @@ export interface Payload {
   title: string
   body: string
   sessionId: string
+  directory?: string
   dedupeKey?: string
   dedupeCooldownMs?: number
 }
@@ -67,6 +68,7 @@ export interface Payload {
 interface NotificationData {
   category: Category
   sessionId: string
+  directory?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +154,7 @@ export async function send(payload: Payload) {
       data: {
         category: payload.category,
         sessionId: payload.sessionId,
+        ...(payload.directory ? { directory: payload.directory } : {}),
       } satisfies NotificationData as Record<string, unknown>,
       sound: "default",
       ...(Platform.OS === "android" ? { channelId: "prompts" } : {}),

@@ -84,6 +84,18 @@ adb install -r android/app/build/outputs/apk/release/app-release.apk
 When no release keystore is configured, the local release build uses the
 checked-in development keystore. Do not use that key for public distribution.
 
+## Optional Telemetry
+
+Sentry crash reporting and PostHog activation analytics are bundled but remain
+off until the user explicitly allows them. Missing `EXPO_PUBLIC_SENTRY_DSN` or
+`EXPO_PUBLIC_POSTHOG_KEY` independently disables that service. Declining or
+revoking consent disables both services; PostHog uses memory-only buffering so
+events cannot survive a revoke and upload after a later re-enable.
+
+No telemetry credentials are tracked. Fork operators should follow
+`docs/TELEMETRY-OPERATIONS.md`; behavior and distribution disclosures are in
+`docs/PRIVACY-AND-STORE-DISCLOSURES.md`.
+
 ## Project Structure
 
 ```text

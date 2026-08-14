@@ -37,6 +37,7 @@ export function buildDemoScript(now: number = Date.now()): DemoScript {
     id: USER_MESSAGE_ID,
     sessionID: DEMO_SESSION_ID,
     role: "user",
+    presentation: "user",
     time: { created: now - 9000 },
   }
 
@@ -44,6 +45,7 @@ export function buildDemoScript(now: number = Date.now()): DemoScript {
     id: ASSISTANT_MESSAGE_ID,
     sessionID: DEMO_SESSION_ID,
     role: "assistant",
+    presentation: "assistant",
     time: { created: now - 8000, completed: now - 1000 },
     modelID: "claude-opus-4-6",
     providerID: "anthropic",
@@ -129,6 +131,7 @@ export function buildDemoCompletionMessage(now: number = Date.now()): { message:
       id: COMPLETION_MESSAGE_ID,
       sessionID: DEMO_SESSION_ID,
       role: "assistant",
+      presentation: "assistant",
       time: { created: now, completed: now },
       modelID: "claude-opus-4-6",
       providerID: "anthropic",
@@ -151,6 +154,7 @@ export function buildDemoDenialMessage(now: number = Date.now()): { message: Mes
       id: DENIAL_MESSAGE_ID,
       sessionID: DEMO_SESSION_ID,
       role: "assistant",
+      presentation: "assistant",
       time: { created: now, completed: now },
       modelID: "claude-opus-4-6",
       providerID: "anthropic",

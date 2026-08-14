@@ -2,9 +2,17 @@ import { useState, useCallback } from "react"
 import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, ScrollView, Platform } from "react-native"
 import { Ionicons } from "@expo/vector-icons"
 import { useTranslation } from "react-i18next"
+import { router } from "expo-router"
 import type { Part } from "../../lib/sdk"
 import { useAccent, type AccentState } from "../../lib/accents"
 import { DiffView } from "./DiffView"
+import { taskSubagentLink } from "../../lib/task-subagent"
+import { findCachedSession } from "../../lib/session-hierarchy"
+import { useSessions } from "../../stores/sessions"
+import { useConnections } from "../../stores/connections"
+import { useEvents } from "../../stores/events"
+
+const EMPTY_PENDING_QUESTIONS: [] = []
 
 const TOOL_ICONS: Record<string, string> = {
   read: "glasses-outline",
@@ -337,6 +345,100 @@ interface Props {
   isDark: boolean
 }
 
+function TaskSubagentCard({ tool, isDark }: Props) {
+  const { t } = useTranslation()
+  const acc = useAccent()
+  const s = makeStyles(acc)
+  const [expanded, setExpanded] = useState(false)
+  const [opening, setOpening] = useState(false)
+  const link = taskSubagentLink(tool)
+  const pendingQuestions = useEvents((state) => link ? state.questions[link.sessionID] ?? EMPTY_PENDING_QUESTIONS : EMPTY_PENDING_QUESTIONS)
+  const input = tool.state?.input && typeof tool.state.input === "object" ? tool.state.input as Record<string, unknown> : {}
+  const agentName = typeof input.agent === "string" ? input.agent : undefined
+  const subagentType = typeof input.subagent_type === "string" ? input.subagent_type : undefined
+  const agent = [agentName, subagentType].filter((value, index, values) => value && values.indexOf(value) === index).join(" · ") || undefined
+  const summary = typeof input.summary === "string" ? input.summary : typeof input.description === "string" ? input.description : undefined
+  const result = tool.state?.output
+  const status = tool.state?.status ?? "pending"
+
+  const open = async () => {
+    if (!link || opening) return
+    setOpening(true)
+    try {
+      const state = useSessions.getState()
+      let session = findCachedSession(link.sessionID, state.sessions, state.childrenByParent, state.currentSession)
+      if (!session) {
+        const parent = link.parentSessionID
+          ? findCachedSession(link.parentSessionID, state.sessions, state.childrenByParent, state.currentSession)
+          : state.currentSession
+        const directory = parent?.directory
+        const connections = useConnections.getState()
+        const client = directory ? connections.clientForDirectory(directory) : connections.client
+        if (!client) return
+        const fetched = await client.session.get(link.sessionID)
+        if (fetched.id !== link.sessionID) return
+        session = fetched
+        state.handleEvent({ type: "session.updated", properties: { info: fetched } })
+      }
+      router.push({ pathname: "/session/[id]", params: { id: session.id, ...(session.directory ? { directory: session.directory } : {}) } })
+    } catch (error) {
+      console.warn("Failed to open subagent session:", error)
+    } finally {
+      setOpening(false)
+    }
+  }
+
+  return (
+    <View style={[s.card, s.taskCard, isDark && s.cardDark]} testID={`task-card-${tool.id}`}>
+      <TouchableOpacity
+        style={s.header}
+        onPress={() => setExpanded((value) => !value)}
+        accessibilityRole="button"
+        accessibilityLabel={summary || t("chat.toolCallCard.taskTitle")}
+        accessibilityState={{ expanded }}
+      >
+        <View style={s.headerLeft}>
+          <Ionicons name="git-branch-outline" size={16} color={statusColor(status)} />
+          <View style={s.taskHeading}>
+            <Text style={[s.name, isDark && s.nameDark]} numberOfLines={1}>{summary || t("chat.toolCallCard.taskTitle")}</Text>
+            {agent && <Text style={[s.taskAgent, isDark && s.elapsedDark]} numberOfLines={1}>{agent}</Text>}
+          </View>
+        </View>
+        <Ionicons name={expanded ? "chevron-up" : "chevron-down"} size={16} color={isDark ? "#888888" : "#666666"} />
+      </TouchableOpacity>
+      <View style={s.taskStatusRow}>
+        <Text style={[s.detailMeta, isDark && s.detailMetaDark]}>{t(`chat.toolCallCard.taskStatus.${status}`)}</Text>
+        {link && (
+          <TouchableOpacity
+            style={s.openTaskButton}
+            onPress={open}
+            disabled={opening}
+            accessibilityRole="button"
+            accessibilityLabel={pendingQuestions.length > 0
+              ? t("chat.toolCallCard.inputNeeded", { count: pendingQuestions.length })
+              : t("chat.toolCallCard.openSubagent")}
+            testID={`open-subagent-${link.sessionID}`}
+          >
+            {opening ? <ActivityIndicator size="small" color={acc.cur.primary} /> : (
+              <View style={s.taskActionContent}>
+                {pendingQuestions.length > 0 && <Text style={[s.pendingTaskText, { color: acc.cur.primary }]}>{t("chat.toolCallCard.inputNeeded", { count: pendingQuestions.length })}</Text>}
+                <Text style={s.openTaskText}>{t("chat.toolCallCard.openSubagent")}</Text>
+              </View>
+            )}
+          </TouchableOpacity>
+        )}
+      </View>
+      {expanded && (
+        <View style={s.detailSection}>
+          {typeof input.prompt === "string" && <Text style={[s.detailMeta, isDark && s.detailMetaDark]} selectable>{input.prompt}</Text>}
+          {result !== undefined && <GenericDetail input={undefined} output={result} isDark={isDark} />}
+          {tool.state?.error?.message && <ErrorBanner message={tool.state.error.message} isDark={isDark} />}
+        </View>
+      )}
+    </View>
+  )
+}
+
 export function ToolCallCard({ tool, isDark }: Props) {
   const { t } = useTranslation()
   const acc = useAccent()
@@ -352,6 +454,8 @@ export function ToolCallCard({ tool, isDark }: Props) {
   const toggle = useCallback(() => {
     if (hasDetail) setExpanded((v) => !v)
   }, [hasDetail])
+
+  if (tool.tool === "task") return <TaskSubagentCard tool={tool} isDark={isDark} />
 
   return (
     <TouchableOpacity
@@ -412,6 +516,7 @@ function makeStyles(acc: AccentState) {
       borderColor: "#f0f0f0",
     },
     cardDark: { backgroundColor: "#2a2a2a", borderColor: "#3a3a3a" },
+    taskCard: { borderLeftWidth: 3, borderLeftColor: acc.cur.primary },
     cardError: { borderColor: "#fecaca" },
     cardErrorDark: { borderColor: "#7f1d1d" },
 
@@ -420,6 +525,13 @@ function makeStyles(acc: AccentState) {
       alignItems: "center",
       justifyContent: "space-between",
     },
+    taskHeading: { flex: 1 },
+    taskAgent: { fontSize: 11, color: "#777777", marginTop: 2 },
+    taskStatusRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 8 },
+    taskActionContent: { alignItems: "flex-end" },
+    pendingTaskText: { fontSize: 11, fontWeight: "600", marginBottom: 2 },
+    openTaskButton: { minHeight: 40, justifyContent: "center", paddingHorizontal: 10 },
+    openTaskText: { color: acc.cur.primary, fontSize: 13, fontWeight: "700" },
     headerLeft: { flexDirection: "row", alignItems: "center", gap: 8, flex: 1 },
     headerRight: { flexDirection: "row", alignItems: "center", gap: 6 },
     name: { fontSize: 13, fontWeight: "500", color: "#0a0a0a", flex: 1 },

@@ -16,7 +16,7 @@ export interface Session {
   slug: string
   projectID: string
   directory: string
-  parentID?: string
+  parentID?: string | null
   title: string
   version: string
   share?: { url: string }
@@ -25,12 +25,15 @@ export interface Session {
   revert?: { messageID: string; partID?: string }
   agent?: string
   model?: { providerID: string; modelID: string; variant?: string }
+  location?: { directory: string; workspaceID?: string }
 }
 
 export interface Message {
   id: string
   sessionID: string
   role: "user" | "assistant"
+  presentation: "user" | "assistant" | "shell" | "system"
+  systemKind?: "agent" | "model" | "location" | "compaction" | "synthetic" | "skill" | "system"
   parentID?: string
   time: { created: number; completed?: number }
   agent?: string
@@ -41,6 +44,17 @@ export interface Message {
   tokens?: { input: number; output: number; reasoning?: number; cache?: { read: number; write: number } }
   error?: { message: string }
   finish?: string
+  shell?: ShellMessage
+}
+
+export interface ShellMessage {
+  id: string
+  shellID: string
+  command: string
+  status: "running" | "exited" | "timeout" | "killed"
+  exit?: number | "Infinity" | "-Infinity" | "NaN"
+  output?: { output: string; cursor: number; size: number; truncated: boolean }
+  time: { created: number; completed?: number }
 }
 
 export interface Part {
@@ -57,6 +71,7 @@ export interface Part {
     output?: unknown
     title?: string
     error?: { message: string }
+    metadata?: Record<string, unknown>
     time?: { start?: number; end?: number }
   }
   time?: { start?: number; end?: number }
@@ -162,17 +177,19 @@ export function normalizeSession(value: SessionInfo): Session {
     revert: value.revert && { messageID: value.revert.messageID, partID: value.revert.partID },
     agent: value.agent,
     model: value.model && { providerID: value.model.providerID, modelID: value.model.id, variant: value.model.variant },
+    location: value.location,
   }
 }
 
 function baseMessage(value: SessionMessageInfo, sessionID: string): Message {
   const time = "time" in value ? value.time : { created: 0 }
-  if (value.type === "user") return { id: value.id, sessionID, role: "user", time }
+  if (value.type === "user") return { id: value.id, sessionID, role: "user", presentation: "user", time }
   if (value.type === "assistant") {
     return {
       id: value.id,
       sessionID,
       role: "assistant",
+      presentation: "assistant",
       time: value.time,
       agent: value.agent,
       modelID: value.model.id,
@@ -183,7 +200,34 @@ function baseMessage(value: SessionMessageInfo, sessionID: string): Message {
       finish: value.finish,
     }
   }
-  return { id: value.id, sessionID, role: "assistant", time }
+  if (value.type === "shell") {
+    return {
+      id: value.id,
+      sessionID,
+      role: "assistant",
+      presentation: "shell",
+      time: value.time,
+      shell: {
+        id: value.id,
+        shellID: value.shellID,
+        command: value.command,
+        status: value.status,
+        ...(value.exit !== undefined ? { exit: value.exit } : {}),
+        ...(value.output !== undefined ? { output: value.output } : {}),
+        time: value.time,
+      },
+    }
+  }
+  const systemKind = value.type === "agent-switched"
+    ? "agent"
+    : value.type === "model-switched"
+      ? "model"
+      : value.type === "location-switched"
+        ? "location"
+        : value.type === "compaction"
+          ? "compaction"
+          : value.type
+  return { id: value.id, sessionID, role: "assistant", presentation: "system", systemKind, time }
 }
 
 function isTextContent(item: unknown): item is { type: "text"; text: string } {
@@ -216,7 +260,7 @@ function contentOutput(content: unknown): unknown {
 
 export function normalizeMessage(value: SessionMessageInfo, sessionID: string): MessageWithParts {
   if (!value || typeof value !== "object") {
-    return { info: { id: "unknown", sessionID, role: "assistant", time: { created: 0 } }, parts: [] }
+    return { info: { id: "unknown", sessionID, role: "assistant", presentation: "system", systemKind: "system", time: { created: 0 } }, parts: [] }
   }
   const info = baseMessage(value, sessionID)
   const parts: Part[] = []
@@ -254,24 +298,26 @@ export function normalizeMessage(value: SessionMessageInfo, sessionID: string): 
           input: state.input,
           output: state.status === "completed" || state.status === "error" ? contentOutput(state.content) : undefined,
           error: state.status === "error" ? { message: state.error.message } : undefined,
+          metadata: "metadata" in state ? state.metadata : undefined,
           time: { start: content.time.ran ?? content.time.created, end: content.time.completed },
         },
       })
     })
+  } else if (value.type === "shell") {
+    // Shell messages are protocol records, not assistant prose or tool calls.
+    // Their structured fields are retained on info.shell for a dedicated row.
   } else {
     const text = "text" in value && typeof value.text === "string"
       ? value.text
-      : value.type === "shell"
-        ? `${value.command}${value.output?.output ? `\n${value.output.output}` : ""}`
-        : value.type === "agent-switched"
-          ? `Agent switched to ${value.agent}`
-          : value.type === "model-switched"
-            ? `Model switched to ${value.model.providerID}/${value.model.id}`
-            : value.type === "location-switched"
-              ? `Location switched to ${value.location.directory}`
-              : value.type === "compaction"
-                ? `Compaction ${value.status}${"summary" in value ? `: ${value.summary}` : ""}`
-                : undefined
+      : value.type === "agent-switched"
+        ? `Agent switched to ${value.agent}`
+        : value.type === "model-switched"
+          ? `Model switched to ${value.model.providerID}/${value.model.id}`
+          : value.type === "location-switched"
+            ? `Location switched to ${value.location.directory}`
+            : value.type === "compaction"
+              ? `Compaction ${value.status}${"summary" in value ? `: ${value.summary}` : ""}`
+              : undefined
     if (text) parts.push({ id: `${value.id}:${value.type}`, sessionID, messageID: value.id, type: "text", text })
   }
   return { info, parts }
@@ -345,19 +391,36 @@ export function normalizeEvent(value: EventSubscribeOutput | unknown): Event {
     return { type: "session.status", properties: { sessionID: data.sessionID, status: { type: "idle" }, canonicalRefresh: true } }
   }
   if (type === "session.execution.failed") return { type: "session.error", properties: data }
+  // Live shell lifecycle events are NOT mapped to message.updated: they carry
+  // the shell id while the persisted row is keyed by a separate message id
+  // (see src/lib/protocol-v2.ts baseMessage), so a live row could never be
+  // reconciled with the canonical session page and would linger after a
+  // refresh as a duplicate. Rendering comes from the canonical page refresh,
+  // which remains authoritative; only the terminal ended event requests that
+  // refresh (see docs/REQUESTS-IMPLEMENTATION-STATUS.md).
+  if (type === "session.shell.ended") {
+    return { type, properties: { ...data, canonicalRefresh: true } }
+  }
   if (type === "permission.asked") {
     return { type, properties: { ...data, permission: data.action, patterns: data.resources, tool: normalizeTool(data.source) } }
   }
   if (type === "question.asked") return { type, properties: { ...data, tool: normalizeTool(data.tool) } }
   if (type === "session.created") {
-    const location = data.location as { directory?: string } | undefined
+    const location = data.location as { directory?: string; workspaceID?: string } | undefined
+    const model = data.model as { providerID?: unknown; id?: unknown; variant?: unknown } | undefined
+    const created = eventTime(value)
     return {
       type,
       properties: {
         info: {
           id: String(data.sessionID ?? ""), slug: String(data.slug ?? data.sessionID ?? ""),
-          projectID: String(data.projectID ?? ""), directory: location?.directory ?? "", title: String(data.title ?? ""),
-          version: String(data.version ?? "2"), time: { created: eventTime(value), updated: eventTime(value) },
+          projectID: String(data.projectID ?? ""), directory: location?.directory ?? "", location, title: String(data.title ?? ""),
+          parentID: typeof data.parentID === "string" || data.parentID === null ? data.parentID : undefined,
+          agent: typeof data.agent === "string" ? data.agent : undefined,
+          model: model && typeof model.providerID === "string" && typeof model.id === "string"
+            ? { providerID: model.providerID, modelID: model.id, ...(typeof model.variant === "string" ? { variant: model.variant } : {}) }
+            : undefined,
+          version: String(data.version ?? "2"), time: { created, updated: created },
         },
       },
     }
@@ -369,6 +432,7 @@ interface ToolState {
   tool?: string
   rawInput: string
   input?: unknown
+  metadata?: Record<string, unknown>
 }
 
 function toolKey(sessionID: string, messageID: string, callID: string): string {
@@ -404,6 +468,7 @@ export class V2EventAdapter {
             id: messageID,
             sessionID,
             role: "assistant",
+            presentation: "assistant",
             time: { created: numberValue(raw.created) },
             agent: stringValue(data.agent),
             modelID: stringValue(model?.id),
@@ -437,9 +502,9 @@ export class V2EventAdapter {
 
     if (raw.type === "session.tool.input.started" && sessionID && messageID) {
       const callID = stringValue(data.id)
-      const state: ToolState = { tool: stringValue(data.name), rawInput: "", input: "" }
+      const state: ToolState = { tool: stringValue(data.name), rawInput: "", input: "", metadata: recordValue(data.metadata) }
       this.tools.set(toolKey(sessionID, messageID, callID), state)
-      return [toolEvent(sessionID, messageID, callID, state.tool, "pending", state.input, undefined, undefined, true)]
+      return [toolEvent(sessionID, messageID, callID, state.tool, "pending", state.input, undefined, undefined, state.metadata, true)]
     }
     if (raw.type === "session.tool.input.delta" && sessionID && messageID) {
       const callID = stringValue(data.id)
@@ -452,21 +517,25 @@ export class V2EventAdapter {
       } catch {
         // Input is streamed as JSON, so partial chunks remain visible as text.
       }
-      this.tools.set(key, { ...previous, rawInput, input })
-      return [toolEvent(sessionID, messageID, callID, previous.tool, "pending", input, undefined, undefined, false)]
+      const metadata = mergeMetadata(previous.metadata, data.metadata)
+      this.tools.set(key, { ...previous, rawInput, input, metadata })
+      return [toolEvent(sessionID, messageID, callID, previous.tool, "pending", input, undefined, undefined, metadata, false)]
     }
     if (raw.type === "session.tool.called" && sessionID && messageID) {
       const callID = stringValue(data.id)
       const key = toolKey(sessionID, messageID, callID)
       const previous = this.tools.get(key) ?? { rawInput: "" }
-      const state: ToolState = { tool: previous.tool, rawInput: previous.rawInput, input: data.input ?? previous.input }
+      const state: ToolState = { tool: previous.tool ?? stringValue(data.name), rawInput: previous.rawInput, input: data.input ?? previous.input, metadata: mergeMetadata(previous.metadata, data.metadata) }
       this.tools.set(key, state)
-      return [toolEvent(sessionID, messageID, callID, state.tool, "running", state.input, undefined, undefined, true)]
+      return [toolEvent(sessionID, messageID, callID, state.tool, "running", state.input, undefined, undefined, state.metadata, true)]
     }
     if (raw.type === "session.tool.progress" && sessionID && messageID) {
       const callID = stringValue(data.id)
-      const state = this.tools.get(toolKey(sessionID, messageID, callID))
-      return [toolEvent(sessionID, messageID, callID, state?.tool, "running", state?.input, undefined, undefined, false)]
+      const key = toolKey(sessionID, messageID, callID)
+      const state = this.tools.get(key) ?? { rawInput: "" }
+      const metadata = mergeMetadata(state.metadata, data.metadata)
+      this.tools.set(key, { ...state, metadata })
+      return [toolEvent(sessionID, messageID, callID, state.tool, "running", state.input, undefined, undefined, metadata, false)]
     }
     if ((raw.type === "session.tool.success" || raw.type === "session.tool.failed") && sessionID && messageID) {
       const failed = raw.type.endsWith("failed")
@@ -483,6 +552,7 @@ export class V2EventAdapter {
         state?.input,
         contentOutput(data.content),
         failed ? stringValue(error?.message) : undefined,
+        mergeMetadata(state?.metadata, data.metadata),
         true,
       )]
       this.tools.delete(key)
@@ -501,6 +571,7 @@ function toolEvent(
   input?: unknown,
   output?: unknown,
   error?: string,
+  metadata?: Record<string, unknown>,
   canonicalRefresh = false,
 ): Event {
   return {
@@ -514,10 +585,21 @@ function toolEvent(
         type: "tool",
         tool,
         callID,
-        state: { status, input, output, error: error ? { message: error } : undefined },
+        state: { status, input, output, error: error ? { message: error } : undefined, metadata },
       } satisfies Part,
     },
   }
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+}
+
+function mergeMetadata(previous: Record<string, unknown> | undefined, incoming: unknown): Record<string, unknown> | undefined {
+  const next = recordValue(incoming)
+  if (!previous) return next
+  if (!next) return previous
+  return { ...previous, ...next }
 }
 
 function stringValue(value: unknown): string {

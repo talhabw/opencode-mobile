@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { chooseModelSelection } from "./model-selection.ts"
+import { chooseModelSelection, resolveDefaultAgent } from "./model-selection.ts"
 
 const providers = [
   {
@@ -49,4 +49,18 @@ test("returns null when no connected providers", () => {
     agentModel: null,
   })
   assert.equal(selected, null)
+})
+
+test("does not guess default agent ordering", () => {
+  assert.equal(resolveDefaultAgent([{ info: { default_agent: "build" } }], false), null)
+})
+
+test("resolves the last configured default only with an ordering guarantee", () => {
+  assert.equal(
+    resolveDefaultAgent([
+      { info: { default_agent: "plan" } },
+      { info: { default_agent: "build" } },
+    ], true),
+    "build",
+  )
 })

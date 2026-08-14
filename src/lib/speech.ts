@@ -1,10 +1,11 @@
 import { useState, useCallback, useRef, useEffect } from "react"
 import { ExpoSpeechRecognitionModule, useSpeechRecognitionEvent } from "expo-speech-recognition"
+import { classifySpeechPermission, mapSpeechError, type SpeechFailureReason } from "./speech-errors"
 
 interface SpeechState {
   listening: boolean
   transcript: string
-  error: string | null
+  error: SpeechFailureReason | null
 }
 
 interface SpeechActions {
@@ -16,7 +17,7 @@ interface SpeechActions {
 export function useSpeech(onResult: (text: string) => void): SpeechState & SpeechActions {
   const [listening, setListening] = useState(false)
   const [transcript, setTranscript] = useState("")
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<SpeechFailureReason | null>(null)
   const pending = useRef("")
 
   useSpeechRecognitionEvent("start", () => {
@@ -43,26 +44,37 @@ export function useSpeech(onResult: (text: string) => void): SpeechState & Speec
   })
 
   useSpeechRecognitionEvent("error", (event) => {
-    // "no-speech" is not really an error — user just didn't say anything
-    if (event.error === "no-speech") {
+    const reason = mapSpeechError(event.error, event.code)
+    if (!reason) {
       setListening(false)
       return
     }
-    setError(event.message || event.error)
+    setError(reason)
     setListening(false)
   })
 
   const start = useCallback(async () => {
-    const result = await ExpoSpeechRecognitionModule.requestPermissionsAsync()
-    if (!result.granted) {
-      setError("Microphone permission denied")
-      return
+    setError(null)
+    try {
+      const result = await ExpoSpeechRecognitionModule.requestPermissionsAsync()
+      const permissionFailure = classifySpeechPermission(result)
+      if (permissionFailure) {
+        setError(permissionFailure)
+        return
+      }
+      if (!ExpoSpeechRecognitionModule.isRecognitionAvailable()) {
+        setError("recognizer-unavailable")
+        return
+      }
+      ExpoSpeechRecognitionModule.start({
+        lang: "en-US",
+        interimResults: true,
+        continuous: true,
+      })
+    } catch (error) {
+      console.error("Speech recognition failed to start:", error)
+      setError("runtime")
     }
-    ExpoSpeechRecognitionModule.start({
-      lang: "en-US",
-      interimResults: true,
-      continuous: true,
-    })
   }, [])
 
   const stop = useCallback(() => {

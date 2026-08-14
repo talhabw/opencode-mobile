@@ -12,6 +12,26 @@ export interface ModelSelection {
   modelID: string
 }
 
+/**
+ * Resolve a config default only when the caller has verified entry ordering.
+ * ConfigEntry ordering is server-specific until the pinned API contract proves
+ * otherwise, so callers must opt in before treating the last value as final.
+ */
+export function resolveDefaultAgent(
+  entries: readonly unknown[],
+  entriesAreOrdered: boolean,
+): string | null {
+  if (!entriesAreOrdered) return null
+  let resolved: string | null = null
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") continue
+    const info = "info" in entry && entry.info && typeof entry.info === "object" ? entry.info : null
+    const defaultAgent = info && "default_agent" in info && typeof info.default_agent === "string" ? info.default_agent : null
+    if (defaultAgent) resolved = defaultAgent
+  }
+  return resolved
+}
+
 export function isModelAvailable(
   providers: ProviderRef[],
   selection: ModelSelection | null | undefined,

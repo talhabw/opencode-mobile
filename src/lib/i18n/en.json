@@ -90,8 +90,18 @@
   },
   "session": {
     "titleFallback": "Session",
+    "subagentInputNeeded": "Subagent needs input",
+    "openSubagentInput": "Open input request from {{title}}",
     "toolbar": {
-      "auto": "Auto"
+      "auto": "Auto",
+      "serverDefault": "Server default",
+      "agentAccessibilityLabel": "Agent: {{name}}",
+      "agentAccessibilityHint": "Opens the agent picker to change the active agent",
+      "modelAccessibilityLabel": "Model: {{name}}",
+      "modelAccessibilityHint": "Opens the model picker to change the active model",
+      "contextLabel": "Context {{percent}}%",
+      "contextAccessibilityLabel": "Context window used, {{percent}} percent",
+      "contextAccessibilityHint": "Opens detailed usage information"
     },
     "banners": {
       "reconnecting": "Reconnecting… (attempt {{attempt}})",
@@ -138,7 +148,15 @@
       "imageFailedTitle": "Image not attached",
       "imageFailedMessage": "One or more images could not be processed. Please try a different photo.",
       "speechErrorTitle": "Voice input failed",
-      "speechErrorMessage": "Could not use voice input. Check your microphone permission and try again."
+      "speechPermissionDeniedMessage": "Microphone permission was denied. Allow microphone access and try again.",
+      "speechPermissionBlockedMessage": "Microphone access is blocked. Open Settings to allow microphone access for OpenCode.",
+      "speechRecognizerUnavailableMessage": "Speech recognition is unavailable on this device. Try typing your message instead.",
+      "speechAudioCaptureMessage": "The microphone could not be started. Check that it is not being used by another app and try again.",
+      "speechNetworkMessage": "Speech recognition needs a network connection. Check your connection and try again.",
+      "speechBusyMessage": "Speech recognition is busy. Stop the current recording and try again.",
+      "speechLanguageMessage": "English speech recognition is unavailable. Try typing your message instead.",
+      "speechRuntimeMessage": "Could not use voice input. Check your microphone and try again.",
+      "speechOpenSettings": "Open Settings"
     }
   },
   "connection": {
@@ -255,6 +273,14 @@
       "daysAgo": "{{count}}d ago"
     },
     "filesCount": "{{count}} files",
+    "hierarchy": {
+      "expand": "Show subagent sessions",
+      "collapse": "Hide subagent sessions",
+      "loading": "Loading subagent sessions",
+      "loadMore": "Load more subagent sessions"
+      ,"inputNeeded": "Input needed, {{count}} pending request"
+      ,"subagentInputNeeded": "Subagent input needed, {{count}} descendant requests"
+    },
     "actions": {
       "rename": "Rename"
     },
@@ -351,6 +377,23 @@
     "unlockButton": "Unlock"
   },
   "chat": {
+    "messageBubble": {
+      "you": "You",
+      "assistant": "Assistant",
+      "failed": "Response failed",
+      "tokens": "{{count}} tokens"
+    },
+    "shellMessage": {
+      "label": "Shell",
+      "emptyCommand": "(empty command)",
+      "outputTruncated": "Output truncated",
+      "status": {
+        "running": "Running",
+        "exited": "Exited",
+        "timeout": "Timed out",
+        "killed": "Killed"
+      }
+    },
     "permissionPrompt": {
       "title": "Permission Required",
       "deny": "Deny",
@@ -361,9 +404,15 @@
       "headerFallback": "Question",
       "answerPlaceholder": "Type your answer...",
       "customAnswerLabel": "Type your own answer",
+      "addCustomAnswer": "Add custom answer",
       "dismiss": "Dismiss",
+      "progress": "Question {{current}} of {{total}}",
+      "back": "Back",
       "next": "Next",
-      "submit": "Submit"
+      "submit": "Submit",
+      "required": "Choose an answer or enter a custom answer before continuing.",
+      "unanswerable": "This question has no available answer. Dismiss it to continue.",
+      "failed": "Could not submit. Your answers are preserved; try again."
     },
     "statusIndicator": {
       "retrying": "Retrying (attempt {{attempt}})...",
@@ -374,7 +423,28 @@
     },
     "modelPicker": {
       "title": "Select Model",
-      "searchPlaceholder": "Search models..."
+      "searchPlaceholder": "Search models...",
+      "useDefault": "Use server default: {{name}}",
+      "useServerDefault": "Use server default",
+      "useServerDefaultDescription": "The server chooses the model for new prompts",
+      "switchDefault": "Switch to current server default: {{name}}",
+      "defaultRowAccessibilityLabel": "Use server default",
+      "defaultRowAccessibilityHint": "Clears your explicit model choice and lets the server decide",
+      "switchDefaultAccessibilityHint": "Switches to the current server default"
+    },
+    "agentPicker": {
+      "title": "Select Agent",
+      "searchPlaceholder": "Search agents...",
+      "useDefault": "Use server default: {{name}}",
+      "useServerDefault": "Use server default",
+      "useServerDefaultDescription": "The server chooses the agent for new prompts",
+      "switchDefault": "Switch to current server default: {{name}}",
+      "defaultDescription": "The server chooses this for new prompts",
+      "defaultRowAccessibilityLabel": "Use server default",
+      "defaultRowAccessibilityHint": "Clears your explicit agent choice and lets the server decide",
+      "switchDefaultAccessibilityHint": "Switches to the current server default",
+      "rowAccessibilityLabel": "Select agent {{name}}",
+      "rowAccessibilityHint": "Uses this agent for new prompts"
     },
     "variantPicker": {
       "title": "Reasoning Effort",
@@ -386,6 +456,7 @@
         "high": "Deep, thorough reasoning"
       }
     },
+    "toolbar": {},
     "directorySwitcher": {
       "title": "Switch Project",
       "serverDefaultLabel": "Server Default",
@@ -409,7 +480,16 @@
     "toolCallCard": {
       "fallbackTitle": "Tool",
       "patternOnly": "Pattern: {{pattern}}",
-      "patternWithPath": "Pattern: {{pattern}} in {{path}}"
+      "patternWithPath": "Pattern: {{pattern}} in {{path}}",
+      "taskTitle": "Subagent task",
+      "openSubagent": "Open subagent",
+      "inputNeeded": "Input needed ({{count}})",
+      "taskStatus": {
+        "pending": "Pending",
+        "running": "Running",
+        "completed": "Completed",
+        "error": "Failed"
+      }
     },
     "sessionInfo": {
       "noUsageData": "No usage data yet",

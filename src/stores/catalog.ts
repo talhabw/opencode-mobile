@@ -1,23 +1,18 @@
 import { create } from "zustand"
 import { useConnections } from "./connections"
 import type { Agent, Command } from "../lib/sdk"
-import { chooseModelSelection } from "../lib/model-selection"
+import {
+  beginCatalogLoad,
+  failCatalogLoad,
+  UNRESOLVED_DEFAULTS,
+  type CatalogScope,
+  type DefaultResolution,
+  type Provider,
+} from "../lib/catalog-load"
+import { chooseModelSelection, resolveDefaultAgent } from "../lib/model-selection"
+import { stripTrailingSlash } from "../lib/path-utils"
 
-export interface ProviderModel {
-  id: string
-  name: string
-  reasoning: boolean
-  attachment: boolean
-  limit?: { context: number; output: number }
-  variants?: Record<string, { reasoningEffort?: string }>
-}
-
-export interface Provider {
-  id: string
-  name: string
-  connected: boolean
-  models: ProviderModel[]
-}
+export type { CatalogScope, DefaultResolution, Provider, ProviderModel } from "../lib/catalog-load"
 
 interface ModelSelection {
   providerID: string
@@ -26,6 +21,13 @@ interface ModelSelection {
 
 function sameModel(left: ModelSelection | null, right: ModelSelection | null) {
   return left?.providerID === right?.providerID && left?.modelID === right?.modelID
+}
+
+let requestSequence = 0
+
+function isCurrentRequest(request: number, scope: CatalogScope) {
+  const connections = useConnections.getState()
+  return request === requestSequence && connections.activeConnection?.id === scope.connectionId
 }
 
 interface CatalogState {
@@ -38,9 +40,15 @@ interface CatalogState {
   model: ModelSelection | null
   variant: string | null // model variant for reasoning effort (e.g. "low", "medium", "high")
   loaded: boolean
+  scope: CatalogScope | null
+  loading: boolean
+  error: string | null
+  defaultModel: ModelSelection | null
+  defaultAgent: string | null
+  defaultResolution: DefaultResolution
 
   // Actions
-  load: () => Promise<void>
+  load: (directory?: string) => Promise<void>
   setAgent: (name: string) => void
   setModel: (selection: ModelSelection | null) => void
   setVariant: (variant: string | null) => void
@@ -56,26 +64,47 @@ export const useCatalog = create<CatalogState>((set, get) => ({
   model: null,
   variant: null,
   loaded: false,
+  scope: null,
+  loading: false,
+  error: null,
+  defaultModel: null,
+  defaultAgent: null,
+  defaultResolution: UNRESOLVED_DEFAULTS,
 
-  load: async () => {
-    const client = useConnections.getState().client
-    if (!client) return
+  load: async (directory) => {
+    const connections = useConnections.getState()
+    const connectionId = connections.activeConnection?.id
+    const normalizedDirectory = directory?.trim() ? stripTrailingSlash(directory.trim()) : undefined
+    const client = connections.clientForDirectory(normalizedDirectory)
+    if (!client || !connectionId) return
 
-    const [agentResult, commandResult, providerResult] = await Promise.all([
-      client.agent.list().catch(() => [] as Agent[]),
-      client.command.list().catch(() => [] as Command[]),
-      client.provider.list().catch(() => null),
-    ])
+    const scope = { connectionId, directory: normalizedDirectory }
+    const current = get()
+    if (current.loaded && current.scope?.connectionId === scope.connectionId && current.scope.directory === scope.directory) return
+    const request = ++requestSequence
+    // Immediately stop treating the previous directory's options/defaults as
+    // loaded or selectable for the new scope. Explicit pending selections are
+    // preserved (not part of the patch) so the success path re-validates them.
+    set(beginCatalogLoad(scope))
 
-    const agents = Array.isArray(agentResult) ? agentResult : []
-    const commands = Array.isArray(commandResult) ? commandResult : []
+    try {
+      const [agentResult, commandResult, providerResult, configResult, defaultModelResult] = await Promise.all([
+        client.agent.list(),
+        client.command.list(),
+        client.provider.list(),
+        client.config.get(),
+        client.model.default(),
+      ])
+
+      const agents = Array.isArray(agentResult) ? agentResult : []
+      const commands = Array.isArray(commandResult) ? commandResult : []
 
     // The v2 adapter returns one normalized catalog assembled from the official
     // provider/model endpoints. Keep only connected providers for pickers.
-    const raw = providerResult
-    const connected = new Set(Array.isArray(raw?.connected) ? raw.connected : [])
-    const defaults = raw?.default || {}
-    const providers: Provider[] = Array.isArray(raw?.all)
+      const raw = providerResult
+      const connected = new Set(Array.isArray(raw.connected) ? raw.connected : [])
+      const defaults = raw.default || {}
+      const providers: Provider[] = Array.isArray(raw.all)
       ? raw.all
           .filter((p) => connected.has(p.id))
           .map((p) => ({
@@ -94,37 +123,51 @@ export const useCatalog = create<CatalogState>((set, get) => ({
               })),
           }))
           .filter((p) => p.models.length > 0)
-      : []
+        : []
 
     // Filter out hidden agents
-    const visible = agents.filter((a) => !a.hidden)
+      const visible = agents.filter((a) => !a.hidden)
 
     // Keep only an explicit valid selection. An empty agent lets a new v2
     // session use the server's configured default.
-    const current = get().agent
-    const agent = current && visible.some((a) => a.name === current) ? current : ""
+      const current = get().agent
+      const agent = current && visible.some((a) => a.name === current) ? current : ""
 
-    // Default model: keep valid existing selection; otherwise prefer connected
-    // provider defaults, then first connected model; agent model is last fallback.
-    const existing = get().model
-    const defaultAgent = visible[0]
-    const model = chooseModelSelection({
-      providers,
-      defaults,
-      existing,
-      agentModel: defaultAgent?.model || null,
-    })
+      // Keep only a valid explicit selection. Defaults remain informational so
+      // sending a new session preserves omission semantics.
+      const existing = get().model
+      const model = chooseModelSelection({ providers, defaults, existing, agentModel: null })
+      const defaultModel = defaultModelResult && typeof defaultModelResult === "object"
+        ? { providerID: defaultModelResult.providerID, modelID: defaultModelResult.id }
+        : null
+       const resolvedDefaultAgent = resolveDefaultAgent(configResult, false)
+       const defaultAgent = resolvedDefaultAgent && visible.some((item) =>
+         item.name === resolvedDefaultAgent && (item.mode === "primary" || item.mode === "all"),
+       ) ? resolvedDefaultAgent : null
 
-    set((state) => ({
-      agents: visible,
-      commands,
-      providers,
-      defaults,
-      agent,
-      model,
-      variant: sameModel(state.model, model) ? state.variant : null,
-      loaded: true,
-    }))
+      if (!isCurrentRequest(request, scope)) return
+      set((state) => ({
+        agents: visible,
+        commands,
+        providers,
+        defaults,
+        agent,
+        model,
+        variant: sameModel(state.model, model) ? state.variant : null,
+        loaded: true,
+        loading: false,
+        error: null,
+        scope,
+        defaultModel,
+        defaultAgent,
+        defaultResolution: { agent: defaultAgent ? "resolved" : "unresolved", model: defaultModel ? "resolved" : "unresolved" },
+      }))
+    } catch (error) {
+      if (!isCurrentRequest(request, scope)) return
+      // Scope and options were already reset at load start; a failure must
+      // leave the requested scope unloaded with no stale prior options behind.
+      set(failCatalogLoad(error))
+    }
   },
 
   setAgent: (name) => {

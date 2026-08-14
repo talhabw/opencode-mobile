@@ -171,21 +171,42 @@ test("adapts v2 text deltas and preserves unknown events", () => {
   assert.doesNotThrow(() => normalizeEvent(null))
 })
 
+test("normalizes complete session.created hierarchy and selection fields", () => {
+  const event = normalizeEvent({
+    type: "session.created",
+    created: 42,
+    data: {
+      sessionID: "child", projectID: "project", parentID: "root", slug: "child-slug", title: "Child",
+      agent: "explore", model: { providerID: "provider", id: "model", variant: "fast" },
+      location: { directory: "/work", workspaceID: "workspace" }, version: "2",
+    },
+  })
+  assert.deepEqual(event.properties.info, {
+    id: "child", slug: "child-slug", projectID: "project", directory: "/work",
+    location: { directory: "/work", workspaceID: "workspace" }, title: "Child", parentID: "root", agent: "explore",
+    model: { providerID: "provider", modelID: "model", variant: "fast" }, version: "2", time: { created: 42, updated: 42 },
+  })
+})
+
 test("preserves server.connected and tool lifecycle state", () => {
   const adapter = new V2EventAdapter()
   assert.deepEqual(adapter.push({ type: "server.connected", data: {} }), [{
     type: "server.connected", properties: {},
   }])
   adapter.push({ type: "session.tool.input.started", data: { sessionID: "s1", assistantMessageID: "m1", id: "c1", name: "bash" } })
-  const called = adapter.push({ type: "session.tool.called", data: { sessionID: "s1", assistantMessageID: "m1", id: "c1", input: { command: "ls" } } })[0]
+  const called = adapter.push({ type: "session.tool.called", data: { sessionID: "s1", assistantMessageID: "m1", id: "c1", input: { command: "ls" }, metadata: { sessionId: "child", stage: "called" } } })[0]
   assert.equal((called.properties.part as { tool: string }).tool, "bash")
   assert.deepEqual((called.properties.part as { state: { input: unknown } }).state.input, { command: "ls" })
+  assert.deepEqual((called.properties.part as { state: { metadata: unknown } }).state.metadata, { sessionId: "child", stage: "called" })
+  const progress = adapter.push({ type: "session.tool.progress", data: { sessionID: "s1", assistantMessageID: "m1", id: "c1", metadata: { stage: "progress" } } })[0]
+  assert.deepEqual((progress.properties.part as { state: { metadata: unknown } }).state.metadata, { sessionId: "child", stage: "progress" })
   const success = adapter.push({ type: "session.tool.success", data: {
-    sessionID: "s1", assistantMessageID: "m1", id: "c1", content: [{ type: "text", text: "file.txt" }, { type: "file", uri: "file://x", mime: "text/plain" }],
+    sessionID: "s1", assistantMessageID: "m1", id: "c1", metadata: { result: true }, content: [{ type: "text", text: "file.txt" }, { type: "file", uri: "file://x", mime: "text/plain" }],
   } })[0]
   const part = success.properties.part as { tool: string; state: { output: unknown } }
   assert.equal(part.tool, "bash")
   assert.equal(part.state.output, "file.txt\n[file: file://x (text/plain)]")
+  assert.deepEqual((success.properties.part as { state: { metadata: unknown } }).state.metadata, { sessionId: "child", stage: "progress", result: true })
 })
 
 test("projects every generated non-chat message variant without blank parts", () => {
@@ -201,9 +222,39 @@ test("projects every generated non-chat message variant without blank parts", ()
   ]
   for (const message of variants) {
     const result = normalizeMessage(message, "s1")
-    assert.equal(result.parts.length, 1, message.type)
-    assert.ok(result.parts[0].text, message.type)
+    if (message.type === "shell") {
+      assert.equal(result.info.presentation, "shell")
+      assert.deepEqual(result.info.shell, {
+        id: "h", shellID: "sh", command: "echo hi", status: "exited",
+        output: { output: "hi", cursor: 2, size: 2, truncated: false }, time: { created: 1 },
+      })
+      assert.deepEqual(result.parts, [])
+    } else {
+      assert.equal(result.info.presentation, "system", message.type)
+      assert.equal(result.info.systemKind, message.type === "agent-switched" ? "agent" : message.type === "model-switched" ? "model" : message.type === "location-switched" ? "location" : message.type)
+      assert.equal(result.parts.length, 1, message.type)
+      assert.ok(result.parts[0].text, message.type)
+    }
   }
+})
+
+test("shell lifecycle events pass through without fabricating a message", () => {
+  const started = normalizeEvent({
+    type: "session.shell.started",
+    created: 10,
+    data: { sessionID: "s1", shell: { id: "shell-1", command: "sleep 1", status: "running", time: { started: 10 } } },
+  })
+  assert.equal(started.type, "session.shell.started")
+  assert.equal((started.properties as { sessionID: string }).sessionID, "s1")
+  assert.equal("info" in started.properties, false)
+
+  const ended = normalizeEvent({
+    type: "session.shell.ended",
+    data: { sessionID: "s1", shell: { id: "shell-1", command: "sleep 1", status: "timeout", exit: "Infinity", time: { started: 10, completed: 20 } }, output: { output: "partial", cursor: 7, size: 7, truncated: true } },
+  })
+  assert.equal(ended.type, "session.shell.ended")
+  assert.equal((ended.properties as { canonicalRefresh: boolean }).canonicalRefresh, true)
+  assert.equal("info" in ended.properties, false)
 })
 
 test("maps v2 execution lifecycle to normalized session status", () => {
@@ -332,9 +383,11 @@ test("canonical tool parts flatten mixed content into visible output text", () =
           { type: "text", text: "out\n" },
           { type: "file", uri: "file:///x", mime: "text/plain", name: "x.txt" },
         ],
+        metadata: { sessionId: "child" },
       },
       time: { created: 1, completed: 2 },
     }],
   } satisfies SessionMessageInfo, "s1")
   assert.equal(message.parts[0].state?.output, "out\n[file: x.txt (text/plain)]")
+  assert.deepEqual(message.parts[0].state?.metadata, { sessionId: "child" })
 })

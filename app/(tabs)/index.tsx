@@ -28,6 +28,7 @@ import { DirectorySwitcher, DirectoryBrowserSheet } from "../../src/components/c
 import { groupByDirectory } from "../../src/lib/session-grouping"
 import { nameOf } from "../../src/lib/path-utils"
 import { useAccent, type AccentState } from "../../src/lib/accents"
+import { pendingSessionCounts } from "../../src/lib/session-hierarchy"
 
 function formatTime(timestamp: number, t: (key: string, opts?: Record<string, unknown>) => string): string {
   const date = new Date(timestamp)
@@ -44,14 +45,26 @@ function formatTime(timestamp: number, t: (key: string, opts?: Record<string, un
 
 function SessionItem({
   session,
+  depth,
+  expanded,
+  canExpand,
+  onToggle,
   isDark,
   onRename,
   onDelete,
+  pending,
+  onPendingPress,
 }: {
   session: Session
+  depth: number
+  expanded: boolean
+  canExpand: boolean
+  onToggle: () => void
   isDark: boolean
   onRename: () => void
   onDelete: () => void
+  pending: { own: number; descendants: number }
+  onPendingPress: () => void
 }) {
   const { t } = useTranslation()
   const acc = useAccent()
@@ -76,12 +89,20 @@ function SessionItem({
   const shortDir = session.directory ? session.directory.split("/").filter(Boolean).pop() : null
 
   return (
-    <TouchableOpacity
-      style={[styles.sessionItem, isDark && styles.sessionItemDark]}
-      onPress={onPress}
-      onLongPress={onLongPress}
-      testID={`session-item-${session.id}`}
-    >
+    <View style={[styles.sessionItem, { paddingLeft: 16 + depth * 20 }, isDark && styles.sessionItemDark]}>
+      {canExpand ? (
+        <TouchableOpacity
+          style={styles.expandButton}
+          onPress={onToggle}
+          accessibilityRole="button"
+          accessibilityLabel={expanded ? t("sessionsList.hierarchy.collapse") : t("sessionsList.hierarchy.expand")}
+          accessibilityState={{ expanded }}
+          testID={`session-expand-${session.id}`}
+        >
+          <Ionicons name={expanded ? "chevron-down" : "chevron-forward"} size={18} color={isDark ? "#888888" : "#666666"} />
+        </TouchableOpacity>
+      ) : <View style={styles.expandButton} />}
+      <TouchableOpacity style={styles.sessionPressable} onPress={onPress} onLongPress={onLongPress} testID={`session-item-${session.id}`}>
       <View style={styles.sessionContent}>
         <View style={styles.sessionHeader}>
           <Text style={[styles.sessionTitle, isDark && styles.textDark]} numberOfLines={1}>
@@ -103,10 +124,35 @@ function SessionItem({
               <Text style={[styles.sessionDirText, isDark && styles.metaDark]}>{shortDir}</Text>
             </View>
           )}
+          {pending.own > 0 && (
+            <TouchableOpacity
+              style={styles.pendingBadge}
+              onPress={onPendingPress}
+              accessibilityRole="button"
+              accessibilityLabel={t("sessionsList.hierarchy.inputNeeded", { count: pending.own })}
+              testID={`session-pending-${session.id}`}
+            >
+              <Ionicons name="help-circle-outline" size={13} color={acc.cur.primary} />
+              <Text style={[styles.pendingBadgeText, { color: acc.cur.primary }]}>{pending.own}</Text>
+            </TouchableOpacity>
+          )}
+          {pending.descendants > 0 && (
+            <TouchableOpacity
+              style={styles.pendingBadge}
+              onPress={onPendingPress}
+              accessibilityRole="button"
+              accessibilityLabel={t("sessionsList.hierarchy.subagentInputNeeded", { count: pending.descendants })}
+              testID={`session-descendant-pending-${session.id}`}
+            >
+              <Ionicons name="git-branch-outline" size={13} color={acc.cur.primary} />
+              <Text style={[styles.pendingBadgeText, { color: acc.cur.primary }]}>{pending.descendants}</Text>
+            </TouchableOpacity>
+          )}
         </View>
       </View>
       <Ionicons name="chevron-forward" size={20} color={isDark ? "#666666" : "#999999"} />
-    </TouchableOpacity>
+      </TouchableOpacity>
+    </View>
   )
 }
 
@@ -115,7 +161,8 @@ function SessionItem({
 // instead of switching to SectionList.
 type ListRow =
   | { type: "header"; directory: string; shortName: string; count: number; collapsed: boolean }
-  | { type: "session"; session: Session }
+  | { type: "session"; session: Session; depth: number }
+  | { type: "children-status"; parentID: string; depth: number; loading: boolean }
 
 function GroupHeader({
   row,
@@ -179,12 +226,18 @@ export default function SessionsScreen() {
 
   const {
     sessions,
-    isLoading,
+    childrenByParent,
+    childrenLoading,
+    childrenLoaded,
+    childrenHasMore,
+    isSessionsLoading,
     loadingMoreSessions,
     hasMoreSessions,
     error,
     loadSessions,
     loadMoreSessions,
+    loadChildren,
+    loadMoreChildren,
     createSession,
     deleteSession,
   } = useSessions()
@@ -200,6 +253,7 @@ export default function SessionsScreen() {
     recentDirectories,
   } = useConnections()
   const authError = useEvents((s) => s.authError)
+  const questions = useEvents((s) => s.questions)
   const reconnect = useEvents((s) => s.connect)
   const loadCatalog = useCatalog((s) => s.load)
   const dirSheetRef = useRef<BottomSheet>(null)
@@ -212,6 +266,19 @@ export default function SessionsScreen() {
   // Directories collapsed in the grouped session list. Empty by default —
   // all groups start expanded (#67).
   const [collapsedDirs, setCollapsedDirs] = useState<Set<string>>(new Set())
+  const [expandedSessions, setExpandedSessions] = useState<Set<string>>(new Set())
+
+  const toggleSession = useCallback((sessionID: string) => {
+    setExpandedSessions((previous) => {
+      const next = new Set(previous)
+      if (next.has(sessionID)) next.delete(sessionID)
+      else {
+        next.add(sessionID)
+        void loadChildren(sessionID)
+      }
+      return next
+    })
+  }, [loadChildren])
 
   const toggleGroup = useCallback((directory: string) => {
     setCollapsedDirs((prev) => {
@@ -226,10 +293,19 @@ export default function SessionsScreen() {
   // everything lives in one directory — a lone header adds noise, not clarity.
   const rows = useMemo<ListRow[]>(() => {
     const groups = groupByDirectory(sessions)
-    if (groups.length <= 1) {
-      return sessions.map((session) => ({ type: "session", session }))
-    }
     const out: ListRow[] = []
+    const appendSession = (session: Session, depth: number) => {
+      out.push({ type: "session", session, depth })
+      if (!expandedSessions.has(session.id)) return
+      for (const child of childrenByParent[session.id] ?? []) appendSession(child, depth + 1)
+      if (childrenLoading[session.id] || childrenHasMore[session.id]) {
+        out.push({ type: "children-status", parentID: session.id, depth: depth + 1, loading: Boolean(childrenLoading[session.id]) })
+      }
+    }
+    if (groups.length <= 1) {
+      for (const session of sessions) appendSession(session, 0)
+      return out
+    }
     for (const group of groups) {
       const collapsed = collapsedDirs.has(group.directory)
       out.push({
@@ -240,11 +316,11 @@ export default function SessionsScreen() {
         collapsed,
       })
       if (!collapsed) {
-        for (const session of group.items) out.push({ type: "session", session })
+        for (const session of group.items) appendSession(session, 0)
       }
     }
     return out
-  }, [sessions, collapsedDirs])
+  }, [sessions, childrenByParent, childrenLoading, childrenHasMore, expandedSessions, collapsedDirs])
 
   // Fetch server-known projects when the new session modal opens
   useEffect(() => {
@@ -297,7 +373,8 @@ export default function SessionsScreen() {
     if (!renameClient) return
     renamingInFlight.current = true
     try {
-      await renameClient.session.rename(renaming.id, title)
+      const updated = await renameClient.session.rename(renaming.id, title)
+      useSessions.getState().handleEvent({ type: "session.updated", properties: { info: updated } })
       setRenaming(null)
       setRenameText("")
       loadSessions()
@@ -561,17 +638,45 @@ export default function SessionsScreen() {
 
       <FlatList
         data={rows}
-        keyExtractor={(row) => (row.type === "header" ? `dir:${row.directory}` : row.session.id)}
+        keyExtractor={(row) => row.type === "header" ? `dir:${row.directory}` : row.type === "session" ? row.session.id : `children:${row.parentID}`}
         renderItem={({ item: row }) =>
           row.type === "header" ? (
             <GroupHeader row={row} isDark={isDark} onToggle={() => toggleGroup(row.directory)} />
-          ) : (
+          ) : row.type === "session" ? (
             <SessionItem
               session={row.session}
+              depth={row.depth}
+              expanded={expandedSessions.has(row.session.id)}
+              canExpand={!childrenLoaded[row.session.id] || (childrenByParent[row.session.id]?.length ?? 0) > 0}
+              onToggle={() => toggleSession(row.session.id)}
               isDark={isDark}
               onRename={() => handleRename(row.session)}
               onDelete={() => handleDelete(row.session)}
+              pending={pendingSessionCounts(row.session.id, childrenByParent, questions)}
+              onPendingPress={() => {
+                const counts = pendingSessionCounts(row.session.id, childrenByParent, questions)
+                if (counts.own > 0) {
+                  router.push({ pathname: "/session/[id]", params: { id: row.session.id, ...(row.session.directory ? { directory: row.session.directory } : {}) } })
+                } else {
+                  toggleSession(row.session.id)
+                }
+              }}
             />
+          ) : (
+            <View style={[styles.childrenStatus, { paddingLeft: 16 + row.depth * 20 }]}>
+              {row.loading ? (
+                <ActivityIndicator size="small" accessibilityLabel={t("sessionsList.hierarchy.loading")} />
+              ) : (
+                <TouchableOpacity
+                  onPress={() => loadMoreChildren(row.parentID)}
+                  accessibilityRole="button"
+                  accessibilityLabel={t("sessionsList.hierarchy.loadMore")}
+                  testID={`session-children-more-${row.parentID}`}
+                >
+                  <Text style={[styles.childrenMore, isDark && styles.metaDark]}>{t("sessionsList.hierarchy.loadMore")}</Text>
+                </TouchableOpacity>
+              )}
+            </View>
           )
         }
         refreshControl={
@@ -583,7 +688,7 @@ export default function SessionsScreen() {
         onEndReachedThreshold={0.4}
         ListFooterComponent={loadingMoreSessions ? <ActivityIndicator style={{ padding: 16 }} /> : null}
         ListEmptyComponent={
-          isLoading ? (
+          isSessionsLoading ? (
             <View style={styles.loadingContainer}>
               <ActivityIndicator size="large" color={isDark ? "#ffffff" : "#0a0a0a"} />
             </View>
@@ -994,9 +1099,33 @@ function makeStyles(acc: AccentState) {
   sessionItem: {
     flexDirection: "row",
     alignItems: "center",
-    padding: 16,
+    paddingRight: 16,
+    paddingVertical: 10,
     borderBottomWidth: 1,
     borderBottomColor: "#e5e5e5",
+  },
+  sessionPressable: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: 6,
+  },
+  expandButton: {
+    width: 32,
+    minHeight: 44,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  childrenStatus: {
+    minHeight: 44,
+    justifyContent: "center",
+    borderBottomWidth: 1,
+    borderBottomColor: "#e5e5e5",
+  },
+  childrenMore: {
+    color: acc.light.primary,
+    fontSize: 13,
+    fontWeight: "600",
   },
   sessionItemDark: {
     borderBottomColor: "#1a1a1a",
@@ -1040,6 +1169,18 @@ function makeStyles(acc: AccentState) {
   sessionDirText: {
     fontSize: 11,
     color: "#666666",
+  },
+  pendingBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 2,
+    marginLeft: 6,
+    paddingHorizontal: 4,
+    minHeight: 24,
+  },
+  pendingBadgeText: {
+    fontSize: 12,
+    fontWeight: "600",
   },
   metaDark: {
     color: "#888888",

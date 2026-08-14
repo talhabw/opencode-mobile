@@ -10,7 +10,11 @@ import { recordSuccessfulSession } from "../lib/store-review"
 import { isAuthError } from "../lib/api-error"
 import { isSessionActuallyIdle } from "../lib/session-status-reconcile"
 import { eventSessionID, mergeSendingState, reconnectDelay, resyncPlan, shouldRefreshCanonicalMessages } from "../lib/event-reconcile"
+import { canAutoResume } from "../lib/transport-lifecycle"
+import type { TransportPhase } from "../lib/transport-lifecycle"
 import type { Client, Event, Part, Session, Message } from "../lib/sdk"
+import { findCachedSession } from "../lib/session-hierarchy"
+import { LatestValueBuffer } from "../lib/latest-value-buffer"
 
 // Session status from the server
 type SessionStatus = { type: "idle" } | { type: "busy" } | { type: "retry"; attempt: number; message: string }
@@ -19,6 +23,7 @@ type PendingQuestion = Awaited<ReturnType<Client["question"]["list"]>>[number]
 
 interface EventsState {
   connected: boolean
+  phase: TransportPhase
   // Set when the last connection attempt failed with 401/403 — the server
   // rejected our credentials, not a transient network issue. The reconnect
   // loop stops retrying in this case (see connect()) since hammering a
@@ -27,6 +32,8 @@ interface EventsState {
   // e.g. after the user fixes their credentials on the connection edit screen.
   authError: boolean
   reconnectAttempts: number
+  reconnectVisible: boolean
+  recoveryVisible: boolean
   lastDisconnectAt: number | null
   sessionStatus: Record<string, SessionStatus>
   statusText: Record<string, string>
@@ -35,6 +42,8 @@ interface EventsState {
   questions: Record<string, PendingQuestion[]>
 
   connect: () => void
+  pause: () => void
+  resume: () => void
   disconnect: () => void
 }
 
@@ -42,8 +51,15 @@ let controller: AbortController | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 const messageRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>()
 let sessionRefreshTimer: ReturnType<typeof setTimeout> | null = null
+let generation = 0
 const resolvedPermissions = new Set<string>()
 const resolvedQuestions = new Set<string>()
+// Rendering every token reparses and relays out the whole accumulated response.
+// Ten visual updates per second keeps streaming fluid without starving input.
+const streamedParts = new LatestValueBuffer<Part>(100, (parts) => {
+  const sessions = useSessions.getState()
+  for (const part of parts) sessions.handleEvent({ type: "message.part.updated", properties: { part } })
+})
 
 export function markPendingResolved(kind: "permission" | "question", requestID: string, resolved: boolean) {
   const requests = kind === "permission" ? resolvedPermissions : resolvedQuestions
@@ -90,7 +106,13 @@ function groupPending<T extends { id: string; sessionID: string }>(items: T[], r
   return grouped
 }
 
-async function authoritativeResync(client: Client) {
+function cachedSession(sessionID: string): Session | undefined {
+  const state = useSessions.getState()
+  return findCachedSession(sessionID, state.sessions, state.childrenByParent, state.currentSession)
+}
+
+async function authoritativeResync(client: Client, isCurrent: () => boolean) {
+  if (!isCurrent()) return
   const sessions = useSessions.getState()
   const plan = resyncPlan(Boolean(sessions.currentSession))
   const pending = plan.pending ? Promise.all([client.permission.list(), client.question.list()]) : null
@@ -99,6 +121,7 @@ async function authoritativeResync(client: Client) {
     plan.sessions ? sessions.loadSessions() : undefined,
     plan.messages ? sessions.refreshMessages() : undefined,
     pending?.then(([permissions, questions]) => {
+      if (!isCurrent()) return
       const permissionIDs = new Set(permissions.map((request) => request.id))
       const questionIDs = new Set(questions.map((request) => request.id))
       for (const id of resolvedPermissions) if (!permissionIDs.has(id)) resolvedPermissions.delete(id)
@@ -109,6 +132,7 @@ async function authoritativeResync(client: Client) {
       })
     }),
     active?.then((running) => {
+      if (!isCurrent()) return
       useEvents.setState((state) => {
         const sessionStatus = { ...state.sessionStatus }
         for (const sessionID of Object.keys(sessionStatus)) {
@@ -122,7 +146,7 @@ async function authoritativeResync(client: Client) {
   ])
 }
 
-function scheduleCanonicalRefresh(event: Event) {
+function scheduleCanonicalRefresh(event: Event, isCurrent: () => boolean) {
   if (!shouldRefreshCanonicalMessages(event)) return
   const sessionID = eventSessionID(event)
   if (!sessionID || useSessions.getState().currentSession?.id !== sessionID) return
@@ -130,15 +154,17 @@ function scheduleCanonicalRefresh(event: Event) {
   if (previous) clearTimeout(previous)
   messageRefreshTimers.set(sessionID, setTimeout(() => {
     messageRefreshTimers.delete(sessionID)
+    if (!isCurrent()) return
     if (useSessions.getState().currentSession?.id === sessionID) void useSessions.getState().refreshMessages()
   }, 150))
 }
 
-function scheduleSessionRefresh(type: string) {
+function scheduleSessionRefresh(type: string, isCurrent: () => boolean) {
   if (!["session.created", "session.renamed", "session.moved", "session.deleted"].includes(type)) return
   if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
   sessionRefreshTimer = setTimeout(() => {
     sessionRefreshTimer = null
+    if (!isCurrent()) return
     void useSessions.getState().loadSessions()
   }, 150)
 }
@@ -175,7 +201,8 @@ const isQuestion = (input: unknown): input is PendingQuestion =>
 // clobber a genuinely still-busy session. Also re-checks sessionStatus right
 // before writing, so a real session.status event that lands while the fetch
 // is in flight (e.g. the session went busy again) wins over this resync.
-async function resyncBusySessions() {
+async function resyncBusySessions(isCurrent: () => boolean) {
+  if (!isCurrent()) return
   const busySessionIDs = Object.entries(useEvents.getState().sessionStatus)
     .filter(([, status]) => status.type === "busy")
     .map(([sessionID]) => sessionID)
@@ -183,6 +210,7 @@ async function resyncBusySessions() {
 
   await Promise.all(
     busySessionIDs.map(async (sessionID) => {
+      if (!isCurrent()) return
       try {
         const sessionsState = useSessions.getState()
         const session =
@@ -201,7 +229,7 @@ async function resyncBusySessions() {
         // A fresh session.status event may have landed on the SSE stream
         // while this fetch was in flight — that's authoritative, don't
         // stomp on it.
-        if (useEvents.getState().sessionStatus[sessionID]?.type !== "busy") return
+        if (!isCurrent() || useEvents.getState().sessionStatus[sessionID]?.type !== "busy") return
 
         useEvents.setState((state) => ({
           sessionStatus: { ...state.sessionStatus, [sessionID]: { type: "idle" } },
@@ -220,8 +248,11 @@ async function resyncBusySessions() {
 
 export const useEvents = create<EventsState>((set, get) => ({
   connected: false,
+  phase: "stopped",
   authError: false,
   reconnectAttempts: 0,
+  reconnectVisible: false,
+  recoveryVisible: false,
   lastDisconnectAt: null,
   sessionStatus: {},
   statusText: {},
@@ -229,6 +260,8 @@ export const useEvents = create<EventsState>((set, get) => ({
   questions: {},
 
   connect: () => {
+    const streamGeneration = ++generation
+    streamedParts.clear()
     controller?.abort()
     controller = null
     if (reconnectTimer) {
@@ -241,7 +274,7 @@ export const useEvents = create<EventsState>((set, get) => ({
 
     controller = new AbortController()
     const currentController = controller
-    set({ connected: true, authError: false })
+    set({ connected: false, phase: "connecting", authError: false, recoveryVisible: false })
     console.log("[SSE] Connecting to event stream...")
     addBreadcrumb({ category: "sse", message: "connecting" })
 
@@ -250,22 +283,22 @@ export const useEvents = create<EventsState>((set, get) => ({
       let reconnectScheduled = false
       let resynced = false
       const stableTimer = setTimeout(() => {
-        if (!currentController.signal.aborted) {
+        if (!currentController.signal.aborted && generation === streamGeneration) {
           set({ reconnectAttempts: 0, lastDisconnectAt: null })
         }
       }, STABLE_CONNECTION_MS)
 
       const scheduleReconnect = (reason: unknown) => {
-        if (reconnectScheduled || currentController.signal.aborted) return
+        if (reconnectScheduled || currentController.signal.aborted || generation !== streamGeneration) return
         reconnectScheduled = true
         const state = get()
         const reconnectAttempts = state.reconnectAttempts + 1
         const lastDisconnectAt = state.lastDisconnectAt ?? Date.now()
         const disconnectedFor = Date.now() - lastDisconnectAt
-        set({ connected: false, reconnectAttempts, lastDisconnectAt })
+        set({ connected: false, phase: "reconnecting", reconnectAttempts, reconnectVisible: true, lastDisconnectAt })
 
         if (disconnectedFor >= PROLONGED_DISCONNECT_MS) {
-          notify({
+                notify({
             category: "connection",
             title: "Connection interrupted",
             body: sanitizeBody(undefined, "Trying to reconnect to your server"),
@@ -281,31 +314,43 @@ export const useEvents = create<EventsState>((set, get) => ({
           category: "sse",
           level: "warning",
           message: "reconnect scheduled",
-          data: { attempt: reconnectAttempts, delayMs: jitteredDelay, reason: String(reason).slice(0, 200) },
+          data: {
+            attempt: reconnectAttempts,
+            delayMs: jitteredDelay,
+            reasonClass: isAuthError(reason) ? "authorization" : reason instanceof Error ? "error" : "unknown",
+          },
         })
         reconnectTimer = setTimeout(() => {
           reconnectTimer = null
-          get().connect()
+          if (generation === streamGeneration) get().connect()
         }, jitteredDelay)
       }
 
       try {
         for await (const event of client.global.events(currentController.signal)) {
-          if (currentController.signal.aborted) break
+          if (currentController.signal.aborted || generation !== streamGeneration) break
+
+          // A parsed event is our first proof that authentication and the
+          // subscription are usable. Do not wait for the stability timer.
+          if (get().phase !== "ready") {
+            set({ connected: true, phase: "ready", reconnectAttempts: 0, reconnectVisible: false, recoveryVisible: get().reconnectVisible })
+          }
 
           // The stream is now live. Rebuild volatile state once per physical
           // subscription so cold starts and reconnects cannot retain gaps.
           if (!resynced) {
             resynced = true
-            void authoritativeResync(client).then(resyncBusySessions).catch((error) => {
+            void authoritativeResync(client, () => generation === streamGeneration && !currentController.signal.aborted).then(() => {
+              if (generation === streamGeneration) return resyncBusySessions(() => generation === streamGeneration && !currentController.signal.aborted)
+            }).catch((error) => {
               console.warn("[Events] Failed authoritative resync:", error)
             })
           }
 
           const type = event.type
           const props = event.properties
-          scheduleCanonicalRefresh(event)
-          scheduleSessionRefresh(type)
+          scheduleCanonicalRefresh(event, () => generation === streamGeneration && !currentController.signal.aborted)
+          scheduleSessionRefresh(type, () => generation === streamGeneration && !currentController.signal.aborted)
 
           switch (type) {
             case "session.status": {
@@ -353,12 +398,13 @@ export const useEvents = create<EventsState>((set, get) => ({
                 // here via busy→idle). Without this guard the user gets a
                 // misleading — or duplicate, contradictory — completion push.
                 if (!aborted && !erroredSessions.has(sessionID)) {
-                  const match = useSessions.getState().sessions.find((s) => s.id === sessionID)
+                  const match = cachedSession(sessionID)
                   notify({
                     category: "completed",
                     title: "Task completed",
                     body: sanitizeBody(match?.title, "Session finished processing"),
                     sessionId: sessionID,
+                    directory: match?.directory,
                   })
                 }
                 // Genuinely positive moment — count it toward the one-time
@@ -384,12 +430,19 @@ export const useEvents = create<EventsState>((set, get) => ({
               // Update status text from the latest part
               const sessionID = part.sessionID
               if (sessionID) {
-                set((state) => ({
-                  statusText: { ...state.statusText, [sessionID]: statusFromPart(part) },
-                }))
+                const statusText = statusFromPart(part)
+                if (get().statusText[sessionID] !== statusText) {
+                  set((state) => ({
+                    statusText: { ...state.statusText, [sessionID]: statusText },
+                  }))
+                }
               }
 
-              useSessions.getState().handleEvent({ type, properties: { part } })
+              if (part.type === "text" || part.type === "reasoning") {
+                streamedParts.push(`${part.sessionID ?? ""}\u0000${part.messageID}\u0000${part.id}`, part, props.canonicalRefresh === true)
+              } else {
+                useSessions.getState().handleEvent({ type, properties: { part } })
+              }
               break
             }
 
@@ -409,12 +462,22 @@ export const useEvents = create<EventsState>((set, get) => ({
             case "session.created": {
               const info = value(props, "info", isSession)
               if (!info) break
-              // Add to sessions list
-              useSessions.setState((state) => {
-                const exists = state.sessions.some((s) => s.id === info.id)
-                if (exists) return {}
-                return { sessions: [info, ...state.sessions] }
-              })
+              useSessions.getState().handleEvent({ type, properties: { info } })
+              break
+            }
+
+            case "session.deleted": {
+              const sessionID = value(props, "sessionID", isString)
+              if (!sessionID) break
+              useSessions.getState().handleEvent({ type, properties: { sessionID } })
+              break
+            }
+
+            case "session.renamed":
+            case "session.moved": {
+              const sessionID = value(props, "sessionID", isString)
+              if (!sessionID) break
+              useSessions.getState().handleEvent({ type, properties: props })
               break
             }
 
@@ -444,6 +507,7 @@ export const useEvents = create<EventsState>((set, get) => ({
                 title: "Session error",
                 body: sanitizeBody(error?.message, "Something went wrong"),
                 sessionId: sessionID,
+                directory: cachedSession(sessionID)?.directory,
               })
               break
             }
@@ -472,6 +536,7 @@ export const useEvents = create<EventsState>((set, get) => ({
                   "A tool needs your approval",
                 ),
                 sessionId: req.sessionID,
+                directory: cachedSession(req.sessionID)?.directory,
                 dedupeKey: `perm-${req.id}`,
                 dedupeCooldownMs: 60_000,
               })
@@ -548,17 +613,41 @@ export const useEvents = create<EventsState>((set, get) => ({
             data: { status: err.status },
           })
           track(AnalyticsEvent.ConnectionFailed, { source: "sse", error_class: "unauthorized" })
-          set({ connected: false, authError: true })
+          if (generation === streamGeneration) set({ connected: false, phase: "auth-error", authError: true, reconnectVisible: false })
         } else {
           scheduleReconnect(err)
         }
       } finally {
         clearTimeout(stableTimer)
-        if (currentController.signal.aborted) {
+        if (currentController.signal.aborted || generation !== streamGeneration) {
           console.log("[SSE] Disconnected (aborted)")
         }
       }
     })()
+  },
+
+  pause: () => {
+    generation += 1
+    streamedParts.clear()
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+    controller?.abort()
+    controller = null
+    set({ connected: false, phase: "paused", reconnectAttempts: 0, reconnectVisible: false, recoveryVisible: false })
+  },
+
+  resume: () => {
+    if (!useConnections.getState().client) return
+    // Only auto-reconnect from phases where a retry is routine (app
+    // backgrounded, transient drop). An auth-error phase means the server
+    // rejected our credentials — resuming on app-activate would just replay
+    // the failing auth with no path to recovery (issue #76). Retrying after
+    // credentials change goes through a manual connect(), which has no such
+    // guard.
+    if (!canAutoResume(get().phase)) return
+    get().connect()
   },
 
   disconnect: () => {
@@ -570,18 +659,23 @@ export const useEvents = create<EventsState>((set, get) => ({
     }
     controller?.abort()
     controller = null
+    generation += 1
     for (const timer of messageRefreshTimers.values()) clearTimeout(timer)
     messageRefreshTimers.clear()
     if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
     sessionRefreshTimer = null
+    streamedParts.clear()
     resolvedPermissions.clear()
     resolvedQuestions.clear()
     erroredSessions.clear()
     abortedSessions.clear()
     set({
       connected: false,
+      phase: "stopped",
       authError: false,
       reconnectAttempts: 0,
+      reconnectVisible: false,
+      recoveryVisible: false,
       lastDisconnectAt: null,
       sessionStatus: {},
       statusText: {},

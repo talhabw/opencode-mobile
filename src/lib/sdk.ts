@@ -195,7 +195,7 @@ export function createClient(input: ClientConfig) {
     },
     session: {
       page: async (
-        params?: { limit?: number; search?: string; cursor?: string; order?: "asc" | "desc" },
+        params?: { limit?: number; search?: string; cursor?: string; order?: "asc" | "desc"; parentID?: string | null },
         timeoutMs?: number,
       ): Promise<CursorPage<Session>> => {
         const response = await timed((options) => raw.session.list({
@@ -203,17 +203,19 @@ export function createClient(input: ClientConfig) {
             search: params?.search,
             cursor: params?.cursor,
              order: params?.cursor ? undefined : params?.order ?? "desc",
+             parentID: params?.parentID,
             directory: config.directory,
             workspace: config.workspace,
           }, options), timeoutMs)
         return { data: response.data.map(normalizeSession), cursor: response.cursor }
       },
-      list: async (params?: { roots?: boolean; limit?: number; search?: string; cursor?: string }, timeoutMs?: number): Promise<Session[]> => {
+      list: async (params?: { roots?: boolean; limit?: number; search?: string; cursor?: string; parentID?: string | null }, timeoutMs?: number): Promise<Session[]> => {
         const response = await timed((options) => raw.session.list({
           limit: params?.limit,
           search: params?.search,
           cursor: params?.cursor,
           order: params?.cursor ? undefined : "desc",
+          parentID: params?.parentID,
           directory: config.directory,
           workspace: config.workspace,
         }, options), timeoutMs)

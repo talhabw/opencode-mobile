@@ -24,6 +24,8 @@ test("canonical refresh covers lifecycle and tool completion but ignores unknown
   assert.equal(shouldRefreshCanonicalMessages({ type: "session.tool.success", properties: {} }), true)
   assert.equal(shouldRefreshCanonicalMessages({ type: "message.part.updated", properties: { canonicalRefresh: true } }), true)
   assert.equal(shouldRefreshCanonicalMessages({ type: "message.part.updated", properties: {} }), false)
+  assert.equal(shouldRefreshCanonicalMessages({ type: "session.shell.ended", properties: { canonicalRefresh: true } }), true)
+  assert.equal(shouldRefreshCanonicalMessages({ type: "session.shell.started", properties: {} }), false)
   assert.equal(shouldRefreshCanonicalMessages({ type: "future.event", properties: { sessionID: "s1" } }), false)
   assert.equal(eventSessionID({ type: "future.event", properties: { sessionID: "s1" } }), "s1")
   assert.equal(eventSessionID({ type: "future.event", properties: { sessionID: 1 } }), undefined)

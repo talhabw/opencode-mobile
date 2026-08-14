@@ -4,6 +4,7 @@ import { Ionicons } from "@expo/vector-icons"
 import BottomSheet, { BottomSheetBackdrop, BottomSheetSectionList, BottomSheetTextInput } from "@gorhom/bottom-sheet"
 import { useTranslation } from "react-i18next"
 import { useAccent, type AccentState } from "../../lib/accents"
+import { defaultActionDecision } from "../../lib/selection-ui"
 
 interface ModelItem {
   providerID: string
@@ -23,10 +24,13 @@ interface Props {
   selected: { providerID: string; modelID: string } | null
   isDark: boolean
   onSelect: (providerID: string, modelID: string) => void
+  defaultModel: { providerID: string; modelID: string } | null
+  hasPersistedOverride: boolean
+  onSelectDefault: (selection: { providerID: string; modelID: string } | null) => void
   sheetRef: React.RefObject<BottomSheet | null>
 }
 
-export function ModelPicker({ providers, selected, isDark, onSelect, sheetRef }: Props) {
+export function ModelPicker({ providers, selected, isDark, onSelect, defaultModel, hasPersistedOverride, onSelectDefault, sheetRef }: Props) {
   const { t } = useTranslation()
   const acc = useAccent()
   const s = makeStyles(acc)
@@ -82,6 +86,19 @@ export function ModelPicker({ providers, selected, isDark, onSelect, sheetRef }:
     [onSelect, sheetRef],
   )
 
+  const action = defaultActionDecision(hasPersistedOverride, !!defaultModel)
+  const defaultModelName = defaultModel
+    ? providers.find((p) => p.id === defaultModel.providerID)?.models.find((m) => m.id === defaultModel.modelID)?.name || defaultModel.modelID
+    : null
+  const isDefaultActive = action === "inherit"
+    ? !selected
+    : selected?.providerID === defaultModel?.providerID && selected?.modelID === defaultModel?.modelID
+  const defaultRowLabel = action === "concrete"
+    ? t("chat.modelPicker.switchDefault", { name: defaultModelName })
+    : defaultModel
+      ? t("chat.modelPicker.useDefault", { name: defaultModelName })
+      : t("chat.modelPicker.useServerDefault")
+
   return (
     <BottomSheet
       ref={sheetRef}
@@ -115,6 +132,24 @@ export function ModelPicker({ providers, selected, isDark, onSelect, sheetRef }:
           autoCapitalize="none"
         />
       </View>
+      {action !== "unavailable" && (
+        <TouchableOpacity
+          style={[s.defaultRow, isDark && s.rowDark, isDefaultActive && s.rowSelected]}
+          onPress={() => { onSelectDefault(action === "concrete" ? defaultModel : null); sheetRef.current?.close() }}
+          testID="model-default-option"
+          accessibilityRole="button"
+          accessibilityState={{ selected: isDefaultActive }}
+          accessibilityLabel={action === "concrete" ? defaultRowLabel : t("chat.modelPicker.defaultRowAccessibilityLabel")}
+          accessibilityHint={action === "concrete" ? t("chat.modelPicker.switchDefaultAccessibilityHint") : t("chat.modelPicker.defaultRowAccessibilityHint")}
+        >
+          <Ionicons name="server-outline" size={20} color={acc.cur.accent} />
+          <View style={s.rowText}>
+            <Text style={[s.rowName, isDark && s.textWhite]}>{defaultRowLabel}</Text>
+            {!defaultModel && <Text style={[s.rowProvider, isDark && s.metaDark]}>{t("chat.modelPicker.useServerDefaultDescription")}</Text>}
+          </View>
+          {isDefaultActive && <Ionicons name="checkmark-circle" size={20} color={acc.cur.accent} />}
+        </TouchableOpacity>
+      )}
       <BottomSheetSectionList
         sections={sections}
         keyExtractor={(item: ModelItem) => `${item.providerID}/${item.modelID}`}
@@ -193,5 +228,6 @@ function makeStyles(acc: AccentState) {
     rowText: { flex: 1 },
     rowName: { fontSize: 15, fontWeight: "500", color: "#0a0a0a" },
     rowProvider: { fontSize: 12, color: "#999999", marginTop: 1 },
+    defaultRow: { flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 12, gap: 12 },
   })
 }

@@ -14,6 +14,7 @@ import {
   Animated,
   Easing,
   useWindowDimensions,
+  Linking,
 } from "react-native"
 import { useLocalSearchParams, Stack, useRouter, useFocusEffect } from "expo-router"
 import { Ionicons } from "@expo/vector-icons"
@@ -30,6 +31,7 @@ import {
   StatusIndicator,
   SlashPopover,
   ModelPicker,
+  AgentPicker,
   VariantPicker,
   ImageAttachments,
   SessionInfo,
@@ -37,6 +39,7 @@ import {
   type Attachment,
 } from "../../src/components/chat"
 import { computeSessionUsage } from "../../src/lib/session-usage"
+import { shouldPinToBottom } from "../../src/lib/session-scroll"
 import { useSessions } from "../../src/stores/sessions"
 import { useEvents, refreshPending, markPendingResolved } from "../../src/stores/events"
 import { useConnections } from "../../src/stores/connections"
@@ -44,9 +47,15 @@ import { useAuth } from "../../src/stores/auth"
 import { useCatalog } from "../../src/stores/catalog"
 import { useSettings } from "../../src/stores/settings"
 import { useSpeech } from "../../src/lib/speech"
+import type { SpeechFailureReason } from "../../src/lib/speech-errors"
 import { useKeyboardHeight } from "../../src/lib/use-keyboard-height"
 import { useAccent, type AccentState } from "../../src/lib/accents"
 import { parseServerCommand } from "../../src/lib/session-request"
+import { matchesCatalogScope } from "../../src/lib/catalog-load"
+import { stripTrailingSlash } from "../../src/lib/path-utils"
+import { selectorLabel } from "../../src/lib/selection-ui"
+import { findCachedSession, unassociatedDescendantPending } from "../../src/lib/session-hierarchy"
+import { taskSubagentLink } from "../../src/lib/task-subagent"
 
 // Header title marquee. When the session title overflows the header title
 // area it scrolls, but never continuously: it slides left, returns, pauses a
@@ -163,6 +172,7 @@ export default function SessionScreen() {
 
   const flatListRef = useRef<FlatList>(null)
   const modelSheetRef = useRef<BottomSheet>(null)
+  const agentSheetRef = useRef<BottomSheet>(null)
   const variantSheetRef = useRef<BottomSheet>(null)
   const [input, setInput] = useState("")
   const [attachments, setAttachments] = useState<Attachment[]>([])
@@ -173,7 +183,7 @@ export default function SessionScreen() {
     currentSession,
     messages,
     parts,
-    isLoading,
+    isSessionLoading,
     loadingMore,
     hasMore,
     selectSession,
@@ -182,6 +192,8 @@ export default function SessionScreen() {
     loadOlderMessages,
     revertToMessage,
     unrevertSession,
+    sessions,
+    childrenByParent,
   } = useSessions()
 
   // Derive sending state for this specific session
@@ -189,6 +201,7 @@ export default function SessionScreen() {
 
   const { authenticateForMessage } = useAuth()
   const { client, clientForDirectory } = useConnections()
+  const activeConnectionID = useConnections((state) => state.activeConnection?.id)
   // Message font scale (percentage, e.g. 120 = 120%); applied to every chat font size
   const fontScale = useSettings((s) => s.fontSize)
 
@@ -209,18 +222,39 @@ export default function SessionScreen() {
   const variant = catalog.variant
   const setVariant = catalog.setVariant
   const setAgent = catalog.setAgent
-  const cycleAgent = catalog.cycleAgent
+  const normalizedSessionDirectory = currentSession?.directory?.trim() ? stripTrailingSlash(currentSession.directory.trim()) : undefined
+  const catalogReady = catalog.loaded && matchesCatalogScope(catalog.scope, activeConnectionID, normalizedSessionDirectory)
+  const pickerAgents = catalogReady ? agents : []
+  const pickerProviders = catalogReady ? providers : []
 
   // Permission & question state
   const sessionID = currentSession?.id
   const permissions = useEvents((s) => (sessionID ? s.permissions[sessionID] : undefined)) || []
   const questions = useEvents((s) => (sessionID ? s.questions[sessionID] : undefined)) || []
+  const allQuestions = useEvents((s) => s.questions)
+  const associatedChildIDs = useMemo(() => {
+    const ids = new Set<string>()
+    for (const sessionParts of Object.values(parts)) {
+      for (const part of sessionParts) {
+        const link = taskSubagentLink(part)
+        if (link) ids.add(link.sessionID)
+      }
+    }
+    return ids
+  }, [parts])
+  const fallbackQuestions = useMemo(
+    () => sessionID ? unassociatedDescendantPending(sessionID, childrenByParent, allQuestions, associatedChildIDs) : [],
+    [sessionID, childrenByParent, allQuestions, associatedChildIDs],
+  )
 
   const shortDir = getShortDir(currentSession?.directory)
   const [showScrollButton, setShowScrollButton] = useState(false)
 
   // SSE reconnect banner
   const reconnectAttempts = useEvents((s) => s.reconnectAttempts)
+  const transportPhase = useEvents((s) => s.phase)
+  const reconnectVisible = useEvents((s) => s.reconnectVisible)
+  const recoveryVisible = useEvents((s) => s.recoveryVisible)
   const [showConnectedFlash, setShowConnectedFlash] = useState(false)
   const prevReconnecting = useRef(false)
 
@@ -243,7 +277,23 @@ export default function SessionScreen() {
   // on every re-render while it remains set.
   useEffect(() => {
     if (!speech.error) return
-    Alert.alert(t("session.alerts.speechErrorTitle"), t("session.alerts.speechErrorMessage"))
+    const messages: Record<SpeechFailureReason, string> = {
+      "permission-denied": t("session.alerts.speechPermissionDeniedMessage"),
+      "permission-blocked": t("session.alerts.speechPermissionBlockedMessage"),
+      "recognizer-unavailable": t("session.alerts.speechRecognizerUnavailableMessage"),
+      "audio-capture": t("session.alerts.speechAudioCaptureMessage"),
+      network: t("session.alerts.speechNetworkMessage"),
+      busy: t("session.alerts.speechBusyMessage"),
+      "language-not-supported": t("session.alerts.speechLanguageMessage"),
+      runtime: t("session.alerts.speechRuntimeMessage"),
+    }
+    const actions = speech.error === "permission-blocked"
+      ? [
+          { text: t("common.cancel"), style: "cancel" as const },
+          { text: t("session.alerts.speechOpenSettings"), onPress: () => Linking.openSettings() },
+        ]
+      : undefined
+    Alert.alert(t("session.alerts.speechErrorTitle"), messages[speech.error], actions)
   }, [speech.error, t])
 
   // Slash command state
@@ -283,6 +333,9 @@ export default function SessionScreen() {
     },
     [messages, parts, revertMessageID],
   )
+  const streamingMessageID = isSending
+    ? messages.findLast((message) => message.role === "assistant")?.id
+    : undefined
 
   // Tracks the latest composer text without pulling `input` into
   // handleMessageLongPress's deps — kept as a plain ref assignment (not
@@ -365,14 +418,21 @@ export default function SessionScreen() {
         const connState = useConnections.getState()
         const c = directory ? (connState.clientForDirectory(directory) ?? connState.client) : connState.client
         if (c) refreshPending(c, id)
+        const selected = useSessions.getState().currentSession
+        void useCatalog.getState().load(selected?.directory || directory)
       })
     }, [id, directory]),
   )
 
+  useEffect(() => {
+    if (!currentSession) return
+    void useCatalog.getState().load(currentSession.directory)
+  }, [currentSession?.id, currentSession?.directory])
+
   // v2 persists these selections on the session. Reflect that state rather
   // than inferring a model from message history (which loses the variant).
   useEffect(() => {
-    if (!currentSession || !catalog.loaded) return
+    if (!currentSession || !catalogReady) return
     const sessionAgent = currentSession.agent
       ? agents.find((item) => item.name === currentSession.agent || item.label === currentSession.agent)?.name
       : undefined
@@ -387,7 +447,7 @@ export default function SessionScreen() {
     currentSession?.model?.providerID,
     currentSession?.model?.modelID,
     currentSession?.model?.variant,
-    catalog.loaded,
+    catalogReady,
   ])
 
   // Slash command handler
@@ -404,13 +464,13 @@ export default function SessionScreen() {
             return
           case "agent":
             setInput("")
-            cycleAgent()
+            agentSheetRef.current?.expand()
             return
         }
       }
       setInput(`/${cmd.trigger} `)
     },
-    [router, cycleAgent],
+    [router],
   )
 
   // --- Image picking ---
@@ -541,6 +601,11 @@ export default function SessionScreen() {
     // No need to abort - just send and it will be processed after current response.
     try {
       await sendMessage(text, model || undefined, agent || undefined, files, variant || undefined)
+      // Pin after sendMessage commits its optimistic row, before later layout
+      // changes from the running status can move it below the viewport.
+      if (shouldPinToBottom({ trigger: "optimistic-send", nearBottom: atBottomRef.current })) {
+        scrollToBottom(false)
+      }
     } catch (err) {
       console.error("Send failed:", err)
       // Restore the user's text and attachments so their input isn't lost.
@@ -568,7 +633,13 @@ export default function SessionScreen() {
   // the viewport on the previously-visible item, so newly streamed text stays
   // hidden just below the fold.
   const handleContentSizeChange = useCallback(() => {
-    if (atBottomRef.current) {
+    if (shouldPinToBottom({ trigger: "content-change", nearBottom: atBottomRef.current })) {
+      flatListRef.current?.scrollToOffset({ offset: 0, animated: false })
+    }
+  }, [])
+
+  const handleListLayout = useCallback(() => {
+    if (shouldPinToBottom({ trigger: "layout-change", nearBottom: atBottomRef.current })) {
       flatListRef.current?.scrollToOffset({ offset: 0, animated: false })
     }
   }, [])
@@ -587,18 +658,17 @@ export default function SessionScreen() {
     if (!loadingMore) loadingTriggered.current = false
   }, [loadingMore])
 
-  // Detect reconnecting → stable transition for the "Connected ✓" flash.
-  // reconnectAttempts and lastDisconnectAt reset in the same set() call, so we
-  // can't use lastDisconnectAt alone; a useRef tracks the prior reconnecting state.
+  // The store only marks recovery after a visible retry. Fast pause/resume is
+  // deliberately silent.
   useEffect(() => {
-    const isReconnecting = reconnectAttempts > 0
-    if (prevReconnecting.current && !isReconnecting) {
+    if (recoveryVisible && !prevReconnecting.current) {
+      prevReconnecting.current = true
       setShowConnectedFlash(true)
       const t = setTimeout(() => setShowConnectedFlash(false), 2000)
       return () => clearTimeout(t)
     }
-    prevReconnecting.current = isReconnecting
-  }, [reconnectAttempts])
+    prevReconnecting.current = recoveryVisible
+  }, [recoveryVisible])
 
   const handlePermissionReply = async (requestID: string, reply: "once" | "always" | "reject") => {
     if (!sessionClient || !sessionID) return
@@ -625,48 +695,28 @@ export default function SessionScreen() {
     }
   }
 
-  const handleQuestionReply = async (requestID: string, answers: string[][]) => {
-    if (!sessionClient || !sessionID) return
-    const snapshot = useEvents.getState().questions[sessionID] || []
+  const handleQuestionReply = async (requestID: string, answers: string[][], ownerSessionID: string) => {
+    if (!sessionClient) throw new Error("No session client")
+    await sessionClient.question.reply(requestID, answers, ownerSessionID)
     markPendingResolved("question", requestID, true)
     useEvents.setState((state) => ({
       questions: {
         ...state.questions,
-        [sessionID]: snapshot.filter((q) => q.id !== requestID),
+        [ownerSessionID]: (state.questions[ownerSessionID] || []).filter((q) => q.id !== requestID),
       },
     }))
-    try {
-      await sessionClient.question.reply(requestID, answers, sessionID)
-    } catch (err) {
-      markPendingResolved("question", requestID, false)
-      console.error("Question reply failed:", err)
-      useEvents.setState((state) => ({
-        questions: { ...state.questions, [sessionID]: snapshot },
-      }))
-      Alert.alert(t("session.alerts.replyFailedTitle"), t("session.alerts.replyFailedMessage"))
-    }
   }
 
-  const handleQuestionReject = async (requestID: string) => {
-    if (!sessionClient || !sessionID) return
-    const snapshot = useEvents.getState().questions[sessionID] || []
+  const handleQuestionReject = async (requestID: string, ownerSessionID: string) => {
+    if (!sessionClient) throw new Error("No session client")
+    await sessionClient.question.reject(requestID, ownerSessionID)
     markPendingResolved("question", requestID, true)
     useEvents.setState((state) => ({
       questions: {
         ...state.questions,
-        [sessionID]: snapshot.filter((q) => q.id !== requestID),
+        [ownerSessionID]: (state.questions[ownerSessionID] || []).filter((q) => q.id !== requestID),
       },
     }))
-    try {
-      await sessionClient.question.reject(requestID, sessionID)
-    } catch (err) {
-      markPendingResolved("question", requestID, false)
-      console.error("Question reject failed:", err)
-      useEvents.setState((state) => ({
-        questions: { ...state.questions, [sessionID]: snapshot },
-      }))
-      Alert.alert(t("session.alerts.rejectFailedTitle"), t("session.alerts.rejectFailedMessage"))
-    }
   }
 
   const handleModelSelect = useCallback(
@@ -680,7 +730,12 @@ export default function SessionScreen() {
   // selection; the toolbar shows the human-readable label when available.
   const currentAgent = agents.find((a) => a.name === agent)
   const agentColor = currentAgent?.color || acc.cur.accent
-  const modelLabel = model?.modelID ? model.modelID.split("/").pop() || model.modelID : "default"
+  const defaultAgentLabel = catalog.defaultAgent ? agents.find((a) => a.name === catalog.defaultAgent)?.label || catalog.defaultAgent : null
+  const defaultModelLabel = catalog.defaultModel ? providers.find((p) => p.id === catalog.defaultModel?.providerID)?.models.find((m) => m.id === catalog.defaultModel?.modelID)?.name || catalog.defaultModel.modelID : null
+  const agentLabel = selectorLabel(agent ? (currentAgent?.label || agent) : null, catalog.defaultResolution.agent === "resolved" ? defaultAgentLabel : null, t("session.toolbar.serverDefault"))
+  const modelLabel = model?.modelID
+    ? providers.find((p) => p.id === model.providerID)?.models.find((m) => m.id === model.modelID)?.name || model.modelID
+    : catalog.defaultResolution.model === "resolved" && defaultModelLabel ? defaultModelLabel : t("session.toolbar.serverDefault")
 
   // Variants for current model (for reasoning effort picker)
   const currentModelVariants = useMemo(() => {
@@ -763,7 +818,7 @@ export default function SessionScreen() {
         />
 
         {/* SSE reconnect/connected banner */}
-        {reconnectAttempts > 0 && (
+        {reconnectVisible && (transportPhase === "connecting" || transportPhase === "reconnecting") && (
           <View style={[s.banner, s.bannerReconnecting]}>
             <Text style={s.bannerText}>{t("session.banners.reconnecting", { attempt: reconnectAttempts })}</Text>
           </View>
@@ -795,7 +850,7 @@ export default function SessionScreen() {
           </View>
         )}
 
-        {isLoading ? (
+        {isSessionLoading ? (
           <View style={s.loading}>
             <ActivityIndicator size="large" color={isDark ? "#ffffff" : "#0a0a0a"} />
           </View>
@@ -812,6 +867,7 @@ export default function SessionScreen() {
                   parts={item.parts}
                   isDark={isDark}
                   fontSize={Math.round(15 * (fontScale / 100))}
+                  isStreaming={item.message.id === streamingMessageID}
                   onLongPress={handleMessageLongPress}
                 />
               )}
@@ -819,6 +875,7 @@ export default function SessionScreen() {
               onScroll={handleScroll}
               scrollEventThrottle={100}
               onContentSizeChange={handleContentSizeChange}
+              onLayout={handleListLayout}
               onEndReached={handleLoadMore}
               onEndReachedThreshold={0.5}
               // Prevent jump when older messages are prepended
@@ -849,6 +906,30 @@ export default function SessionScreen() {
           </View>
         )}
 
+        {fallbackQuestions.length > 0 && (
+          <View style={[s.subagentFallback, isDark && s.subagentFallbackDark]} accessibilityRole="summary">
+            <Text style={[s.subagentFallbackTitle, isDark && s.textWhite]}>{t("session.subagentInputNeeded")}</Text>
+            {Array.from(new Map(fallbackQuestions.map((request) => [request.sessionID, request])).values()).map((request) => {
+              const child = findCachedSession(request.sessionID, sessions, childrenByParent, currentSession)
+              return (
+                <TouchableOpacity
+                  key={request.sessionID}
+                  style={s.subagentFallbackRow}
+                  onPress={() => child && router.push({ pathname: "/session/[id]", params: { id: child.id, ...(child.directory ? { directory: child.directory } : {}) } })}
+                  disabled={!child}
+                  accessibilityRole="button"
+                  accessibilityLabel={t("session.openSubagentInput", { title: child?.title || request.sessionID })}
+                >
+                  <Text style={[s.subagentFallbackText, isDark && s.textWhite]} numberOfLines={1}>
+                    {child?.title || t("session.titleFallback")} ({request.sessionID})
+                  </Text>
+                  <Text style={[s.subagentFallbackCount, { color: acc.cur.primary }]}>{t("chat.toolCallCard.inputNeeded", { count: (allQuestions[request.sessionID] || []).length })}</Text>
+                </TouchableOpacity>
+              )
+            })}
+          </View>
+        )}
+
         {/* Status */}
         {currentSession && <StatusIndicator sessionID={currentSession.id} isDark={isDark} />}
 
@@ -868,8 +949,8 @@ export default function SessionScreen() {
             key={q.id}
             request={q}
             isDark={isDark}
-            onReply={(answers) => handleQuestionReply(q.id, answers)}
-            onReject={() => handleQuestionReject(q.id)}
+            onReply={(answers) => handleQuestionReply(q.id, answers, q.sessionID)}
+            onReject={() => handleQuestionReject(q.id, q.sessionID)}
           />
         ))}
 
@@ -882,18 +963,28 @@ export default function SessionScreen() {
         <View style={[s.toolbar, isDark && s.toolbarDark]}>
           <TouchableOpacity
             style={[s.agentChip, { borderColor: agentColor }]}
-            onPress={() => cycleAgent()}
-            onLongPress={() => cycleAgent(-1)}
+            onPress={() => catalogReady && agentSheetRef.current?.expand()}
+            disabled={!catalogReady}
+            testID="agent-chip"
+            accessibilityRole="button"
+            accessibilityState={{ disabled: !catalogReady }}
+            accessibilityLabel={t("session.toolbar.agentAccessibilityLabel", { name: agentLabel })}
+            accessibilityHint={t("session.toolbar.agentAccessibilityHint")}
           >
             <View style={[s.agentDot, { backgroundColor: agentColor }]} />
-            <Text style={[s.agentLabel, isDark && s.textWhite]}>{currentAgent?.label || agent || t("session.toolbar.auto")}</Text>
-            <Ionicons name="swap-horizontal-outline" size={12} color={isDark ? "#888888" : "#666666"} />
+            <Text style={[s.agentLabel, isDark && s.textWhite]} numberOfLines={1}>{agentLabel}</Text>
+            <Ionicons name="chevron-up-outline" size={12} color={isDark ? "#888888" : "#666666"} />
           </TouchableOpacity>
 
           <TouchableOpacity
             style={[s.modelChip, isDark && s.modelChipDark]}
-            onPress={() => modelSheetRef.current?.expand()}
+            onPress={() => catalogReady && modelSheetRef.current?.expand()}
+            disabled={!catalogReady}
             testID="model-chip"
+            accessibilityRole="button"
+            accessibilityState={{ disabled: !catalogReady }}
+            accessibilityLabel={t("session.toolbar.modelAccessibilityLabel", { name: modelLabel })}
+            accessibilityHint={t("session.toolbar.modelAccessibilityHint")}
           >
             <Ionicons name="hardware-chip-outline" size={14} color={isDark ? "#888888" : "#666666"} />
             <Text style={[s.modelLabel, isDark && s.metaDark]} numberOfLines={1}>
@@ -909,17 +1000,25 @@ export default function SessionScreen() {
             >
               <Ionicons name="flash-outline" size={14} color={variant ? acc.cur.accent : isDark ? "#888888" : "#666666"} />
               <Text style={[s.variantLabel, isDark && s.metaDark, variant && s.variantLabelActive]} numberOfLines={1}>
-                {variant ? variant.charAt(0).toUpperCase() + variant.slice(1) : t("session.toolbar.auto")}
+              {variant ? variant.charAt(0).toUpperCase() + variant.slice(1) : t("session.toolbar.serverDefault")}
               </Text>
             </TouchableOpacity>
           )}
 
-          {usage.percent > 0 && (
-            <View style={[s.tokenChip, isDark && s.tokenChipDark]} testID="token-percent-chip">
-              <Ionicons name="diamond-outline" size={14} color={isDark ? "#888888" : "#666666"} />
-              <Text style={[s.tokenLabel, isDark && s.metaDark]}>{`${usage.percent}%`}</Text>
-            </View>
-          )}
+          <TouchableOpacity
+            style={[s.tokenChip, isDark && s.tokenChipDark]}
+            onPress={() => setShowInfo((v) => !v)}
+            testID="token-percent-chip"
+            accessibilityRole="button"
+            accessibilityLabel={t("session.toolbar.contextAccessibilityLabel", { percent: usage.percent ?? "?" })}
+            accessibilityHint={t("session.toolbar.contextAccessibilityHint")}
+            accessibilityState={{ expanded: showInfo }}
+          >
+            <Ionicons name="speedometer-outline" size={14} color={isDark ? "#888888" : "#666666"} />
+            <Text style={[s.tokenLabel, isDark && s.metaDark]} numberOfLines={1}>
+              {t("session.toolbar.contextLabel", { percent: usage.percent ?? "?" })}
+            </Text>
+          </TouchableOpacity>
         </View>
 
         {/* Attachment preview */}
@@ -996,10 +1095,27 @@ export default function SessionScreen() {
       {/* Model picker bottom sheet */}
       <ModelPicker
         sheetRef={modelSheetRef}
-        providers={providers}
+        providers={pickerProviders}
         selected={model}
+        defaultModel={catalogReady ? catalog.defaultModel : null}
+        hasPersistedOverride={!!currentSession?.model}
+        onSelectDefault={(selection) => {
+          setModel(selection)
+          setVariant(null)
+        }}
         isDark={isDark}
         onSelect={handleModelSelect}
+      />
+
+      <AgentPicker
+        sheetRef={agentSheetRef}
+        agents={pickerAgents}
+        selected={agent}
+        defaultAgent={catalogReady ? catalog.defaultAgent : null}
+        hasPersistedOverride={!!currentSession?.agent}
+        isDark={isDark}
+        onSelect={setAgent}
+        onSelectDefault={() => setAgent("")}
       />
 
       {/* Reasoning effort (variant) picker bottom sheet */}
@@ -1068,6 +1184,12 @@ function makeStyles(acc: AccentState) {
   emptyHint: { fontSize: 13, color: "#bbbbbb", marginTop: 4 },
   metaDark: { color: "#666666" },
   textWhite: { color: "#ffffff" },
+  subagentFallback: { marginHorizontal: 12, marginBottom: 8, padding: 10, borderRadius: 8, backgroundColor: "#f5f5f5" },
+  subagentFallbackDark: { backgroundColor: "#202020" },
+  subagentFallbackTitle: { fontSize: 13, fontWeight: "600", marginBottom: 4, color: "#444444" },
+  subagentFallbackRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", minHeight: 36 },
+  subagentFallbackText: { flex: 1, fontSize: 13, color: "#444444" },
+  subagentFallbackCount: { fontSize: 12, fontWeight: "600", marginLeft: 8 },
 
   // Toolbar
   toolbar: {
@@ -1129,9 +1251,10 @@ function makeStyles(acc: AccentState) {
     paddingHorizontal: 10,
     paddingVertical: 4,
     marginLeft: "auto",
+    flexShrink: 1,
   },
   tokenChipDark: { backgroundColor: "#1a1a1a" },
-  tokenLabel: { fontSize: 12, color: "#666666" },
+  tokenLabel: { fontSize: 12, color: "#666666", flexShrink: 1 },
 
   // Input
   inputContainer: {

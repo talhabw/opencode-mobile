@@ -82,7 +82,7 @@ export function SessionInfo({
           {hasTokens && (
             <Text style={[s.tokens, isDark && s.textDark]}>
               {stats.total.toLocaleString()}
-              {stats.percent > 0 && <Text style={[s.percent, isDark && s.dimDark]}>{`  ${stats.percent}%`}</Text>}
+              {stats.percent !== null && <Text style={[s.percent, isDark && s.dimDark]}>{`  ${stats.percent}%`}</Text>}
             </Text>
           )}
           {hasCost && <Text style={[s.cost, isDark && s.dimDark]}>({formatCost(stats.cost)})</Text>}
@@ -96,12 +96,12 @@ export function SessionInfo({
       </View>
 
       {/* Context bar */}
-      {stats.percent > 0 && (
+      {stats.percent !== null && (
         <View style={[s.bar, isDark && s.barDark]}>
           <View
             style={[
               s.barFill,
-              { width: `${Math.min(stats.percent, 100)}%` },
+              { width: `${Math.min(Math.max(stats.percent, 0), 100)}%` },
               stats.percent > 80 ? s.barWarn : stats.percent > 50 ? s.barMid : s.barOk,
             ]}
           />

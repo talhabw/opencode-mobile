@@ -13,8 +13,10 @@ import * as Sentry from "@sentry/react-native"
 import appJson from "../../app.json"
 import { log } from "./logbuffer"
 import type { DiagnosticReport } from "./diagnostics"
+import { hasTelemetryRuntimeConfig } from "./analytics-events"
+import { sanitizeSentryBreadcrumb, sanitizeSentryContext, sanitizeSentryEvent } from "./sentry-sanitize"
 
-const DSN = process.env.EXPO_PUBLIC_SENTRY_DSN
+const DSN = process.env.EXPO_PUBLIC_SENTRY_DSN?.trim()
 const APP_VERSION = (appJson as { expo?: { version?: string } }).expo?.version ?? "unknown"
 
 let enabled = false
@@ -22,7 +24,7 @@ let handlersInstalled = false
 
 export function initSentry() {
   if (enabled) return
-  if (!DSN) {
+  if (!hasTelemetryRuntimeConfig(DSN)) {
     log.info("sentry", "no DSN configured — telemetry disabled")
     installGlobalHandlers()
     return
@@ -47,16 +49,11 @@ export function initSentry() {
       maxBreadcrumbs: 100,
       // Final pre-send scrub: strip URLs everywhere they could appear.
       beforeSend(event) {
-        return scrubEvent(event)
+        return sanitizeSentryEvent(event as unknown as Record<string, unknown>) as unknown as typeof event
       },
       beforeBreadcrumb(crumb) {
         // Console output can contain malformed server payloads, prompts, or code.
-        if (crumb.category === "console") return null
-        if (crumb.data && typeof crumb.data === "object") {
-          crumb.data = redactObject(crumb.data as Record<string, unknown>)
-        }
-        if (typeof crumb.message === "string") crumb.message = redactString(crumb.message)
-        return crumb
+        return sanitizeSentryBreadcrumb(crumb) as Sentry.Breadcrumb | null
       },
     })
     enabled = true
@@ -71,6 +68,17 @@ export function initSentry() {
 export async function disableSentry() {
   if (!enabled) return
   enabled = false
+  const client = Sentry.getClient()
+  if (client) {
+    client.getOptions().enabled = false
+    const transport = client.getTransport()
+    if (transport) {
+      // ReactNativeClient.close() normally flushes queued envelopes. Consent
+      // revocation must discard them instead, while still closing the native SDK.
+      transport.send = () => Promise.resolve({})
+      transport.flush = () => Promise.resolve(true)
+    }
+  }
   await Sentry.close()
   log.info("sentry", "disabled by user")
 }
@@ -142,64 +150,6 @@ function toError(value: unknown): Error {
 
 export { scrubUrl } from "./scrub"
 
-function scrubEvent<T extends Sentry.Event>(event: T): T {
-  if (event.request?.url) event.request.url = "<redacted-url>"
-  if (event.message) event.message = redactString(event.message)
-  if (event.exception?.values) {
-    for (const ex of event.exception.values) {
-      if (ex.value) ex.value = redactString(ex.value)
-    }
-  }
-  if (event.breadcrumbs) {
-    event.breadcrumbs = event.breadcrumbs.filter((crumb) => crumb.category !== "console")
-    for (const crumb of event.breadcrumbs) {
-      if (typeof crumb.message === "string") crumb.message = redactString(crumb.message)
-      if (crumb.data && typeof crumb.data === "object") {
-        crumb.data = redactObject(crumb.data as Record<string, unknown>)
-      }
-    }
-  }
-  return event
-}
-
-function redactString(value: string): string {
-  return value.replace(/https?:\/\/[^\s)\]}"']+/gi, "<redacted-url>")
-}
-
-function redactObject(value: Record<string, unknown>): Record<string, unknown> {
-  const redacted: Record<string, unknown> = {}
-  for (const [key, item] of Object.entries(value)) {
-    if (
-      /^(?:id|.*Id|.*ID|url|host|hostname|port|address|server|serverUrl|target|endpoint|authorization|auth|token|password|secret|apiKey|username|cookie)$/i.test(
-        key,
-      )
-    ) {
-      redacted[key] = "<redacted>"
-      continue
-    }
-    if (typeof item === "string") {
-      redacted[key] = redactString(item)
-      continue
-    }
-    if (Array.isArray(item)) {
-      redacted[key] = item.map((entry) =>
-        typeof entry === "string"
-          ? redactString(entry)
-          : entry && typeof entry === "object"
-            ? redactObject(entry as Record<string, unknown>)
-            : entry,
-      )
-      continue
-    }
-    if (item && typeof item === "object") {
-      redacted[key] = redactObject(item as Record<string, unknown>)
-      continue
-    }
-    redacted[key] = item
-  }
-  return redacted
-}
-
 // --- Helpers exposed to the rest of the app ------------------------------
 
 export type Breadcrumb = {
@@ -211,13 +161,14 @@ export type Breadcrumb = {
 
 export function addBreadcrumb(crumb: Breadcrumb) {
   if (!enabled) return
-  Sentry.addBreadcrumb({
+  const sanitized = sanitizeSentryBreadcrumb({
     category: crumb.category,
     message: crumb.message,
     level: crumb.level ?? "info",
     data: crumb.data,
     timestamp: Date.now() / 1000,
   })
+  if (sanitized) Sentry.addBreadcrumb(sanitized as Sentry.Breadcrumb)
 }
 
 export function captureException(
@@ -229,8 +180,8 @@ export function captureException(
   if (!enabled) return
   Sentry.withScope((scope) => {
     if (context?.level) scope.setLevel(context.level)
-    if (context?.tags) for (const [k, v] of Object.entries(context.tags)) scope.setTag(k, v)
-    if (context?.extra) for (const [k, v] of Object.entries(context.extra)) scope.setExtra(k, v)
+    if (context?.tags) for (const [k, v] of Object.entries(sanitizeSentryContext(context.tags))) scope.setTag(k, String(v))
+    if (context?.extra) for (const [k, v] of Object.entries(sanitizeSentryContext(context.extra))) scope.setExtra(k, v)
     Sentry.captureException(error)
   })
 }
@@ -239,20 +190,23 @@ export function captureDiagnostic(report: DiagnosticReport) {
   log.info("sentry", "capture", report.classification, enabled ? "(uploading)" : "(local only)")
   if (!enabled) return
   Sentry.withScope((scope) => {
-    scope.setTag("connect.classification", report.classification)
-    scope.setTag("connect.scheme", report.scheme ?? "n/a")
-    scope.setContext("connection", {
-      targetType: report.isHostname ? "hostname" : "ip-address",
+    const tags = sanitizeSentryContext({
+      "connect.classification": report.classification,
+      "connect.scheme": report.scheme ?? "n/a",
     })
-    scope.setContext("probes", {
+    for (const [key, value] of Object.entries(tags)) scope.setTag(key, String(value))
+    scope.setContext("connection", sanitizeSentryContext({
+      targetType: report.isHostname ? "hostname" : "ip-address",
+    }))
+    scope.setContext("probes", sanitizeSentryContext({
       attempts: report.attempts.map((a) => ({
         name: a.name,
         ok: a.ok,
         status: a.status,
         durationMs: a.durationMs,
       })),
-    })
-    scope.setContext("device", report.device)
+    }))
+    scope.setContext("device", sanitizeSentryContext(report.device))
     Sentry.captureException(new Error(`connect ${report.classification}`))
   })
 }

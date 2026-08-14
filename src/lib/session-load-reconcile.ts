@@ -9,12 +9,12 @@
  * resync, which re-binds this screen to its session on every re-entry, not
  * just mount — since the native stack keeps screens mounted underneath a
  * pushed one). That re-fetch is a good idea (it recovers from missed SSE
- * events), but unconditionally flipping `isLoading` back to `true` for it
+ * events), but unconditionally flipping the detail loading flag back to `true` for it
  * hides the ENTIRE conversation — messages, composer, everything — behind a
  * spinner for as long as the redundant fetch takes. Meanwhile SSE keeps
  * delivering `message.updated`/`message.part.updated` events the whole
  * time — the store keeps them, but the screen can't show them while
- * `isLoading` is blocking the message list. If that redundant fetch is slow
+ * the detail loading flag is blocking the message list. If that redundant fetch is slow
  * or stalls (flaky mobile network), the conversation looks permanently stuck
  * "loading" until the user backs out to the sessions list and re-enters —
  * which works only because it's a fresh attempt that (usually) doesn't hit

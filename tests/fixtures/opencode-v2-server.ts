@@ -101,7 +101,7 @@ async function handle(request: Request): Promise<Response> {
     const filtered = parentID === null ? sessions : sessions.filter((item) => parentID === "" || parentID === "null" ? !item.parentID : item.parentID === parentID)
     return json({ data: filtered, cursor: {} })
   }
-  if (path === "/api/session" && request.method === "POST") { const input = await body(request); const created = session(`fixture-created-${sessions.length}`, (input.title as string) || "Fixture session"); sessions.unshift(created); messages.set(created.id, []); emit("session.created", { sessionID: created.id, projectID: project.id, location: { directory: root }, title: created.title, version: "2" }); return json({ data: created }) }
+  if (path === "/api/session" && request.method === "POST") { const input = await body(request); const created = session(`fixture-created-${sessions.length}`, (input.title as string) || "Fixture session"); sessions.unshift(created); messages.set(created.id, []); emit("session.created", { sessionID: created.id, projectID: project.id, location: created.location, parentID: created.parentID, slug: created.id, title: created.title, agent: created.agent, model: created.model, version: "2" }); return json({ data: created }) }
   if (path.startsWith("/api/message")) { const sid = url.searchParams.get("sessionID") || ""; return json({ data: messages.get(sid) || [], cursor: {} }) }
   if (path.startsWith("/api/session/")) return sessionRoute(request, path)
   return json({ error: "fixture route not found", path }, 404)
@@ -120,7 +120,33 @@ async function sessionRoute(request: Request, path: string): Promise<Response> {
   if (rest === "/agent") { current.agent = input.agent; emit("session.agent.selected", { sessionID: sid, agent: input.agent }); return empty() }
   if (rest === "/model") { current.model = input.model; emit("session.model.selected", { sessionID: sid, model: input.model }); return empty() }
   if (rest === "/interrupt") { emit("session.execution.interrupted", { sessionID: sid }); return empty() }
-  if (rest === "/prompt" || rest === "/command") { const prompt = (input.id as Json | undefined) ?? input; const text = rest === "/prompt" ? String(prompt.text || "") : `/${input.command} ${input.arguments || ""}`.trim(); const messageID = ++messageSequence; const userID = `fixture-user-${messageID}`; const assistantID = `fixture-assistant-${messageID}`; messages.get(sid)!.push(user(userID, sid, text), assistant(assistantID, `Fixture reply to: ${text}`)); emit("session.execution.started", { sessionID: sid }); emit("session.step.started", { sessionID: sid, assistantMessageID: assistantID, agent: "build", model: { providerID: "fixture", id: "fixture-model" } }); emit("session.text.started", { sessionID: sid, assistantMessageID: assistantID, ordinal: 0 }); emit("session.text.delta", { sessionID: sid, assistantMessageID: assistantID, ordinal: 0, delta: "Fixture reply" }); setTimeout(() => { emit("session.text.ended", { sessionID: sid, assistantMessageID: assistantID, ordinal: 0, text: `Fixture reply to: ${text}` }); emit("session.execution.succeeded", { sessionID: sid }) }, 25); return json({ data: user(userID, sid, text) }) }
+  if (rest === "/prompt" || rest === "/command") {
+    const prompt = (input.id as Json | undefined) ?? input
+    const text = rest === "/prompt" ? String(prompt.text || "") : `/${input.command} ${input.arguments || ""}`.trim()
+    const messageID = ++messageSequence
+    const userID = `fixture-user-${messageID}`
+    const assistantID = `fixture-assistant-${messageID}`
+    const streamingStressTest = text.toLowerCase() === "fixture:stream-stress"
+    const chunks = streamingStressTest
+      ? Array.from({ length: 1_200 }, (_, index) => `${index % 12 === 0 ? `\n\n### Stream block ${index / 12 + 1}\n\n` : ""}Responsive streaming fixture text ${index}. \`inline code\` remains readable.\n`)
+      : ["Fixture reply"]
+    const reply = streamingStressTest ? chunks.join("") : `Fixture reply to: ${text}`
+
+    messages.get(sid)!.push(user(userID, sid, text), assistant(assistantID, reply))
+    emit("session.execution.started", { sessionID: sid })
+    emit("session.step.started", { sessionID: sid, assistantMessageID: assistantID, agent: "build", model: { providerID: "fixture", id: "fixture-model" } })
+    emit("session.text.started", { sessionID: sid, assistantMessageID: assistantID, ordinal: 0 })
+
+    let index = 0
+    const interval = setInterval(() => {
+      emit("session.text.delta", { sessionID: sid, assistantMessageID: assistantID, ordinal: 0, delta: chunks[index++] })
+      if (index < chunks.length) return
+      clearInterval(interval)
+      emit("session.text.ended", { sessionID: sid, assistantMessageID: assistantID, ordinal: 0, text: reply })
+      emit("session.execution.succeeded", { sessionID: sid })
+    }, streamingStressTest ? 10 : 25)
+    return json({ data: user(userID, sid, text) })
+  }
   if (rest === "/revert/stage" || rest === "/revert/clear" || rest === "/revert/commit") return rest === "/revert/stage" ? json({ messageID: input.messageID }) : empty()
   if (rest.startsWith("/permission/") && rest.endsWith("/reply")) { const requestID = rest.split("/")[2]; permissions = permissions.filter((item) => item.id !== requestID); emit("permission.replied", { sessionID: sid, requestID, reply: input.reply }); return empty() }
   if (rest.startsWith("/question/") && (rest.endsWith("/reply") || rest.endsWith("/reject"))) { const requestID = rest.split("/")[2]; questions = questions.filter((item) => item.id !== requestID); emit(rest.endsWith("reply") ? "question.replied" : "question.rejected", { sessionID: sid, requestID, answers: input.answers }); return empty() }

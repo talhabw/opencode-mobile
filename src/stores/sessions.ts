@@ -19,6 +19,7 @@ import { mergeIncomingMessage } from "../lib/message-merge"
 import { isColdSessionLoad, isLiveEventForSession } from "../lib/session-load-reconcile"
 import { appendCursorPage, dedupePage, mergeCursorRefresh, mergeCursorRefreshSnapshot, mergePartsRefreshSnapshot, prependCursorPage, truncateCommittedRevert } from "../lib/cursor-pagination"
 import { attachmentUri } from "../lib/session-request"
+import { findCachedSession, purgeSessionHierarchy, upsertSessionHierarchy } from "../lib/session-hierarchy"
 
 // Fast-fail bound for the sessions list on app start/open. A dead or
 // unreachable saved server otherwise holds the sessions tab's spinner for the
@@ -45,10 +46,17 @@ function pageSize(): number {
 
 interface SessionsState {
   sessions: Session[]
+  childrenByParent: Record<string, Session[]>
+  childrenLoading: Record<string, boolean>
+  childrenLoaded: Record<string, boolean>
+  childrenHasMore: Record<string, boolean>
+  childrenCursor: Record<string, CursorPage<Session>["cursor"]>
+  childrenGeneration: Record<string, number>
   currentSession: Session | null
   messages: Message[]
   parts: Record<string, Part[]>
-  isLoading: boolean
+  isSessionsLoading: boolean
+  isSessionLoading: boolean
   // Per-session optimistic sending flag — bridging gap between user tap and SSE busy
   sending: Record<string, boolean>
   loadingMore: boolean
@@ -62,6 +70,8 @@ interface SessionsState {
   // Actions
   loadSessions: () => Promise<void>
   loadMoreSessions: () => Promise<void>
+  loadChildren: (parentID: string) => Promise<void>
+  loadMoreChildren: (parentID: string) => Promise<void>
   selectSession: (sessionID: string, directory?: string) => Promise<void>
   loadOlderMessages: () => Promise<void>
   createSession: (title?: string) => Promise<Session | null>
@@ -100,6 +110,47 @@ export const abortedSessions = new Set<string>()
 // the next value and only commits its result if still the latest.
 let selectSeq = 0
 let canonicalPageSeq = 0
+let rootListSeq = 0
+let hierarchyScope = ""
+let hierarchyConnection: ReturnType<typeof useConnections.getState>["clientBase"] = null
+
+function connectionScope(): string {
+  const state = useConnections.getState()
+  return `${state.activeConnection?.id ?? ""}\u0000${state.activeConnection?.directory ?? ""}\u0000${state.clientBase?.baseUrl ?? ""}`
+}
+
+function upsertHierarchy(state: SessionsState, session: Session): Partial<SessionsState> {
+  const result = upsertSessionHierarchy(state.sessions, state.childrenByParent, session)
+  return { sessions: result.roots, childrenByParent: result.childrenByParent }
+}
+
+function purgeHierarchy(state: SessionsState, sessionID: string): Partial<SessionsState> {
+  const removedSessions = [
+    ...state.sessions,
+    ...Object.values(state.childrenByParent).flat(),
+  ]
+  const hierarchy = purgeSessionHierarchy(state.sessions, state.childrenByParent, sessionID)
+  const ids = hierarchy.removed
+  const invalidatedParents = new Set(
+    removedSessions
+      .filter((session) => ids.has(session.id) && session.parentID && !ids.has(session.parentID))
+      .map((session) => session.parentID!),
+  )
+  const generations = { ...state.childrenGeneration }
+  for (const id of [...ids, ...invalidatedParents]) generations[id] = (generations[id] ?? 0) + 1
+  return {
+    sessions: hierarchy.roots,
+    childrenByParent: hierarchy.childrenByParent,
+    childrenLoading: Object.fromEntries(Object.entries(state.childrenLoading).filter(([id]) => !ids.has(id) && !invalidatedParents.has(id))),
+    childrenLoaded: Object.fromEntries(Object.entries(state.childrenLoaded).filter(([id]) => !ids.has(id))),
+    childrenHasMore: Object.fromEntries(Object.entries(state.childrenHasMore).filter(([id]) => !ids.has(id))),
+    childrenCursor: Object.fromEntries(Object.entries(state.childrenCursor).filter(([id]) => !ids.has(id))),
+    childrenGeneration: generations,
+    currentSession: state.currentSession && ids.has(state.currentSession.id) ? null : state.currentSession,
+    messages: state.currentSession && ids.has(state.currentSession.id) ? [] : state.messages,
+    parts: state.currentSession && ids.has(state.currentSession.id) ? {} : state.parts,
+  }
+}
 
 // Get the right client for a session's directory
 function clientFor(directory?: string): Client | null {
@@ -112,10 +163,17 @@ function clientFor(directory?: string): Client | null {
 
 export const useSessions = create<SessionsState>((set, get) => ({
   sessions: [],
+  childrenByParent: {},
+  childrenLoading: {},
+  childrenLoaded: {},
+  childrenHasMore: {},
+  childrenCursor: {},
+  childrenGeneration: {},
   currentSession: null,
   messages: [],
   parts: {},
-  isLoading: false,
+  isSessionsLoading: false,
+  isSessionLoading: false,
   sending: {},
   loadingMore: false,
   hasMore: false,
@@ -134,17 +192,33 @@ export const useSessions = create<SessionsState>((set, get) => ({
       return
     }
 
+    const seq = ++rootListSeq
+    const scope = connectionScope()
+    const connection = useConnections.getState().clientBase
+    if (hierarchyScope && (hierarchyScope !== scope || hierarchyConnection !== connection)) {
+      set((state) => ({
+        childrenByParent: {},
+        childrenLoading: {},
+        childrenLoaded: {},
+        childrenHasMore: {},
+        childrenCursor: {},
+        childrenGeneration: Object.fromEntries(Object.entries(state.childrenGeneration).map(([id, generation]) => [id, generation + 1])),
+      }))
+    }
+    hierarchyScope = scope
+    hierarchyConnection = connection
     try {
-      set({ isLoading: true, error: null })
-      const page = await client.session.page({ limit: 50, order: "desc" }, SESSION_LIST_TIMEOUT_MS)
+      set({ isSessionsLoading: true, error: null })
+      const page = await client.session.page({ limit: 50, order: "desc", parentID: null }, SESSION_LIST_TIMEOUT_MS)
+      if (seq !== rootListSeq || scope !== connectionScope() || connection !== useConnections.getState().clientBase) return
       set({
-        sessions: dedupePage(page),
+        sessions: dedupePage(page).filter((session) => !session.parentID),
         sessionCursor: page.cursor,
         hasMoreSessions: Boolean(page.cursor.next),
-        isLoading: false,
+        isSessionsLoading: false,
       })
     } catch (error) {
-      set({ error: "Failed to load sessions", isLoading: false })
+      if (seq === rootListSeq && scope === connectionScope() && connection === useConnections.getState().clientBase) set({ error: "Failed to load sessions", isSessionsLoading: false })
     }
   },
 
@@ -154,17 +228,83 @@ export const useSessions = create<SessionsState>((set, get) => ({
     const cursor = get().sessionCursor.next
     if (!client || !cursor || get().loadingMoreSessions) return
 
+    const seq = rootListSeq
+    const scope = connectionScope()
+    const connection = useConnections.getState().clientBase
     try {
       set({ loadingMoreSessions: true })
-      const page = await client.session.page({ limit: 50, cursor }, SESSION_LIST_TIMEOUT_MS)
+      const page = await client.session.page({ limit: 50, cursor, parentID: null }, SESSION_LIST_TIMEOUT_MS)
+      if (seq !== rootListSeq || scope !== connectionScope() || connection !== useConnections.getState().clientBase) return
       set((state) => ({
-        sessions: appendCursorPage(state.sessions, page),
+        sessions: appendCursorPage(state.sessions, { ...page, data: page.data.filter((session) => !session.parentID) }),
         sessionCursor: page.cursor,
         hasMoreSessions: Boolean(page.cursor.next),
         loadingMoreSessions: false,
       }))
     } catch {
-      set({ loadingMoreSessions: false })
+      if (seq === rootListSeq && scope === connectionScope() && connection === useConnections.getState().clientBase) set({ loadingMoreSessions: false })
+    }
+  },
+
+  loadChildren: async (parentID) => {
+    const state = get()
+    if (state.childrenLoading[parentID] || state.childrenLoaded[parentID]) return
+    const parent = findCachedSession(parentID, state.sessions, state.childrenByParent, state.currentSession)
+    if (!parent) return
+    const client = clientFor(parent.directory)
+    if (!client) return
+    const generation = (state.childrenGeneration[parentID] ?? 0) + 1
+    const scope = connectionScope()
+    const connection = useConnections.getState().clientBase
+    set((current) => ({
+      childrenLoading: { ...current.childrenLoading, [parentID]: true },
+      childrenGeneration: { ...current.childrenGeneration, [parentID]: generation },
+    }))
+    try {
+      const page = await client.session.page({ limit: 50, order: "desc", parentID }, SESSION_LIST_TIMEOUT_MS)
+      if (get().childrenGeneration[parentID] !== generation || connectionScope() !== scope || connection !== useConnections.getState().clientBase) return
+      set((current) => ({
+        childrenByParent: { ...current.childrenByParent, [parentID]: dedupePage(page).filter((session) => session.parentID === parentID) },
+        childrenLoading: { ...current.childrenLoading, [parentID]: false },
+        childrenLoaded: { ...current.childrenLoaded, [parentID]: true },
+        childrenHasMore: { ...current.childrenHasMore, [parentID]: Boolean(page.cursor.next) },
+        childrenCursor: { ...current.childrenCursor, [parentID]: page.cursor },
+      }))
+    } catch {
+      if (get().childrenGeneration[parentID] === generation && connectionScope() === scope && connection === useConnections.getState().clientBase) {
+        set((current) => ({ childrenLoading: { ...current.childrenLoading, [parentID]: false } }))
+      }
+    }
+  },
+
+  loadMoreChildren: async (parentID) => {
+    const state = get()
+    const cursor = state.childrenCursor[parentID]?.next
+    if (!cursor || state.childrenLoading[parentID]) return
+    const parent = findCachedSession(parentID, state.sessions, state.childrenByParent, state.currentSession)
+    if (!parent) return
+    const client = clientFor(parent.directory)
+    if (!client) return
+    const generation = state.childrenGeneration[parentID] ?? 0
+    const scope = connectionScope()
+    const connection = useConnections.getState().clientBase
+    set((current) => ({ childrenLoading: { ...current.childrenLoading, [parentID]: true } }))
+    try {
+      const page = await client.session.page({ limit: 50, cursor, parentID }, SESSION_LIST_TIMEOUT_MS)
+      if (get().childrenGeneration[parentID] !== generation || connectionScope() !== scope || connection !== useConnections.getState().clientBase) return
+      set((current) => ({
+        childrenByParent: {
+          ...current.childrenByParent,
+          [parentID]: appendCursorPage(current.childrenByParent[parentID] ?? [], { ...page, data: page.data.filter((session) => session.parentID === parentID) }),
+        },
+        childrenLoading: { ...current.childrenLoading, [parentID]: false },
+        childrenHasMore: { ...current.childrenHasMore, [parentID]: Boolean(page.cursor.next) },
+        childrenCursor: { ...current.childrenCursor, [parentID]: page.cursor },
+      }))
+    } catch {
+      if (get().childrenGeneration[parentID] === generation && connectionScope() === scope && connection === useConnections.getState().clientBase) {
+        set((current) => ({ childrenLoading: { ...current.childrenLoading, [parentID]: false } }))
+      }
     }
   },
 
@@ -193,7 +333,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
     try {
       // Reset optimistic sending — SSE sessionStatus is the source of truth
       set((state) => ({
-        isLoading: isColdLoad ? true : state.isLoading,
+        isSessionLoading: isColdLoad ? true : state.isSessionLoading,
         error: null,
         hasMore: false,
         messageCursor: {},
@@ -228,7 +368,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
 
       set((state) => {
         if (!pageIsCurrent && state.currentSession?.id === sessionID) {
-          return { currentSession: session, isLoading: false }
+          return { currentSession: session, isSessionLoading: false }
         }
         if (!isColdLoad && state.currentSession?.id === sessionID) {
           const merged = mergeCursorRefreshSnapshot(
@@ -240,7 +380,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
             currentSession: session,
             messages: merged,
             parts: mergePartsRefreshSnapshot(merged, state.parts, partsSnapshot, parts),
-            isLoading: false,
+            isSessionLoading: false,
             hasMore: Boolean(messagePage.cursor.next),
             messageCursor: messagePage.cursor,
           }
@@ -249,7 +389,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
           currentSession: session,
           messages: firstPage,
           parts: pageIsCurrent ? parts : state.parts,
-          isLoading: false,
+          isSessionLoading: false,
           hasMore: Boolean(messagePage.cursor.next),
           messageCursor: messagePage.cursor,
         }
@@ -257,7 +397,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
     } catch (err) {
       if (seq !== selectSeq) return
       console.error("Failed to load session:", err)
-      set({ error: "Failed to load session", isLoading: false })
+      set({ error: "Failed to load session", isSessionLoading: false })
     }
   },
 
@@ -326,7 +466,8 @@ export const useSessions = create<SessionsState>((set, get) => ({
   },
 
   deleteSession: async (sessionID) => {
-    const session = get().sessions.find((s) => s.id === sessionID)
+    const state = get()
+    const session = findCachedSession(sessionID, state.sessions, state.childrenByParent, state.currentSession)
     const client = clientFor(session?.directory)
     if (!client) {
       set({ error: "No active connection" })
@@ -335,12 +476,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
 
     try {
       await client.session.delete(sessionID)
-      set((state) => ({
-        sessions: state.sessions.filter((s) => s.id !== sessionID),
-        currentSession: state.currentSession?.id === sessionID ? null : state.currentSession,
-        messages: state.currentSession?.id === sessionID ? [] : state.messages,
-        parts: state.currentSession?.id === sessionID ? {} : state.parts,
-      }))
+      set((current) => purgeHierarchy(current, sessionID))
     } catch (error) {
       set({ error: "Failed to delete session" })
       throw error
@@ -365,6 +501,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
         id: `temp-${ts}`,
         sessionID: session.id,
         role: "user",
+        presentation: "user",
         time: { created: ts },
         model,
         agent,
@@ -556,18 +693,59 @@ export const useSessions = create<SessionsState>((set, get) => ({
             ...(typeof rawModel.variant === "string" ? { variant: rawModel.variant } : {}),
           }
         : undefined
+      set((state) => {
+        const cached = findCachedSession(sessionID, state.sessions, state.childrenByParent, state.currentSession)
+        const updated = cached && { ...cached, ...(agent !== undefined ? { agent } : {}), ...(model !== undefined ? { model } : {}) }
+        return {
+          ...(updated ? upsertHierarchy(state, updated) : {}),
+          currentSession: state.currentSession?.id !== sessionID ? state.currentSession : {
+            ...state.currentSession,
+            ...(agent !== undefined ? { agent } : {}),
+            ...(model !== undefined ? { model } : {}),
+          },
+        }
+      })
+      return
+    }
+
+    if (event.type === "session.created" || event.type === "session.updated") {
+      const session = (props.info || props) as Session | undefined
+      if (!session?.id) return
       set((state) => ({
-        sessions: state.sessions.map((session) => session.id !== sessionID ? session : {
-          ...session,
-          ...(agent !== undefined ? { agent } : {}),
-          ...(model !== undefined ? { model } : {}),
-        }),
-        currentSession: state.currentSession?.id !== sessionID ? state.currentSession : {
-          ...state.currentSession,
-          ...(agent !== undefined ? { agent } : {}),
-          ...(model !== undefined ? { model } : {}),
-        },
+        ...upsertHierarchy(state, session),
+        currentSession: state.currentSession?.id === session.id ? session : state.currentSession,
+        isSessionLoading: isLiveEventForSession(session.id, state.currentSession?.id) ? false : state.isSessionLoading,
       }))
+      return
+    }
+
+    if (event.type === "session.deleted") {
+      const sessionID = typeof props.sessionID === "string" ? props.sessionID : undefined
+      if (!sessionID) return
+      set((state) => purgeHierarchy(state, sessionID))
+      return
+    }
+
+    if (event.type === "session.renamed" || event.type === "session.moved") {
+      const sessionID = typeof props.sessionID === "string" ? props.sessionID : undefined
+      if (!sessionID) return
+      set((state) => {
+        const cached = findCachedSession(sessionID, state.sessions, state.childrenByParent, state.currentSession)
+        if (!cached) return state
+        const location = props.location && typeof props.location === "object" ? props.location as Record<string, unknown> : undefined
+        const updated: Session = {
+          ...cached,
+          ...(event.type === "session.renamed" && typeof props.title === "string" ? { title: props.title } : {}),
+          ...(event.type === "session.moved" && typeof location?.directory === "string"
+            ? { directory: location.directory, location: { ...cached.location, directory: location.directory } }
+            : {}),
+          ...(event.type === "session.moved" && typeof props.projectID === "string" ? { projectID: props.projectID } : {}),
+        }
+        return {
+          ...upsertHierarchy(state, updated),
+          currentSession: state.currentSession?.id === sessionID ? updated : state.currentSession,
+        }
+      })
       return
     }
 
@@ -585,7 +763,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
           // to show — clear any stuck spinner even if the initial (or a
           // redundant re-focus) GET hasn't resolved yet, or never does
           // (issue #150). Only ever clears, never sets it back to true.
-          isLoading: false,
+          isSessionLoading: false,
         }))
         break
       }
@@ -603,12 +781,20 @@ export const useSessions = create<SessionsState>((set, get) => ({
             parts: {
               ...state.parts,
               [part.messageID]: exists
-                ? messageParts.map((p) => (p.id === part.id ? part : p))
+                ? messageParts.map((p) => p.id !== part.id ? p : {
+                    ...p,
+                    ...part,
+                    state: part.state ? {
+                      ...p.state,
+                      ...part.state,
+                      metadata: { ...(p.state?.metadata ?? {}), ...(part.state.metadata ?? {}) },
+                    } : p.state,
+                  })
                 : [...messageParts, part],
             },
             // See message.updated above — a live part update is just as
             // much proof of life as a message update.
-            isLoading: false,
+            isSessionLoading: false,
           }
         })
         break
@@ -624,17 +810,6 @@ export const useSessions = create<SessionsState>((set, get) => ({
         break
       }
 
-      case "session.updated": {
-        const session = (props.info || props) as Session | undefined
-        if (!session?.id) return
-
-        set((state) => ({
-          sessions: state.sessions.map((s) => (s.id === session.id ? session : s)),
-          currentSession: state.currentSession?.id === session.id ? session : state.currentSession,
-          isLoading: isLiveEventForSession(session.id, state.currentSession?.id) ? false : state.isLoading,
-        }))
-        break
-      }
     }
   },
 }))
