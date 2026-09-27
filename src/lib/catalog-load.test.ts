@@ -4,6 +4,7 @@ import { create } from "zustand"
 import {
   beginCatalogLoad,
   failCatalogLoad,
+  isSelectableModel,
   matchesCatalogScope,
   UNRESOLVED_DEFAULTS,
   type CatalogScope,
@@ -17,6 +18,16 @@ test("matches only the active connection and normalized directory", () => {
   assert.equal(matchesCatalogScope(scope, "c1", "/workspace/project/"), true)
   assert.equal(matchesCatalogScope(scope, "c2", "/workspace/project"), false)
   assert.equal(matchesCatalogScope(scope, "c1", "/workspace/other"), false)
+})
+
+test("isSelectableModel hides explicitly disabled and deprecated models only", () => {
+  assert.equal(isSelectableModel({}), true)
+  assert.equal(isSelectableModel({ enabled: true, status: "active" }), true)
+  assert.equal(isSelectableModel({ enabled: true, status: "alpha" }), true)
+  assert.equal(isSelectableModel({ enabled: false }), false)
+  assert.equal(isSelectableModel({ enabled: false, status: "active" }), false)
+  assert.equal(isSelectableModel({ status: "deprecated" }), false)
+  assert.equal(isSelectableModel({ status: "deprecated", enabled: true }), false)
 })
 
 interface ModelSelection {

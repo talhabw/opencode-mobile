@@ -20,12 +20,6 @@ export class ApiAuthError extends Error {
   }
 }
 
-/** True for HTTP statuses that mean "your credentials are wrong", as opposed
- *  to transient/network/server failures that should keep retrying. */
-export function isAuthStatus(status: number): boolean {
-  return status === 401 || status === 403
-}
-
 export function apiStatusFor(error: unknown): number | undefined {
   if (!error || typeof error !== "object") return undefined
   const tagged = error as { _tag?: unknown; status?: unknown; cause?: unknown }
@@ -37,11 +31,6 @@ export function apiStatusFor(error: unknown): number | undefined {
     if (typeof status === "number") return status
   }
   return undefined
-}
-
-/** Build the right error type for a failed HTTP response. */
-export function apiErrorFor(status: number, message: string): Error {
-  return isAuthStatus(status) ? new ApiAuthError(status, message) : new Error(message)
 }
 
 /** Type guard for call sites (e.g. the SSE reconnect loop) that need to branch

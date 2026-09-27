@@ -4,6 +4,7 @@ import type { Agent, Command } from "../lib/sdk"
 import {
   beginCatalogLoad,
   failCatalogLoad,
+  isSelectableModel,
   UNRESOLVED_DEFAULTS,
   type CatalogScope,
   type DefaultResolution,
@@ -111,7 +112,7 @@ export const useCatalog = create<CatalogState>((set, get) => ({
             name: p.name || p.id,
             connected: connected.has(p.id),
             models: Object.values(p.models || {})
-              .filter((m) => m.status !== "deprecated")
+              .filter((m) => isSelectableModel(m))
               .map((m) => ({
                 id: m.id,
                 name: m.name || m.id,

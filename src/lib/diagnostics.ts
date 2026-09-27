@@ -6,6 +6,7 @@ import * as Clipboard from "expo-clipboard"
 import * as Device from "expo-device"
 import appJson from "../../app.json"
 import { log, formatLogLines } from "./logbuffer"
+import { buildRequestHeaders } from "./headers"
 import { type Classification, type ProbeAttempt, parseUrl, classify } from "./diagnostics-classify"
 
 export type { Classification, ProbeAttempt } from "./diagnostics-classify"
@@ -33,7 +34,7 @@ export interface DiagnosticReport {
 }
 
 // requireOk: whether a non-2xx HTTP response counts as a probe failure.
-// The health probe must actually succeed (2xx) to mean "the server works" —
+// The identity probe must actually succeed (2xx) to mean "the server works" —
 // otherwise a 401/403/404/500 response was being reported as ok:true, which
 // made classify() short-circuit to "connection actually works now" even when
 // auth failed or the server errored. The root probe only checks reachability
@@ -66,28 +67,30 @@ export async function probeConnection(url: string, auth?: { username: string; pa
   const parsed = parseUrl(url)
   log.info("diag", "probe start", url, "parsed", JSON.stringify(parsed))
 
-  const headers: Record<string, string> = {}
-  if (auth) headers["Authorization"] = `Basic ${btoa(`${auth.username}:${auth.password}`)}`
+  const headers = buildRequestHeaders({ auth })
 
-  let health: ProbeAttempt
+  let info: ProbeAttempt
   let root: ProbeAttempt
   let internet: ProbeAttempt
 
   if (parsed.valid) {
     const base = `${parsed.scheme}://${parsed.host}:${parsed.port}`
-    ;[health, root, internet] = await Promise.all([
-      timedFetch("health", `${base}/api/health`, { headers }),
+    ;[info, root, internet] = await Promise.all([
+      // Released v2 servers identify themselves at GET /api/info; /api/health
+      // was removed and answers 404, which made every working server look like
+      // a failed one and hid the real auth/version problem.
+      timedFetch("info", `${base}/api/info`, { headers }),
       timedFetch("server-root", `${base}/`, { headers }, { requireOk: false }),
       timedFetch("internet", INTERNET_CHECK_URL),
     ])
   } else {
-    const skipped: ProbeAttempt = { name: "health", target: url, ok: false, durationMs: 0, error: "skipped: malformed url" }
-    health = skipped
+    const skipped: ProbeAttempt = { name: "info", target: url, ok: false, durationMs: 0, error: "skipped: malformed url" }
+    info = skipped
     root = { ...skipped, name: "server-root" }
     internet = await timedFetch("internet", INTERNET_CHECK_URL)
   }
 
-  const { classification, summary } = classify(parsed, health, internet, root)
+  const { classification, summary } = classify(parsed, info, internet, root)
 
   const report: DiagnosticReport = {
     classification,
@@ -97,7 +100,7 @@ export async function probeConnection(url: string, auth?: { username: string; pa
     host: parsed.host,
     port: parsed.port,
     isHostname: parsed.isHostname,
-    attempts: [health, root, internet],
+    attempts: [info, root, internet],
     device: {
       platform: Platform.OS,
       osVersion: String(Platform.Version),

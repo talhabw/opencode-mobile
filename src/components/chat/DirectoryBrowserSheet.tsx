@@ -5,12 +5,12 @@ import BottomSheet, { BottomSheetBackdrop, BottomSheetFlatList, BottomSheetTextI
 import { useTranslation } from "react-i18next"
 import type { Client, FileEntry } from "../../lib/sdk"
 import { parentOf, nameOf } from "../../lib/path-utils"
-import { normalizeRoots, type FileRoot } from "../../lib/file-roots"
-import { useAccent, type AccentState } from "../../lib/accents"
+import { useAccent } from "../../lib/accents"
 
 interface Props {
   sheetRef: React.RefObject<BottomSheet | null>
-  // Directory to start browsing from whenever the sheet opens (project root, server home, etc).
+  // Directory to start browsing from whenever the sheet opens (e.g. the
+  // project root or the active connection's directory).
   startDirectory: string | null
   // Builds a client rooted at an arbitrary absolute directory (see connections store).
   clientForDirectory: (directory: string) => Client | null
@@ -31,17 +31,12 @@ export function DirectoryBrowserSheet({
 }: Props) {
   const { t } = useTranslation()
   const acc = useAccent()
-  const s = makeStyles(acc)
+  const s = makeStyles()
   const [browseDir, setBrowseDir] = useState<string | null>(null)
   const [entries, setEntries] = useState<FileEntry[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [jumpPath, setJumpPath] = useState("")
-  // Pinned top-level entries (drives, home dir) fetched from GET /file/roots.
-  // Stays empty on older servers that don't expose the endpoint, or while a
-  // fetch is in flight — the manual "Jump to path" input keeps working
-  // either way.
-  const [roots, setRoots] = useState<FileRoot[]>([])
   const loadToken = useRef(0)
 
   const load = useCallback(
@@ -82,24 +77,6 @@ export function DirectoryBrowserSheet({
     [load],
   )
 
-  // Fetch pinned filesystem roots for the current server. Silently falls
-  // back to no pinned roots (manual path entry still works) on older
-  // servers or any request failure.
-  const loadRoots = useCallback(
-    (dir: string) => {
-      const client = clientForDirectory(dir)
-      if (!client) {
-        setRoots([])
-        return
-      }
-      client.file
-        .roots()
-        .then((result) => setRoots(normalizeRoots(result)))
-        .catch(() => setRoots([]))
-    },
-    [clientForDirectory],
-  )
-
   // The caller (app/(tabs)/index.tsx openBrowser) sets the start directory
   // via setState and calls sheetRef.current?.expand() in the very same
   // synchronous handler. expand() kicks off a reanimated-driven animation
@@ -132,19 +109,17 @@ export function DirectoryBrowserSheet({
       const dir = startDirectoryRef.current
       if (dir) {
         enter(dir)
-        loadRoots(dir)
       } else {
-        // No starting directory known (e.g. server home not loaded yet):
-        // show an explicit empty state instead of a previous open's entries.
+        // No starting directory known yet: show an explicit empty state
+        // instead of a previous open's entries.
         loadToken.current++
         setBrowseDir(null)
         setEntries([])
         setError(null)
         setLoading(false)
-        setRoots([])
       }
     },
-    [enter, loadRoots, onDismiss],
+    [enter, onDismiss],
   )
 
   const goUp = useCallback(() => {
@@ -208,35 +183,6 @@ export function DirectoryBrowserSheet({
           </Text>
         </View>
       </View>
-
-      {roots.length > 0 && (
-        <View style={s.rootsRow}>
-          {roots.map((root) => (
-            <TouchableOpacity
-              key={root.path}
-              style={[s.rootChip, isDark && s.rootChipDark, browseDir === root.path && s.rootChipActive]}
-              onPress={() => enter(root.path)}
-              testID={`directory-root-${root.label}`}
-            >
-              <Ionicons
-                name={root.label === "Home" ? "home-outline" : "layers-outline"}
-                size={14}
-                color={browseDir === root.path ? "#ffffff" : acc.cur.softer}
-              />
-              <Text
-                style={[
-                  s.rootChipText,
-                  isDark && s.rootChipTextDark,
-                  browseDir === root.path && s.rootChipTextActive,
-                ]}
-                numberOfLines={1}
-              >
-                {root.label}
-              </Text>
-            </TouchableOpacity>
-          ))}
-        </View>
-      )}
 
       <View style={s.inputWrap}>
         <BottomSheetTextInput
@@ -320,7 +266,7 @@ export function DirectoryBrowserSheet({
   )
 }
 
-function makeStyles(acc: AccentState) {
+function makeStyles() {
   return StyleSheet.create({
     sheet: { backgroundColor: "#ffffff" },
     sheetDark: { backgroundColor: "#1a1a1a" },
@@ -338,31 +284,6 @@ function makeStyles(acc: AccentState) {
       color: "#666666",
     },
     dimDark: { color: "#888888" },
-    rootsRow: {
-      flexDirection: "row",
-      flexWrap: "wrap",
-      gap: 8,
-      paddingHorizontal: 16,
-      paddingBottom: 10,
-    },
-    rootChip: {
-      flexDirection: "row",
-      alignItems: "center",
-      gap: 5,
-      paddingHorizontal: 10,
-      paddingVertical: 6,
-      borderRadius: 14,
-      backgroundColor: acc.light.tintSurface,
-    },
-    rootChipDark: { backgroundColor: acc.dark.tintBg },
-    rootChipActive: { backgroundColor: acc.cur.accent },
-    rootChipText: {
-      fontSize: 12,
-      fontWeight: "600",
-      color: acc.light.primary,
-    },
-    rootChipTextDark: { color: acc.dark.softer },
-    rootChipTextActive: { color: "#ffffff" },
     inputWrap: {
       flexDirection: "row",
       alignItems: "center",

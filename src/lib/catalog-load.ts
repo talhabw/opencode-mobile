@@ -11,6 +11,21 @@ export interface ProviderModel {
   variants?: Record<string, { reasoningEffort?: string }>
 }
 
+export interface SelectableModel {
+  status?: string
+  enabled?: boolean
+}
+
+/**
+ * The pickers only offer models that can actually run. An explicitly disabled
+ * model (`enabled: false`) is never selectable, and deprecated catalog entries
+ * are hidden. Servers/fixtures that omit the flag stay selectable — only an
+ * explicit false hides a model.
+ */
+export function isSelectableModel(model: SelectableModel): boolean {
+  return model.enabled !== false && model.status !== "deprecated"
+}
+
 export interface Provider {
   id: string
   name: string

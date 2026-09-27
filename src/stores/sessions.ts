@@ -21,6 +21,7 @@ import { appendCursorPage, dedupePage, mergeCursorRefresh, mergeCursorRefreshSna
 import { attachmentUri } from "../lib/session-request"
 import { sessionInListScope } from "../lib/session-list-scope"
 import { childCountsFromSessions, decrementChildCount, findCachedSession, incrementChildCount, purgeSessionHierarchy, upsertSessionHierarchy } from "../lib/session-hierarchy"
+import { RevertResponseGuard, revertPatchFromEvent, sessionInfoPatchFromEvent } from "./session-events"
 
 // Fast-fail bound for the sessions list on app start/open. A dead or
 // unreachable saved server otherwise holds the sessions tab's spinner for the
@@ -98,7 +99,13 @@ interface SessionsState {
 
   // Revert (edit sent message) / unrevert (undo the pending revert)
   revertToMessage: (messageID: string) => Promise<RevertResult>
-  unrevertSession: () => Promise<void>
+  // Resolves true when the server restore succeeded; false when it failed, so
+  // callers only clear the prefilled undo draft on a real success.
+  unrevertSession: () => Promise<boolean>
+  // Commit a staged revert before sending. No-op when there is nothing
+  // staged; rejects when the server commit fails so callers can abort the
+  // send instead of running with a revert still pending server-side.
+  commitPendingRevert: () => Promise<void>
 
   // Event handling
   handleEvent: (event: Event) => void
@@ -113,6 +120,10 @@ export type RevertResult = ({ ok: true } & PromptFromParts) | { ok: false; reaso
 // success toward the store review prompt. events.ts (which already imports
 // this module) clears entries on busy and checks them on busy -> idle.
 export const abortedSessions = new Set<string>()
+
+// Orders revert stage/clear/commit responses against later requests and
+// against SSE revert events for the same session — see RevertResponseGuard.
+const revertGuard = new RevertResponseGuard()
 
 // Monotonic token guarding selectSession against out-of-order resolution: a
 // slow fetch for a session the user has already navigated away from must not
@@ -380,14 +391,26 @@ export const useSessions = create<SessionsState>((set, get) => ({
     // genuinely new/different session needs the blocking spinner.
     const isColdLoad = isColdSessionLoad(get().currentSession?.id, sessionID)
     try {
-      // Reset optimistic sending — SSE sessionStatus is the source of truth
+      // A cold load binds the store to the target session immediately. While
+      // the target's fetch is in flight, leaving `currentSession` pointing at
+      // the session the user just left let every consumer that acts on
+      // "the current session" — a send racing the navigation, permission
+      // replies — target the wrong session. Nothing can be shown for the
+      // target yet, so its previous transcript is cleared with it; the
+      // canonical page replaces it below on success.
+      //
+      // The optimistic `sending` flag is deliberately NOT reset here. SSE
+      // owns it (busy/retry -> true, idle/error -> false, and the reconnect
+      // resync reconciles it), so re-entering a still-running session must
+      // keep the stop control alive instead of clearing it until the run's
+      // next (possibly far-off) status event.
       set((state) => ({
         isSessionLoading: isColdLoad ? true : state.isSessionLoading,
         error: null,
         hasMore: false,
         messageCursor: {},
         loadingMore: false,
-        sending: { ...state.sending, [sessionID]: false },
+        ...(isColdLoad ? { currentSession: null, messages: [], parts: {} } : {}),
       }))
 
       // Snapshot what is on screen when the request begins. The canonical
@@ -610,17 +633,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
       // streamed response) so a failure here can propagate to the caller — SSE
       // events still update messages/parts/status in real-time on success.
       if (session.revert) {
-        await client.session.commitRevert(session.id)
-        set((state) => {
-          if (state.currentSession?.id !== session.id) return state
-          const messages = truncateCommittedRevert(state.messages, session.revert!.messageID)
-          const messageIDs = new Set(messages.map((message) => message.id))
-          return {
-            currentSession: { ...state.currentSession, revert: undefined },
-            messages,
-            parts: Object.fromEntries(Object.entries(state.parts).filter(([messageID]) => messageIDs.has(messageID))),
-          }
-        })
+        await get().commitPendingRevert()
       }
       const selectedAgent = agent && agent !== session.agent ? agent : undefined
       const selectedModel = model && (
@@ -646,13 +659,32 @@ export const useSessions = create<SessionsState>((set, get) => ({
     const session = get().currentSession
     if (!client || !session) return
 
+    // Mark the abort BEFORE the request leaves. The server can emit the run's
+    // busy -> idle transition while the interrupt HTTP response is still in
+    // flight; by the time the response confirms the interrupt, the completion
+    // handler has already run and would count a user-cancelled run as a
+    // received response (notification, analytics, review credit). Marking the
+    // run as aborted up front closes that race. If the server reports there
+    // was no run to interrupt, the mark is removed again: that transition was
+    // a genuine completion which the user's stop merely raced.
+    const alreadyAborted = abortedSessions.has(session.id)
+    abortedSessions.add(session.id)
     try {
-      await client.session.interrupt(session.id)
-      // Mark only after the abort request succeeded — if it failed, the run
-      // continues and any eventual completion is a genuine response.
-      abortedSessions.add(session.id)
+      const result = await client.session.interrupt(session.id)
+      // The server reports false when there was no run to interrupt — it
+      // already finished on its own. That is NOT a user abort: marking it
+      // would suppress the completion notification, review credit, and
+      // analytics for a legitimate run. Clear the optimistic sending flag and
+      // reconcile the transcript instead.
+      if (!result.interrupted) {
+        if (!alreadyAborted) abortedSessions.delete(session.id)
+        set((state) => ({ sending: { ...state.sending, [session.id]: false } }))
+        if (get().currentSession?.id === session.id) void get().refreshMessages()
+        return
+      }
       set((state) => ({ sending: { ...state.sending, [session.id]: false } }))
     } catch {
+      if (!alreadyAborted) abortedSessions.delete(session.id)
       set({ error: "Failed to abort session" })
     }
   },
@@ -700,10 +732,17 @@ export const useSessions = create<SessionsState>((set, get) => ({
     if (!client || !session) return { ok: false, reason: "error" }
 
     try {
+      const token = revertGuard.begin(session.id)
       const updated = await client.session.revert(session.id, messageID)
-      set((state) => ({
-        currentSession: state.currentSession?.id === session.id ? updated : state.currentSession,
-      }))
+      // A newer stage/clear (this device or another client) superseded this
+      // response while it was in flight — applying it would resurrect a
+      // pending revert that was already changed. The prompt parts are local,
+      // so the caller can still use the returned edit text.
+      if (revertGuard.isCurrent(session.id, token)) {
+        set((state) => ({
+          currentSession: state.currentSession?.id === session.id ? updated : state.currentSession,
+        }))
+      }
       return { ok: true, ...extractPromptFromParts(get().parts[messageID]) }
     } catch (err) {
       if (err instanceof ApiError && err.status === 404) return { ok: false, reason: "unsupported" }
@@ -721,17 +760,52 @@ export const useSessions = create<SessionsState>((set, get) => ({
   unrevertSession: async () => {
     const client = clientFor(get().currentSession?.directory)
     const session = get().currentSession
-    if (!client || !session) return
+    if (!client || !session) return false
 
     try {
+      const token = revertGuard.begin(session.id)
       const updated = await client.session.clearRevert(session.id)
-      set((state) => ({
-        currentSession: state.currentSession?.id === session.id ? updated : state.currentSession,
-      }))
+      // See revertToMessage: a newer revert action/event wins over this
+      // response, so a stale clear can't resurrect the staged revert.
+      if (revertGuard.isCurrent(session.id, token)) {
+        set((state) => ({
+          currentSession: state.currentSession?.id === session.id ? updated : state.currentSession,
+        }))
+      }
+      return true
     } catch (err) {
       console.error("Failed to unrevert session:", err)
       set({ error: "Failed to restore reverted messages" })
+      return false
     }
+  },
+
+  commitPendingRevert: async () => {
+    const session = get().currentSession
+    const revert = session?.revert
+    if (!session || !revert) return
+    const client = clientFor(session.directory)
+    if (!client) {
+      set({ error: "No active connection" })
+      return
+    }
+
+    const token = revertGuard.begin(session.id)
+    await client.session.commitRevert(session.id)
+    // A newer revert action (another stage) or a revert lifecycle event
+    // landed while the commit was in flight — it owns the local state now.
+    if (!revertGuard.isCurrent(session.id, token)) return
+    const { messageID } = revert
+    set((state) => {
+      if (state.currentSession?.id !== session.id) return state
+      const messages = truncateCommittedRevert(state.messages, messageID)
+      const messageIDs = new Set(messages.map((message) => message.id))
+      return {
+        currentSession: { ...state.currentSession, revert: undefined },
+        messages,
+        parts: Object.fromEntries(Object.entries(state.parts).filter(([id]) => messageIDs.has(id))),
+      }
+    })
   },
 
   handleEvent: (event) => {
@@ -820,6 +894,69 @@ export const useSessions = create<SessionsState>((set, get) => ({
         return {
           ...upsertHierarchy(state, updated),
           currentSession: state.currentSession?.id === sessionID ? updated : state.currentSession,
+        }
+      })
+      return
+    }
+
+    if (event.type === "session.revert.staged" || event.type === "session.revert.cleared" || event.type === "session.revert.committed") {
+      const patch = revertPatchFromEvent(event)
+      if (!patch) return
+      // Any revert lifecycle event makes in-flight stage/clear/commit
+      // responses stale, even when this session isn't cached locally.
+      revertGuard.noteEvent(patch.sessionID)
+      set((state) => {
+        const cached = findCachedSession(patch.sessionID, state.sessions, state.childrenByParent, state.currentSession)
+        const revert = patch.revert ?? undefined
+        const updated = cached && { ...cached, revert }
+        const current = state.currentSession?.id === patch.sessionID ? state.currentSession : null
+        // Nothing cached for this session (list not loaded, other clients'
+        // session): leave state untouched rather than re-rendering subscribers.
+        if (!updated && !current) return state
+        // A committed revert is authoritative cleanup: the server removed the
+        // boundary message and everything after it, so drop those local rows
+        // (and their parts) rather than showing content the next canonical
+        // page will no longer return. Optimistic temps stay — a send that
+        // raced the commit is still in flight and must not vanish.
+        if (patch.committedTo && current) {
+          const messages = truncateCommittedRevert(state.messages, patch.committedTo)
+          const messageIDs = new Set(messages.map((message) => message.id))
+          return {
+            ...(updated ? upsertHierarchy(state, updated) : {}),
+            currentSession: { ...current, revert },
+            messages,
+            parts: Object.fromEntries(Object.entries(state.parts).filter(([messageID]) => messageIDs.has(messageID))),
+          }
+        }
+        return {
+          ...(updated ? upsertHierarchy(state, updated) : {}),
+          ...(current ? { currentSession: { ...current, revert } } : {}),
+        }
+      })
+      return
+    }
+
+    if (event.type === "session.metadata.updated" || event.type === "session.permissions") {
+      const patch = sessionInfoPatchFromEvent(event)
+      if (!patch) return
+      set((state) => {
+        const cached = findCachedSession(patch.sessionID, state.sessions, state.childrenByParent, state.currentSession)
+        const current = state.currentSession?.id === patch.sessionID ? state.currentSession : null
+        // Nothing cached for this session (list not loaded, another client's
+        // session): leave state untouched rather than re-rendering subscribers.
+        if (!cached && !current) return state
+        // Session metadata and the permission ruleset are not part of the
+        // shared Session type — the UI doesn't render them — but a cross-client
+        // update is still the latest server state. Object.assign keeps them on
+        // the cached object (typed writes are unnecessary; the next canonical
+        // fetch simply replaces the object) without widening the public type.
+        const info: Record<string, unknown> = {}
+        if (patch.metadata) info.metadata = patch.metadata
+        if (patch.permissions) info.permissions = patch.permissions
+        const updated = cached ? Object.assign({}, cached, info) as Session : null
+        return {
+          ...(updated ? upsertHierarchy(state, updated) : {}),
+          ...(current ? { currentSession: Object.assign({}, current, info) as Session } : {}),
         }
       })
       return

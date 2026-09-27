@@ -2,13 +2,13 @@ import type {
   AgentInfo,
   CommandInfo,
   EventSubscribeOutput,
+  LocationPublicInfo,
   ModelInfo,
   Project as V2Project,
-  ProjectCurrent,
   ProviderInfo,
   SessionInfo,
   SessionMessageInfo,
-} from "@opencode-ai/client"
+} from "@opencode/client"
 import { inlineFileUri } from "./session-request.ts"
 
 export interface Session {
@@ -33,7 +33,7 @@ export interface Message {
   sessionID: string
   role: "user" | "assistant"
   presentation: "user" | "assistant" | "shell" | "system" | "subagent"
-  systemKind?: "agent" | "model" | "location" | "compaction" | "synthetic" | "skill" | "system"
+  systemKind?: "agent" | "model" | "location" | "compaction" | "synthetic" | "skill" | "system" | "idle"
   parentID?: string
   time: { created: number; completed?: number }
   agent?: string
@@ -43,6 +43,7 @@ export interface Message {
   cost?: number
   tokens?: { input: number; output: number; reasoning?: number; cache?: { read: number; write: number } }
   error?: { message: string }
+  retry?: { attempt: number; at: number }
   finish?: string
   shell?: ShellMessage
   subagent?: SubagentMessage
@@ -147,6 +148,9 @@ export interface ProviderCatalog {
       cost?: { input: number; output: number }
       limit: { context: number; output: number }
       status?: "alpha" | "beta" | "deprecated" | "active"
+      // Explicitly disabled models are not selectable. Absent on older
+      // servers/fixtures means "not explicitly disabled".
+      enabled?: boolean
       variants?: Record<string, { reasoningEffort?: string }>
     }>
   }>
@@ -155,19 +159,6 @@ export interface ProviderCatalog {
 }
 
 export const V2_REQUIRED_ERROR = "OpenCode v2 server required"
-
-export function isV2HealthResponse(value: unknown): value is { healthy: boolean; version: string } {
-  if (!value || typeof value !== "object") return false
-  const health = value as { healthy?: unknown; version?: unknown }
-  return typeof health.healthy === "boolean" && typeof health.version === "string" && health.version.length > 0
-}
-
-export function v2HealthError(value: unknown): Error {
-  if (value && typeof value === "object" && "status" in value && (value as { status?: unknown }).status === 404) {
-    return new Error(V2_REQUIRED_ERROR)
-  }
-  return new Error(V2_REQUIRED_ERROR)
-}
 
 export type SyntheticTagState = "completed" | "error" | "cancelled"
 
@@ -234,6 +225,7 @@ function baseMessage(value: SessionMessageInfo, sessionID: string): Message {
       cost: value.cost,
       tokens: value.tokens,
       error: value.error && { message: value.error.message },
+      retry: value.retry && { attempt: value.retry.attempt, at: value.retry.at },
       finish: value.finish,
     }
   }
@@ -301,9 +293,11 @@ function baseMessage(value: SessionMessageInfo, sessionID: string): Message {
       ? "model"
       : value.type === "location-switched"
         ? "location"
-        : value.type === "compaction"
-          ? "compaction"
-          : value.type
+        : value.type === "idle"
+          ? "idle"
+          : value.type === "compaction"
+            ? "compaction"
+            : value.type
   return { id: value.id, sessionID, role: "assistant", presentation: "system", systemKind, time }
 }
 
@@ -426,7 +420,7 @@ export function normalizeCommand(value: CommandInfo): Command {
   }
 }
 
-export function normalizeProject(value: V2Project | ProjectCurrent): Project {
+export function normalizeProject(value: V2Project | LocationPublicInfo["project"]): Project {
   const directory = "directory" in value ? value.directory : value.canonical
   return { id: value.id, name: "name" in value ? value.name : undefined, path: { cwd: directory, root: directory, absolute: directory } }
 }
@@ -447,6 +441,7 @@ export function normalizeProviderCatalog(providers: ProviderInfo[], models: Mode
         cost: model.cost[0] && { input: model.cost[0].input, output: model.cost[0].output },
         limit: model.limit,
         status: model.status,
+        enabled: model.enabled,
         variants: Object.fromEntries(model.variants.map((variant) => [variant.id, {}])),
       }])),
     })),

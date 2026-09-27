@@ -1,10 +1,5 @@
 import type { Session } from "./sdk"
 
-export interface HierarchySessionRow {
-  session: Session
-  depth: number
-}
-
 export type PendingBySession = Readonly<Record<string, readonly unknown[]>>
 
 export interface PendingSessionCounts {
@@ -26,26 +21,6 @@ export function mergePendingRequests(...records: readonly PendingBySession[]): P
     }
   }
   return merged
-}
-
-export function flattenSessionHierarchy(
-  roots: Session[],
-  childrenByParent: Record<string, Session[]>,
-  expanded: ReadonlySet<string>,
-): HierarchySessionRow[] {
-  const rows: HierarchySessionRow[] = []
-  const visited = new Set<string>()
-
-  const append = (session: Session, depth: number) => {
-    if (visited.has(session.id)) return
-    visited.add(session.id)
-    rows.push({ session, depth })
-    if (!expanded.has(session.id)) return
-    for (const child of childrenByParent[session.id] ?? []) append(child, depth + 1)
-  }
-
-  for (const root of roots) append(root, 0)
-  return rows
 }
 
 export function findCachedSession(
@@ -126,18 +101,63 @@ export function unassociatedDescendantPending<T extends { sessionID: string }>(
   return result
 }
 
+// Remove a session from every child list; returns the same object when nothing
+// contained it, so an in-place replacement can keep the cache identity.
+function withoutChild(childrenByParent: Record<string, Session[]>, sessionID: string): Record<string, Session[]> {
+  let found = false
+  for (const children of Object.values(childrenByParent)) {
+    if (children.some((item) => item.id === sessionID)) {
+      found = true
+      break
+    }
+  }
+  if (!found) return childrenByParent
+  return Object.fromEntries(
+    Object.entries(childrenByParent).map(([parentID, children]) => [parentID, children.filter((item) => item.id !== sessionID)]),
+  )
+}
+
 export function upsertSessionHierarchy(
   roots: Session[],
   childrenByParent: Record<string, Session[]>,
   session: Session,
 ): { roots: Session[]; childrenByParent: Record<string, Session[]> } {
-  const nextRoots = roots.filter((item) => item.id !== session.id)
-  const nextChildren = Object.fromEntries(
-    Object.entries(childrenByParent).map(([parentID, children]) => [parentID, children.filter((item) => item.id !== session.id)]),
-  )
-  if (!session.parentID) return { roots: [session, ...nextRoots], childrenByParent: nextChildren }
-  nextChildren[session.parentID] = [session, ...(nextChildren[session.parentID] ?? [])]
-  return { roots: nextRoots, childrenByParent: nextChildren }
+  const siblings = session.parentID ? childrenByParent[session.parentID] : undefined
+
+  // The session is already in its bucket (a rename/metadata/selection update):
+  // replace it in place so the list keeps its newest-first order. Prepending
+  // here yanked a renamed or touched row to the top of the list.
+  if (!session.parentID) {
+    const rootIndex = roots.findIndex((item) => item.id === session.id)
+    if (rootIndex !== -1) {
+      const nextRoots = [...roots]
+      nextRoots[rootIndex] = session
+      return { roots: nextRoots, childrenByParent: withoutChild(childrenByParent, session.id) }
+    }
+  } else if (siblings) {
+    const index = siblings.findIndex((item) => item.id === session.id)
+    if (index !== -1) {
+      const stripped = withoutChild(childrenByParent, session.id)
+      return {
+        roots: roots.filter((item) => item.id !== session.id),
+        childrenByParent: {
+          ...stripped,
+          [session.parentID!]: siblings.map((item, i) => (i === index ? session : item)),
+        },
+      }
+    }
+  }
+
+  // New session, or moved to a different bucket: drop any stale copy and
+  // insert at the head of its (new) bucket, matching the desc list order.
+  const nextChildren = withoutChild(childrenByParent, session.id)
+  if (!session.parentID) {
+    return { roots: [session, ...roots.filter((item) => item.id !== session.id)], childrenByParent: nextChildren }
+  }
+  return {
+    roots: roots.filter((item) => item.id !== session.id),
+    childrenByParent: { ...nextChildren, [session.parentID]: [session, ...(nextChildren[session.parentID] ?? [])] },
+  }
 }
 
 export function purgeSessionHierarchy(

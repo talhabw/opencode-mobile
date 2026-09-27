@@ -8,6 +8,13 @@ test("validates non-empty answers and rejects an empty unanswerable question", (
   assert.equal(questionValidationMessage({ options: [], custom: false }, []), "unanswerable")
 })
 
+test("an explicitly optional form field can be submitted unanswered", () => {
+  assert.equal(isQuestionAnswerValid({ options: ["Yes"], required: false }, []), true)
+  assert.equal(questionValidationMessage({ options: [], custom: false, required: false }, []), null)
+  // The answered case is unaffected.
+  assert.equal(questionValidationMessage({ options: ["Yes"], required: false }, ["Yes"]), null)
+})
+
 test("updates single and multiple answers without mutating prior pages", () => {
   const initial = [["old"], []]
   assert.deepEqual(updateQuestionAnswer(initial, 0, "new", false), [["new"], []])

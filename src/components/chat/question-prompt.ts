@@ -1,10 +1,14 @@
 export interface QuestionAnswerInput {
   options: readonly unknown[]
   custom?: boolean
+  // Explicit false from the form field: the question may be left unanswered.
+  required?: boolean
 }
 
 export function isQuestionAnswerValid(question: QuestionAnswerInput, answer: string[] | undefined): boolean {
-  return Boolean(answer?.some((value) => value.trim().length > 0))
+  const answered = Boolean(answer?.some((value) => value.trim().length > 0))
+  if (question.required === false) return true
+  return answered
 }
 
 export function questionValidationMessage(question: QuestionAnswerInput, answer: string[] | undefined): "required" | "unanswerable" | null {

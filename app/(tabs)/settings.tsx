@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import {
   View,
   Text,
@@ -14,7 +14,9 @@ import {
 import Slider from "@react-native-community/slider"
 import { Ionicons } from "@expo/vector-icons"
 import { useTranslation } from "react-i18next"
+import { useFocusEffect } from "expo-router"
 import { useAuth } from "../../src/stores/auth"
+import { useConnections } from "../../src/stores/connections"
 import { useSettings, FONT_SCALE_MIN, FONT_SCALE_MAX, type ThemePreference } from "../../src/stores/settings"
 import { ACCENTS, useAccent, type AccentName } from "../../src/lib/accents"
 import {
@@ -25,7 +27,13 @@ import {
 } from "../../src/lib/notifications"
 import type { Category } from "../../src/lib/notifications"
 import { hasTelemetryConsent, setTelemetryConsent } from "../../src/lib/telemetry"
+import { savedPermissionsForProject, type SavedPermission } from "../../src/lib/saved-permissions"
 import type { LocalePreference } from "../../src/lib/i18n/locale-resolve"
+import appJson from "../../app.json"
+
+// app.json is the release source of truth (scripts/check-version-parity.mjs
+// keeps it in step with package.json and the native projects).
+const APP_VERSION = (appJson as { expo?: { version?: string } }).expo?.version || "unknown"
 
 function SettingRow({
   icon,
@@ -214,14 +222,103 @@ export default function SettingsScreen() {
   const { settings, hasBiometrics, updateSettings, lock } = useAuth()
   const { notifications, setNotification, locale, setLocale, theme, setTheme, accent, setAccent, fontSize, setFontSize } =
     useSettings()
+  const client = useConnections((state) => state.client)
+  // The resolved active project. Saved approvals are project-scoped on the
+  // server, so the review list must not render approvals for any other
+  // project (or another connection that raced this response).
+  const currentProjectID = useConnections((state) => state.currentProject?.id)
   const [osGranted, setOsGranted] = useState<boolean | null>(null)
   const [telemetryUpdating, setTelemetryUpdating] = useState(false)
   // Which picker sheet is open: theme | accent | language | fontSize | null
   const [picker, setPicker] = useState<"theme" | "accent" | "language" | "fontSize" | null>(null)
+  // Project-scoped "always allow" approvals. null means the server either does
+  // not support the saved-permission routes or has not answered yet, in which
+  // case the section stays hidden instead of showing a spurious error.
+  const [savedPermissions, setSavedPermissions] = useState<SavedPermission[] | null>(null)
 
   // Telemetry consent: hasTelemetryConsent() returns null (unknown), true, or false.
   // We initialise local state from in-memory value; updates call setTelemetryConsent().
   const [crashReporting, setCrashReporting] = useState<boolean>(hasTelemetryConsent() ?? false)
+
+  // Project-scoped saved approvals: list them when the server exposes the
+  // route (beta servers and the test fixture may not), remove on request. The
+  // docs' "Allow always" flow is only safe to use when the resulting grants
+  // can be reviewed and revoked again.
+  //
+  // The list is request-scoped to (client, project). A connection or
+  // directory switch bumps the sequence below and hides the section, so a
+  // response that lands after the switch can never present one project's
+  // grants as another's.
+  const savedRequestSeq = useRef(0)
+
+  useEffect(() => {
+    // Identity changed (or was never known): drop whatever the previous
+    // connection/project rendered and invalidate any in-flight response.
+    savedRequestSeq.current += 1
+    setSavedPermissions(null)
+  }, [client, currentProjectID])
+
+  const loadSavedPermissions = useCallback(async () => {
+    const seq = ++savedRequestSeq.current
+    // Without a resolved project the section stays hidden: the server would
+    // otherwise fall back to its location default, which is not necessarily
+    // the project these approvals belong to.
+    if (!client || !currentProjectID) {
+      setSavedPermissions(null)
+      return
+    }
+    try {
+      const list = await client.protocol.permission.saved.list({ projectID: currentProjectID })
+      const state = useConnections.getState()
+      if (seq !== savedRequestSeq.current) return
+      if (state.client !== client || state.currentProject?.id !== currentProjectID) return
+      // Enforce the scope client-side too: a server that ignores the
+      // projectID filter must not leak another project's grants into this
+      // review list, where the trash button would delete them.
+      setSavedPermissions(savedPermissionsForProject(list, currentProjectID))
+    } catch {
+      // Unsupported server (404) or transient failure: keep the section hidden
+      // rather than presenting an error the user cannot act on.
+      if (seq === savedRequestSeq.current) setSavedPermissions(null)
+    }
+  }, [client, currentProjectID])
+
+  useFocusEffect(
+    useCallback(() => {
+      void loadSavedPermissions()
+    }, [loadSavedPermissions]),
+  )
+
+  const handleRemoveSavedPermission = useCallback(
+    (permission: SavedPermission) => {
+      if (!client) return
+      Alert.alert(
+        t("settings.savedPermissions.removeConfirmTitle"),
+        t("settings.savedPermissions.removeConfirmMessage", { action: permission.action, resource: permission.resource }),
+        [
+          { text: t("common.cancel"), style: "cancel" },
+          {
+            text: t("common.delete"),
+            style: "destructive",
+            onPress: async () => {
+              // The confirm dialog outlives a connection switch: never delete
+              // through a client that is no longer the active one.
+              if (useConnections.getState().client !== client) return
+              try {
+                await client.protocol.permission.saved.remove({ id: permission.id })
+                // Discard any list response that predates this removal.
+                savedRequestSeq.current += 1
+                setSavedPermissions((prev) => (prev ? prev.filter((item) => item.id !== permission.id) : prev))
+              } catch {
+                Alert.alert(t("settings.savedPermissions.removeFailedTitle"), t("settings.savedPermissions.removeFailedMessage"))
+              }
+            },
+          },
+        ],
+      )
+    },
+    [client, t],
+  )
 
   const handleCrashReportingToggle = useCallback(
     async (value: boolean) => {
@@ -255,12 +352,25 @@ export default function SettingsScreen() {
     [setNotification, t],
   )
 
-  // Lazy-check OS permission for status display
-  if (osGranted === null) {
-    notificationsGranted()
-      .then(setOsGranted)
-      .catch(() => setOsGranted(false))
-  }
+  // Lazy-check OS permission for status display. Runs as an effect (never
+  // during render, which could fire it on every re-render) and re-checks on
+  // focus so the notice clears after the user enables notifications in
+  // system settings.
+  useFocusEffect(
+    useCallback(() => {
+      let active = true
+      notificationsGranted()
+        .then((granted) => {
+          if (active) setOsGranted(granted)
+        })
+        .catch(() => {
+          if (active) setOsGranted(false)
+        })
+      return () => {
+        active = false
+      }
+    }, []),
+  )
 
   const localeLabels: Record<LocalePreference, string> = {
     system: t("settings.language.system"),
@@ -360,6 +470,45 @@ export default function SettingsScreen() {
         )}
       </SettingSection>
 
+      {savedPermissions !== null && (
+        <SettingSection title={t("settings.sections.permissions")} isDark={isDark}>
+          <View style={[styles.settingRow, isDark && styles.settingRowDark]}>
+            <Text style={[styles.settingDescription, isDark && styles.metaDark]}>
+              {t("settings.savedPermissions.description")}
+            </Text>
+          </View>
+          {savedPermissions.length === 0 && (
+            <View style={[styles.settingRow, isDark && styles.settingRowDark]}>
+              <Text style={[styles.settingDescription, isDark && styles.metaDark]}>
+                {t("settings.savedPermissions.empty")}
+              </Text>
+            </View>
+          )}
+          {savedPermissions.map((permission) => (
+            <SettingRow
+              key={permission.id}
+              icon="shield-checkmark-outline"
+              label={permission.action}
+              description={permission.resource}
+              isDark={isDark}
+              right={
+                <TouchableOpacity
+                  onPress={() => handleRemoveSavedPermission(permission)}
+                  accessibilityRole="button"
+                  accessibilityLabel={t("settings.savedPermissions.removeAccessibility", {
+                    action: permission.action,
+                    resource: permission.resource,
+                  })}
+                  testID={`saved-permission-remove-${permission.id}`}
+                >
+                  <Ionicons name="trash-outline" size={20} color="#dc2626" />
+                </TouchableOpacity>
+              }
+            />
+          ))}
+        </SettingSection>
+      )}
+
       <SettingSection title={t("settings.sections.notifications")} isDark={isDark}>
         {categories.map((category) => {
           const meta = categoryMeta[category]
@@ -439,7 +588,7 @@ export default function SettingsScreen() {
           onPress={handleLanguagePress}
           right={<Ionicons name="chevron-forward" size={20} color={isDark ? "#666666" : "#999999"} />}
         />
-        <SettingRow icon="information-circle" label={t("settings.about.version")} description="1.0.0" isDark={isDark} />
+        <SettingRow icon="information-circle" label={t("settings.about.version")} description={APP_VERSION} isDark={isDark} />
         <SettingRow
           icon="logo-github"
           label={t("settings.about.github.label")}

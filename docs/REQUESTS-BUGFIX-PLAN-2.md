@@ -1,5 +1,7 @@
 # Bug Fix Round 2 - Device Test Findings
 
+> Historical plan for the August beta build. API and compatibility notes below are not the current released-v2 implementation; see [the current review](V2-REVIEW-2026-09-27.md).
+
 Date: 2026-08-14
 Inputs: user device test against a real OpenCode v2 server (`opencode2 v0.0.0-next-17444`,
 client SDK in tree: `next-17403`), plus code inspection of this checkout.

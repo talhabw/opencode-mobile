@@ -44,18 +44,18 @@ export function parseUrl(url: string): ParsedUrl {
 
 export function classify(
   parsed: ParsedUrl,
-  health: ProbeAttempt,
+  info: ProbeAttempt,
   internet: ProbeAttempt,
   root: ProbeAttempt,
 ): { classification: Classification; summary: string } {
   if (!parsed.valid) {
     return { classification: "malformed-url", summary: "The server URL could not be parsed. Check for typos or extra characters." }
   }
-  if (health.ok) {
-    return { classification: "ok", summary: "Health endpoint responded — connection actually works now." }
+  if (info.ok) {
+    return { classification: "ok", summary: "Server identity endpoint responded — connection actually works now." }
   }
 
-  const txt = `${health.error ?? ""} ${health.errorCause ?? ""}`.toLowerCase()
+  const txt = `${info.error ?? ""} ${info.errorCause ?? ""}`.toLowerCase()
   const isTls = /ssl|tls|certificate|trust|handshake/.test(txt)
   const isTimeout = /timeout|timed out/.test(txt)
 
@@ -67,7 +67,7 @@ export function classify(
   // probe (captive portal, no WAN but Tailscale LAN still up, etc.) must not
   // override it and misreport a reachable server as "no internet".
   if (root.ok) {
-    return { classification: "health-failed", summary: `Server is reachable but /api/health failed (HTTP ${health.status ?? "error"}). An OpenCode v2 server is required; check the path, auth, and server version.` }
+    return { classification: "health-failed", summary: `Server is reachable but /api/info failed (HTTP ${info.status ?? "error"}). An OpenCode v2 server is required; check the path, auth, and server version.` }
   }
   if (!internet.ok) {
     return { classification: "no-internet", summary: "The device has no working internet/network at all (public check also failed). Check Wi-Fi/data and Tailscale (VPN) status." }

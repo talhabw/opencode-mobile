@@ -39,7 +39,7 @@ test("flags an IPv4 host as not-a-hostname, and a DNS name as a hostname", () =>
 })
 
 test("ignores path, query, and fragment when extracting the host", () => {
-  const p = parseUrl("http://host:9000/api/health?x=1#frag")
+  const p = parseUrl("http://host:9000/api/info?x=1#frag")
   assert.equal(p.host, "host")
   assert.equal(p.port, "9000")
 })
@@ -79,7 +79,7 @@ test("no internet (and no TLS signal) classifies as no-internet", () => {
   assert.equal(r.classification, "no-internet")
 })
 
-test("internet up + server root reachable but health failed -> health-failed (includes status)", () => {
+test("internet up + server root reachable but identity failed -> health-failed (includes /api/info status)", () => {
   const r = classify(
     okUrl,
     probe({ error: "HTTP 404", status: 404 }),
@@ -87,7 +87,11 @@ test("internet up + server root reachable but health failed -> health-failed (in
     probe({ ok: true, status: 404 }), // root reachable
   )
   assert.equal(r.classification, "health-failed")
+  assert.match(r.summary, /\/api\/info/)
   assert.match(r.summary, /404/)
+  // Released v2 removed /api/health; the guidance must point at the endpoint
+  // the client actually probes, or users chase a route that no longer exists.
+  assert.doesNotMatch(r.summary, /\/api\/health/)
 })
 
 test("internet up, root unreachable, timeout signal -> timeout", () => {
@@ -116,12 +120,12 @@ test("root reachable but internet probe down still classifies as health-failed, 
   // this must not be misreported as "no internet".
   const r = classify(
     okUrl,
-    probe({ ok: false, error: "HTTP 401", status: 401 }), // health
+    probe({ ok: false, error: "HTTP 401", status: 401 }), // identity (/api/info)
     probe({ ok: false }), // internet (down)
     probe({ ok: true }), // root (reachable)
   )
   assert.equal(r.classification, "health-failed")
-  assert.match(r.summary, /\/api\/health/)
+  assert.match(r.summary, /\/api\/info/)
   assert.match(r.summary, /v2 server is required/)
 })
 

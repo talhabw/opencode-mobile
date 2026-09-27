@@ -6,6 +6,8 @@ readonly SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}"
 readonly ADB="$SDK/platform-tools/adb"
 readonly SERIAL="${OPENCODE_MOBILE_EMULATOR_SERIAL:-emulator-${OPENCODE_MOBILE_EMULATOR_PORT:-5554}}"
 readonly APK="$ROOT_DIR/android/app/build/outputs/apk/debug/app-debug.apk"
+readonly FIXTURE_PORT="${OPENCODE_MOBILE_FIXTURE_PORT:-4100}"
+readonly FIXTURE_HOST="${OPENCODE_MOBILE_FIXTURE_HOST:-0.0.0.0}"
 
 export ANDROID_HOME="$SDK"
 export ANDROID_SDK_ROOT="$SDK"
@@ -42,6 +44,11 @@ node_path() {
 build_install_launch() {
   require_adb
   "$ADB" -s "$SERIAL" reverse tcp:8081 tcp:8081
+  # The fixture binds 0.0.0.0 by default, which the emulator reaches through
+  # 10.0.2.2. A loopback-only fixture host needs its own adb reverse.
+  case "$FIXTURE_HOST" in
+    127.0.0.1|localhost|::1) "$ADB" -s "$SERIAL" reverse "tcp:$FIXTURE_PORT" "tcp:$FIXTURE_PORT" ;;
+  esac
   if [[ "${OPENCODE_MOBILE_SKIP_BUILD:-0}" != "1" || ! -f "$APK" ]]; then
     local node_bin
     node_bin="$(node_path)"
@@ -50,9 +57,13 @@ build_install_launch() {
   "$ADB" -s "$SERIAL" install -r "$APK"
   "$ADB" -s "$SERIAL" shell am force-stop cc.agentlabs.opencode
   "$ADB" -s "$SERIAL" shell monkey -p cc.agentlabs.opencode -c android.intent.category.LAUNCHER 1 >/dev/null
+  local fixture_url="http://10.0.2.2:$FIXTURE_PORT"
+  case "$FIXTURE_HOST" in
+    127.0.0.1|localhost|::1) fixture_url="http://127.0.0.1:$FIXTURE_PORT" ;;
+  esac
   printf '\nEnvironment ready.\n'
   printf 'App:      cc.agentlabs.opencode on %s\n' "$SERIAL"
-  printf 'Fixture:  http://10.0.2.2:4100 (opencode/devpassword)\n'
+  printf 'Fixture:  %s (opencode/devpassword)\n' "$fixture_url"
   printf 'Automate: agent-device open cc.agentlabs.opencode --platform android --device opencode-mobile-api36 --foreground\n'
 }
 

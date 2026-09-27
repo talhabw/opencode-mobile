@@ -11,7 +11,6 @@ interface SpeechState {
 interface SpeechActions {
   start: () => Promise<void>
   stop: () => void
-  cancel: () => void
 }
 
 export function useSpeech(onResult: (text: string) => void): SpeechState & SpeechActions {
@@ -81,13 +80,6 @@ export function useSpeech(onResult: (text: string) => void): SpeechState & Speec
     ExpoSpeechRecognitionModule.stop()
   }, [])
 
-  const cancel = useCallback(() => {
-    pending.current = ""
-    ExpoSpeechRecognitionModule.abort()
-    setListening(false)
-    setTranscript("")
-  }, [])
-
   // Stop the native recognition session when the screen unmounts — otherwise
   // the mic stays hot in the background. abort() is a no-op when not listening.
   useEffect(() => {
@@ -96,5 +88,5 @@ export function useSpeech(onResult: (text: string) => void): SpeechState & Speec
     }
   }, [])
 
-  return { listening, transcript, error, start, stop, cancel }
+  return { listening, transcript, error, start, stop }
 }

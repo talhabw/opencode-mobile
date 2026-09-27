@@ -1,9 +1,24 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { OpenCode, type SessionInfo, type SessionMessageInfo } from "@opencode-ai/client"
-import { V2EventAdapter, normalizeAgent, normalizeCommand, normalizeEvent, normalizeMessage, normalizeSession, isV2HealthResponse, normalizeProviderCatalog, parseSyntheticTag, V2_REQUIRED_ERROR } from "./protocol-v2.ts"
+import { OpenCode, type SessionInfo, type SessionMessageInfo } from "@opencode/client"
+import {
+  V2EventAdapter,
+  normalizeAgent,
+  normalizeCommand,
+  normalizeEvent,
+  normalizeMessage,
+  normalizeProject,
+  normalizeProviderCatalog,
+  normalizeSession,
+  parseSyntheticTag,
+  V2_REQUIRED_ERROR,
+} from "./protocol-v2.ts"
 
-test("official client uses v2 /api paths and location query", async () => {
+// The app talks to released v2 servers exclusively, through the generated
+// @opencode/client 2.0.18 surface. The generated-client checks below pin the
+// documented routes/bodies the wrapper relies on (https://opencode.ai/v2/openapi.json).
+
+test("released client uses /api paths and the location[directory] query", async () => {
   const requests: URL[] = []
   const client = OpenCode.make({
     baseUrl: "http://example.test",
@@ -21,13 +36,14 @@ test("official client uses v2 /api paths and location query", async () => {
   assert.equal(requests[0].searchParams.get("location[directory]"), "/tmp")
 })
 
-test("official client maps session actions to v2 paths and generated request bodies", async () => {
-  const requests: Array<{ url: URL; body: unknown }> = []
+test("released client maps session actions to the documented routes and bodies", async () => {
+  const requests: Array<{ method: string; url: URL; body: unknown }> = []
   const client = OpenCode.make({
     baseUrl: "http://example.test",
     fetch: async (input, init) => {
       const url = new URL(String(input))
       requests.push({
+        method: init?.method ?? "GET",
         url,
         body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
       })
@@ -35,57 +51,78 @@ test("official client maps session actions to v2 paths and generated request bod
         return new Response(JSON.stringify({ interrupted: true }), { status: 200, headers: { "content-type": "application/json" } })
       }
       if (url.pathname.endsWith("/revert/stage")) {
-        return new Response(JSON.stringify({ data: { messageID: "message/id" } }), { status: 200, headers: { "content-type": "application/json" } })
+        return new Response(JSON.stringify({ data: { messageID: "msg_1" } }), { status: 200, headers: { "content-type": "application/json" } })
+      }
+      if (url.pathname === "/api/form") {
+        return new Response(JSON.stringify({ location: { directory: "/work" }, data: [] }), { status: 200, headers: { "content-type": "application/json" } })
       }
       return new Response(null, { status: 204 })
     },
   })
 
+  await client.session.update({ sessionID: "ses_1", title: "Renamed" })
   await client.session.command({
-    sessionID: "session/id",
-    command: "review",
+    sessionID: "ses_1",
+    name: "review",
     text: "first  second",
     files: [{ uri: "data:image/jpeg;base64,YQ==", name: "a.jpg", description: "Screenshot" }],
   })
-  await client.session.interrupt({ sessionID: "session/id" })
-  await client.permission.reply({ sessionID: "session/id", requestID: "permission/id", reply: "once", message: "Approved" })
-  await client.session.revert.stage({ sessionID: "session/id", messageID: "message/id" })
-  await client.session.revert.clear({ sessionID: "session/id" })
-  await client.session.revert.commit({ sessionID: "session/id" })
+  await client.session.interrupt({ sessionID: "ses_1", resume: true })
+  await client.permission.reply({ sessionID: "ses_1", requestID: "per_1", decision: "once", message: "Approved" })
+  await client.session.revert.stage({ sessionID: "ses_1", messageID: "msg_1" })
+  await client.session.revert.clear({ sessionID: "ses_1" })
+  await client.session.revert.commit({ sessionID: "ses_1" })
+  await client.session.form.cancel({ sessionID: "ses_1", formID: "frm_1" })
+  await client.form.list({ location: { directory: "/work" } })
 
-  assert.deepEqual(requests.map((request) => request.url.pathname), [
-    "/api/session/session%2Fid/command",
-    "/api/session/session%2Fid/interrupt",
-    "/api/session/session%2Fid/permission/permission%2Fid/reply",
-    "/api/session/session%2Fid/revert/stage",
-    "/api/session/session%2Fid/revert/clear",
-    "/api/session/session%2Fid/revert/commit",
+  assert.deepEqual(requests.map((request) => `${request.method} ${request.url.pathname}${request.url.search}`), [
+    "PATCH /api/session/ses_1",
+    "POST /api/session/ses_1/command",
+    "POST /api/session/ses_1/interrupt?resume=true",
+    "POST /api/session/ses_1/permission/per_1/reply",
+    "POST /api/session/ses_1/revert/stage",
+    "DELETE /api/session/ses_1/revert",
+    "POST /api/session/ses_1/revert/commit",
+    "DELETE /api/session/ses_1/form/frm_1",
+    "GET /api/form?location%5Bdirectory%5D=%2Fwork",
   ])
-  // The beta command request is flat: arguments became `text` and the file
-  // attachments moved next to it; agent/model selection is no longer part of
-  // the request body.
-  assert.deepEqual(requests[0].body, {
-    command: "review",
+  assert.deepEqual(requests[0].body, { title: "Renamed" })
+  assert.deepEqual(requests[1].body, {
+    name: "review",
     text: "first  second",
     files: [{ uri: "data:image/jpeg;base64,YQ==", name: "a.jpg", description: "Screenshot" }],
   })
-  assert.deepEqual(requests[2].body, { reply: "once", message: "Approved" })
-  assert.deepEqual(requests[3].body, { messageID: "message/id" })
+  assert.deepEqual(requests[3].body, { decision: "once", message: "Approved" })
+  assert.deepEqual(requests[4].body, { messageID: "msg_1" })
 })
 
-test("beta client removes the legacy question API and project directories endpoint", async () => {
+test("released client exposes only the documented surface", async () => {
   const client = OpenCode.make({
     baseUrl: "http://example.test",
     fetch: async () => new Response(null, { status: 204 }),
   })
+  // Beta-only APIs are gone: no question module, no /rename, no form.request,
+  // no /api/health, no /project/current.
   assert.equal("question" in client, false)
-  assert.equal("directories" in client.project, false)
+  assert.equal("health" in client, false)
+  assert.equal("rename" in client.session, false)
+  assert.equal("request" in client.form, false)
+  assert.equal("current" in client.project, false)
 })
 
-test("v2 health detection rejects legacy or malformed responses", () => {
-  assert.equal(isV2HealthResponse({ healthy: true, version: "2.0.0" }), true)
-  assert.equal(isV2HealthResponse({ status: "ok" }), false)
+test("v2 required error identifies a non-v2 server", () => {
   assert.equal(V2_REQUIRED_ERROR, "OpenCode v2 server required")
+})
+
+test("derives project.current from the documented location response", () => {
+  // The released server has no /api/project/current; location.get carries the
+  // same project identity.
+  const project = normalizeProject({ id: "p1", directory: "/work", canonical: "/work/real" })
+  assert.deepEqual(project, {
+    id: "p1",
+    name: undefined,
+    path: { cwd: "/work", root: "/work", absolute: "/work" },
+  })
 })
 
 test("normalizes v2 provider and model catalog without selecting a default", () => {
@@ -108,7 +145,7 @@ test("normalizes v2 provider and model catalog without selecting a default", () 
   assert.deepEqual(catalog.default, {})
 })
 
-test("normalizes beta command info into name and description only", () => {
+test("normalizes command info into name and description only", () => {
   assert.deepEqual(normalizeCommand({ name: "review", description: "Review the diff" }), {
     name: "review",
     description: "Review the diff",
@@ -157,6 +194,8 @@ test("normalizes known and unknown message variants without throwing", () => {
   const result = normalizeMessage(assistant, "s1")
   assert.equal(result.parts[0].text, "hello")
   assert.equal(result.parts[1].state?.status, "pending")
+  const retrying = normalizeMessage({ ...assistant, retry: { attempt: 2, at: 123, error: { name: "Error", message: "temporary" } } }, "s1")
+  assert.deepEqual(retrying.info.retry, { attempt: 2, at: 123 })
 
   const unknown = normalizeMessage({ id: "m2", type: "future", time: { created: 3 } } as unknown as SessionMessageInfo, "s1")
   assert.equal(unknown.info.id, "m2")
@@ -253,6 +292,20 @@ test("projects every generated non-chat message variant without blank parts", ()
       assert.ok(result.parts[0].text, message.type)
     }
   }
+})
+
+test("idle run markers stay invisible bookkeeping rows", () => {
+  // Released v2 appends an `idle` message when a run settles. It carries no
+  // user-facing text; the status indicator is the visible surface.
+  const result = normalizeMessage({
+    id: "msg_idle",
+    type: "idle",
+    time: { created: 3 },
+    outcome: "succeeded",
+  } satisfies SessionMessageInfo, "s1")
+  assert.equal(result.info.presentation, "system")
+  assert.equal(result.info.systemKind, "idle")
+  assert.deepEqual(result.parts, [])
 })
 
 test("shell lifecycle events pass through without fabricating a message", () => {

@@ -15,10 +15,10 @@ const MAX_RECENT_DIRS = 10
 // A bad IP (unreachable host, wrong port) otherwise hangs for the full 30s
 // general request timeout before the user sees a "connection failed" error —
 // a first-run bounce driver. The interactive connect flow can afford to fail
-// faster since a real v2 server responds to /api/health in well under a
+// faster since a real v2 server responds to /api/info in well under a
 // second; this does NOT affect the timeout used for real session traffic.
 const CONNECTION_TEST_TIMEOUT_MS = 12_000
-// Startup metadata probe (project.current / path.get). A dead/unreachable
+// Startup metadata probe (project.current). A dead/unreachable
 // saved server otherwise stalls the root spinner for the full 30s general
 // request timeout on every cold start — the app looks permanently stuck
 // loading. This probe only feeds the directory-switcher header; it doesn't
@@ -38,7 +38,6 @@ interface ConnectionsState {
   client: Client | null
   clientBase: ClientBase | null
   currentProject: Project | null
-  serverHome: string | null // Home directory on the server machine (for ~ expansion)
   recentDirectories: string[]
   isLoading: boolean
   error: string | null
@@ -56,6 +55,10 @@ interface ConnectionsState {
     password?: string,
   ) => Promise<{ ok: boolean; error?: string }>
   updateConnection: (id: string, updates: Partial<ServerConnection>, password?: string) => Promise<void>
+  // Read the password saved for an existing connection. The edit screen's Test
+  // Connection / diagnostics path uses this so a blank password field (which
+  // means "keep the saved password" on save) does not probe unauthenticated.
+  getConnectionPassword: (id: string) => Promise<string | null>
   refreshProject: () => Promise<void>
   // Create a one-off client pointing at a specific directory (for cross-project operations).
   // Pass undefined to get a directory-less client that queries the server without project scope.
@@ -68,6 +71,14 @@ interface ConnectionsState {
 
 function generateId(): string {
   return Crypto.randomUUID().replace(/-/g, "").slice(0, 16)
+}
+
+// Saved passwords live in SecureStore under an id-scoped key. An empty/absent
+// id (the add-connection flow builds a throwaway connection before it has an
+// id) must never read an unrelated key.
+async function readSavedPassword(id: string): Promise<string | null> {
+  if (!id) return null
+  return (await SecureStore.getItemAsync(`${PASSWORDS_PREFIX}${id}`)) || null
 }
 
 function buildClient(
@@ -85,7 +96,6 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
   activeConnection: null,
   client: null,
   clientBase: null,
-  serverHome: null,
   currentProject: null,
   recentDirectories: [],
   isLoading: true,
@@ -114,7 +124,6 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
       let client: Client | null = null
       let base: ClientBase | null = null
       let project: Project | null = null
-      let home: string | null = null
       if (active) {
         const password = await SecureStore.getItemAsync(`${PASSWORDS_PREFIX}${active.id}`)
         const auth = buildAuth(active.username, password)
@@ -133,23 +142,17 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
         client,
         clientBase: base,
         currentProject: project,
-        serverHome: home,
         recentDirectories,
         isLoading: false,
       })
 
-      // Fetch current project info and server paths (best-effort, non-blocking)
+      // Fetch current project info (best-effort, non-blocking)
       if (active && client) {
         try {
-          const [proj, paths] = await Promise.all([
-            client.project.current(CONNECTION_PROBE_TIMEOUT_MS).catch(() => null),
-            client.path.get(CONNECTION_PROBE_TIMEOUT_MS).catch(() => null),
-          ])
-          project = proj
-          home = paths?.home || null
+          project = await client.project.current(CONNECTION_PROBE_TIMEOUT_MS).catch(() => null)
           // Only apply if the active connection hasn't changed under us
           if (get().activeConnection?.id === active.id) {
-            set({ currentProject: project, serverHome: home })
+            set({ currentProject: project })
           }
         } catch {
           // Server might be offline; the sessions screen shows a retry state
@@ -183,7 +186,6 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
     let activeConnection = get().activeConnection
 
     let project = get().currentProject
-    let serverHome = get().serverHome
 
     if (newConnection.active) {
       activeConnection = newConnection
@@ -192,21 +194,16 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
       client = built.client
       base = built.base
 
-      // Fetch server metadata so loadSessions can use clientForDirectory(serverHome)
-      // immediately after the connection is added (same as setActiveConnection does).
+      // Fetch project metadata immediately after the connection is added
+      // (same as setActiveConnection does).
       try {
-        const [proj, paths] = await Promise.all([
-          client.project.current(CONNECTION_PROBE_TIMEOUT_MS).catch(() => null),
-          client.path.get(CONNECTION_PROBE_TIMEOUT_MS).catch(() => null),
-        ])
-        project = proj
-        serverHome = paths?.home || null
+        project = await client.project.current(CONNECTION_PROBE_TIMEOUT_MS).catch(() => null)
       } catch {
         // Server might be unreachable; proceed without metadata
       }
     }
 
-    set({ connections, activeConnection, client, clientBase: base, currentProject: project, serverHome })
+    set({ connections, activeConnection, client, clientBase: base, currentProject: project })
   },
 
   removeConnection: async (id) => {
@@ -248,7 +245,6 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
     let client: Client | null = null
     let base: ClientBase | null = null
     let project: Project | null = null
-    let home: string | null = null
 
     if (active) {
       const password = await SecureStore.getItemAsync(`${PASSWORDS_PREFIX}${active.id}`)
@@ -258,12 +254,7 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
       base = built.base
 
       try {
-        const [proj, paths] = await Promise.all([
-          client.project.current(CONNECTION_PROBE_TIMEOUT_MS).catch(() => null),
-          client.path.get(CONNECTION_PROBE_TIMEOUT_MS).catch(() => null),
-        ])
-        project = proj
-        home = paths?.home || null
+        project = await client.project.current(CONNECTION_PROBE_TIMEOUT_MS).catch(() => null)
       } catch {
         // Server might be offline
       }
@@ -273,7 +264,7 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
       await SecureStore.setItemAsync(CONNECTIONS_KEY, JSON.stringify(connections))
     }
 
-    set({ connections, activeConnection: active, client, clientBase: base, currentProject: project, serverHome: home })
+    set({ connections, activeConnection: active, client, clientBase: base, currentProject: project })
     addBreadcrumb({
       category: "connection",
       message: active ? `active connection set: ${active.type}` : "active connection cleared",
@@ -284,10 +275,15 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
   testConnection: async (connection, source, password) => {
     track(AnalyticsEvent.ConnectionAttempted, { source })
     try {
+      // The edit form loads the password blank (saved passwords are never read
+      // back into the field), so an empty value means "use the saved password",
+      // not "no auth". Without the fallback, Test Connection sent no
+      // Authorization header and reported 401 for a server that works.
+      const effectivePassword = password || (await readSavedPassword(connection.id)) || undefined
       const client = createClient({
         baseUrl: connection.url,
         directory: connection.directory,
-        auth: buildAuth(connection.username, password),
+        auth: buildAuth(connection.username, effectivePassword),
       })
 
       await client.global.health(CONNECTION_TEST_TIMEOUT_MS)
@@ -316,23 +312,22 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
     // If updating active connection, recreate client
     if (get().activeConnection?.id === id) {
       const active = connections.find((c) => c.id === id)!
-      const password = await SecureStore.getItemAsync(`${PASSWORDS_PREFIX}${id}`)
+      const password = await readSavedPassword(id)
       const auth = buildAuth(active.username, password)
       const built = buildClient(active.url, active.directory, auth)
       try {
-        const [project, paths] = await Promise.all([
-          built.client.project.current(CONNECTION_PROBE_TIMEOUT_MS).catch(() => null),
-          built.client.path.get(CONNECTION_PROBE_TIMEOUT_MS).catch(() => null),
-        ])
+        const project = await built.client.project.current(CONNECTION_PROBE_TIMEOUT_MS)
         set({
           connections,
           activeConnection: active,
           client: built.client,
           clientBase: built.base,
           currentProject: project,
-          serverHome: paths?.home || null,
         })
       } catch {
+        // Metadata probe failed (e.g. the edited URL is unreachable). Clear the
+        // previous server's project too: keeping it would show stale metadata
+        // for a server the active connection no longer points at.
         set({
           connections,
           activeConnection: active,
@@ -345,6 +340,8 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
       set({ connections })
     }
   },
+
+  getConnectionPassword: (id) => readSavedPassword(id),
 
   refreshProject: async () => {
     const client = get().client

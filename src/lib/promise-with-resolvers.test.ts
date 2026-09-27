@@ -2,7 +2,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import { installPromiseWithResolvers, withResolvers, type Deferred } from "./promise-with-resolvers.ts"
 
-// The @opencode-ai/client SSE transport calls Promise.withResolvers() when it
+// The @opencode/client shared event transport calls Promise.withResolvers() when it
 // queues the next event-stream read; Hermes on Android lacks it. The app must
 // provide a spec-compatible fallback — and must never touch a platform that
 // already has an implementation.

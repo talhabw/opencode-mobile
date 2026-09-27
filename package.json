@@ -13,37 +13,39 @@
     "dev:env:stop": "scripts/dev-env.sh stop",
     "dev:fixture:test": "bun test tests/fixtures/opencode-v2-server.test.ts",
     "typecheck": "tsc --noEmit",
-    "check:versions": "node scripts/check-version-parity.mjs",
-    "test": "node --test 'src/**/*.test.ts'"
+    "check:versions": "bun scripts/check-version-parity.mjs",
+    "test": "bun test src"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",
     "@gorhom/bottom-sheet": "5.2.8",
-    "@opencode-ai/client": "0.0.0-beta-18743",
+    "@opencode/client": "^2.0.18",
     "@react-native-async-storage/async-storage": "2.2.0",
     "@react-native-community/slider": "5.0.1",
-    "@react-navigation/native": "^7.0.14",
-    "@sentry/react-native": "~6.22.0",
-    "@tanstack/react-query": "^5.62.0",
-    "expo": "^54.0.0",
+    "@react-navigation/native": "^7.1.8",
+    "@sentry/react-native": "~7.2.0",
+    "@tanstack/react-query": "^5.104.0",
+    "expo": "~54.0.37",
     "expo-clipboard": "8.0.8",
+    "expo-constants": "~18.0.14",
     "expo-crypto": "~15.0.9",
     "expo-device": "~8.0.10",
+    "expo-font": "~14.0.12",
     "expo-image-manipulator": "~14.0.8",
-    "expo-image-picker": "17.0.10",
+    "expo-image-picker": "~17.0.11",
     "expo-linking": "~8.0.11",
-    "expo-local-authentication": "~17.0.8",
+    "expo-local-authentication": "~17.0.9",
     "expo-localization": "~17.0.9",
     "expo-notifications": "~0.32.16",
-    "expo-router": "~6.0.22",
+    "expo-router": "~6.0.24",
     "expo-secure-store": "~15.0.8",
     "expo-speech-recognition": "3.0.1",
     "expo-status-bar": "~3.0.9",
     "expo-store-review": "~9.0.9",
-    "i18next": "^26.3.6",
-    "posthog-react-native": "^4.57.0",
+    "i18next": "^26.4.2",
+    "posthog-react-native": "^4.78.0",
     "react": "19.1.0",
-    "react-i18next": "^17.0.10",
+    "react-i18next": "^17.0.15",
     "react-native": "0.81.5",
     "react-native-gesture-handler": "~2.28.0",
     "react-native-marked": "8.0.0",
@@ -52,7 +54,7 @@
     "react-native-screens": "~4.16.0",
     "react-native-svg": "15.15.1",
     "react-native-worklets": "0.5.1",
-    "zustand": "^5.0.2"
+    "zustand": "^5.0.15"
   },
   "devDependencies": {
     "@types/react": "~19.1.10",
@@ -60,7 +62,9 @@
   },
   "expo": {
     "install": {
-      "exclude": []
+      "exclude": [
+        "react-native-svg"
+      ]
     },
     "autolinking": {
       "buildFromSource": [

@@ -248,7 +248,6 @@ export default function SessionsScreen() {
     activeConnection,
     client,
     currentProject,
-    serverHome,
     refreshProject,
     clientForDirectory,
     switchDirectory,
@@ -503,7 +502,7 @@ export default function SessionsScreen() {
 
   const openBrowser = useCallback(
     (startDir: string | null, mode: "create" | "switch") => {
-      setBrowseStartDir(startDir || serverHome || null)
+      setBrowseStartDir(startDir)
       setBrowseMode(mode)
       if (mode === "create" && showNewSession) {
         restoreNewSessionOnDismiss.current = true
@@ -511,7 +510,7 @@ export default function SessionsScreen() {
       }
       browserSheetRef.current?.expand()
     },
-    [serverHome, showNewSession],
+    [showNewSession],
   )
 
   const onBrowserSelect = useCallback(
@@ -952,39 +951,13 @@ export default function SessionsScreen() {
               </Text>
               <TextInput
                 style={[styles.modalInput, isDark && styles.modalInputDark]}
-                placeholder={serverHome ? `${serverHome}/...` : "/path/to/project"}
+                placeholder="/path/to/project"
                 placeholderTextColor={isDark ? "#666666" : "#999999"}
                 value={customDir}
-                onChangeText={(text) => {
-                  // Expand ~ to server home directory
-                  if (serverHome && text.startsWith("~/")) {
-                    setCustomDir(serverHome + text.slice(1))
-                  } else if (serverHome && text === "~") {
-                    setCustomDir(serverHome)
-                  } else {
-                    setCustomDir(text)
-                  }
-                }}
+                onChangeText={setCustomDir}
                 autoCapitalize="none"
                 autoCorrect={false}
               />
-              {/* Quick path shortcuts */}
-              {serverHome && (
-                <View style={styles.pathChips}>
-                  <TouchableOpacity
-                    style={[styles.pathChip, isDark && styles.pathChipDark]}
-                    onPress={() => setCustomDir(serverHome)}
-                  >
-                    <Text style={[styles.pathChipText, isDark && styles.pathChipTextDark]}>~</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.pathChip, isDark && styles.pathChipDark]}
-                    onPress={() => setCustomDir(serverHome + "/")}
-                  >
-                    <Text style={[styles.pathChipText, isDark && styles.pathChipTextDark]}>~/</Text>
-                  </TouchableOpacity>
-                </View>
-              )}
             </ScrollView>
 
             <View style={styles.modalActions}>
@@ -1078,7 +1051,6 @@ export default function SessionsScreen() {
         sheetRef={dirSheetRef}
         current={activeConnection?.directory}
         recents={recentDirectories}
-        serverHome={serverHome}
         isDark={isDark}
         onSwitch={handleSwitchDirectory}
         onBrowse={() =>
@@ -1510,28 +1482,6 @@ function makeStyles(acc: AccentState) {
   modalInputDark: {
     backgroundColor: "#2a2a2a",
     color: "#ffffff",
-  },
-  pathChips: {
-    flexDirection: "row",
-    gap: 8,
-    marginTop: 8,
-  },
-  pathChip: {
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    backgroundColor: acc.light.tintSurface,
-    borderRadius: 16,
-  },
-  pathChipDark: {
-    backgroundColor: acc.dark.tintBg,
-  },
-  pathChipText: {
-    fontSize: 13,
-    fontWeight: "600",
-    color: acc.light.primary,
-  },
-  pathChipTextDark: {
-    color: acc.dark.softer,
   },
   modalHint: {
     fontSize: 13,

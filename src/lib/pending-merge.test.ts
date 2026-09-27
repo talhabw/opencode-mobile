@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import {
   mergePendingBuckets,
+  pendingSnapshotScope,
   pruneResolved,
   reconcilePendingSource,
   replacePendingSessions,
@@ -121,4 +122,12 @@ test("session-scoped replacement preserves buckets from other workspace scopes",
     child: [req("fresh", "child")],
     other: [req("keep", "other")],
   })
+})
+
+test("pendingSnapshotScope covers snapshot sessions and same-directory local sessions", () => {
+  // The snapshot names a session the local cache does not have yet; local
+  // sessions from the same directory are authoritative for the fetcher too.
+  assert.deepEqual([...pendingSnapshotScope([req("p1", "remote")], ["local"])].sort(), ["local", "remote"])
+  assert.deepEqual([...pendingSnapshotScope(null, ["local"])], ["local"])
+  assert.deepEqual([...pendingSnapshotScope(null, [])], [])
 })

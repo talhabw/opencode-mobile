@@ -11,20 +11,6 @@ export function canAutoResume(phase: TransportPhase): boolean {
   return phase === "paused" || phase === "stopped" || phase === "reconnecting"
 }
 
-export type TransportBannerState = {
-  phase: TransportPhase
-  reconnectAttempts: number
-  reconnectVisible: boolean
-  recoveryVisible: boolean
-}
-
-export function transportBannerState(state: TransportBannerState) {
-  return {
-    showReconnect: state.reconnectVisible && (state.phase === "connecting" || state.phase === "reconnecting"),
-    showRecovery: state.recoveryVisible && state.phase === "ready",
-  }
-}
-
 export type StreamLiveSnapshot = {
   phase: TransportPhase
   reconnectVisible: boolean
@@ -48,8 +34,4 @@ export function streamLiveTransition(previous: StreamLiveSnapshot) {
     reconnectVisible: false,
     recoveryVisible: previous.reconnectVisible,
   }
-}
-
-export function isCurrentGeneration(current: number, generation: number): boolean {
-  return current === generation
 }

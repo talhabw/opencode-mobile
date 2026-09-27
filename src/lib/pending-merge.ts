@@ -106,3 +106,21 @@ export function replacePendingSessions<T extends PendingItem>(
   }
   return next
 }
+
+/**
+ * Session IDs a directory-scoped pending snapshot is authoritative for: the
+ * sessions the snapshot itself names, plus `localSessionIDs` (the cached
+ * sessions that belong to the same directory). The events store keeps pending
+ * buckets globally across directories, but `permission.list`/`form.requestList`
+ * only see the client's own directory. Replacing every bucket would wipe
+ * another project's prompts, which no later refresh on this screen would
+ * recover.
+ */
+export function pendingSnapshotScope<T extends PendingItem>(
+  snapshot: readonly T[] | null,
+  localSessionIDs: Iterable<string>,
+): Set<string> {
+  const ids = new Set(localSessionIDs)
+  for (const item of snapshot ?? []) ids.add(item.sessionID)
+  return ids
+}

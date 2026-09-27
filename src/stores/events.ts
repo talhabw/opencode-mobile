@@ -8,7 +8,7 @@ import { addBreadcrumb } from "../lib/sentry"
 import { AnalyticsEvent, track } from "../lib/analytics"
 import { recordSuccessfulSession } from "../lib/store-review"
 import { isAuthError } from "../lib/api-error"
-import { isSessionActuallyIdle } from "../lib/session-status-reconcile"
+import { isSessionActuallyIdleFromNewestFirst, changedStatusSessionIDs, reconcileRunningStatuses, staleRunningSessionIDs, type SessionStatus } from "../lib/session-status-reconcile"
 import { eventSessionID, mergeSendingState, reconnectDelay, resyncPlan, shouldRefreshCanonicalMessages } from "../lib/event-reconcile"
 import { canAutoResume, streamLiveTransition } from "../lib/transport-lifecycle"
 import type { TransportPhase } from "../lib/transport-lifecycle"
@@ -18,12 +18,11 @@ import {
   isQuestionForm,
   type PendingInput,
 } from "../lib/question-inputs"
-import { reconcilePendingSource, replacePendingSessions } from "../lib/pending-merge"
+import { pendingSnapshotScope, reconcilePendingSource, replacePendingSessions } from "../lib/pending-merge"
 import { descendantIDs, findCachedSession } from "../lib/session-hierarchy"
 import { LatestValueBuffer } from "../lib/latest-value-buffer"
+import { isDurableHistoryEvent, isRunCompletion, retryFromScheduled } from "./session-events"
 
-// Session status from the server
-type SessionStatus = { type: "idle" } | { type: "busy" } | { type: "retry"; attempt: number; message: string }
 type PendingPermission = Awaited<ReturnType<Client["permission"]["list"]>>[number]
 
 interface EventsState {
@@ -93,9 +92,8 @@ const PROLONGED_DISCONNECT_MS = 30_000
 // Re-fetch pending permissions and question forms from the server for a
 // session. Called when entering a session to recover from missed SSE events or
 // failed optimistic removals. Permissions and forms are fetched independently:
-// a failure in one source never blocks the other (the beta has no question
-// API — question-kind forms are the only question source, and this is what a
-// refresh recovers), and a successful source still reconciles its own bucket.
+// a failure in one source never blocks the other, and a successful source
+// still reconciles its own bucket.
 // Snapshot application is race-safe: a request that arrived over SSE while the
 // fetch was in flight is preserved, never clobbered by the older snapshot.
 export async function refreshPending(client: Client, sessionID: string) {
@@ -157,63 +155,119 @@ function cachedSession(sessionID: string): Session | undefined {
   return findCachedSession(sessionID, state.sessions, state.childrenByParent, state.currentSession)
 }
 
-async function authoritativeResync(client: Client, isCurrent: () => boolean) {
-  if (!isCurrent()) return
+// IDs of cached sessions that belong to the active connection's directory.
+// The reconnect resync's pending snapshot is fetched through that
+// directory-scoped client, so those are the buckets it is allowed to replace.
+// An unscoped connection (`directory` undefined) sees every directory, but
+// still only names the sessions the snapshot actually returned plus the
+// cached ones, so a bucket for a session this client cannot see survives.
+function activeDirectorySessionIDs(): string[] {
+  const state = useSessions.getState()
+  const activeDirectory = useConnections.getState().activeConnection?.directory
+  const cached = [
+    ...state.sessions,
+    ...Object.values(state.childrenByParent).flat(),
+    ...(state.currentSession ? [state.currentSession] : []),
+  ]
+  const ids: string[] = []
+  for (const session of cached) {
+    if (activeDirectory === undefined || session.directory === activeDirectory) ids.push(session.id)
+  }
+  return ids
+}
+
+// Returns the sessions `session.active()` confirmed as running (null when the
+// probe was skipped or failed) so the message-tail fallback below can leave
+// explicit server truth alone.
+async function authoritativeResync(client: Client, isCurrent: () => boolean): Promise<Record<string, unknown> | null> {
+  if (!isCurrent()) return null
   const sessions = useSessions.getState()
   const beforePermissions = useEvents.getState().permissions
   const beforeQuestions = useEvents.getState().questions
+  // Status map exactly before the active probe is fired. `active()` is an
+  // older snapshot than any session.status event that lands while it is in
+  // flight, so those fresher statuses (and their sending mirror) must win.
+  const statusBeforeProbe = useEvents.getState().sessionStatus
   const plan = resyncPlan(Boolean(sessions.currentSession))
   const pending = plan.pending
     ? Promise.all([listPendingPermissions(client), pendingFormInputs(client)])
     : null
-  const active = plan.active ? client.session.active() : null
+  // A failed active probe must not abort the rest of the resync: the busy
+  // resync below is the fallback that clears a stale flag when the active
+  // list is unavailable (issue #123).
+  const active = plan.active ? client.session.active().catch(() => null) : null
+  let confirmedRunning: Record<string, unknown> | null = null
   await Promise.all([
     plan.sessions ? sessions.loadSessions() : undefined,
     plan.messages ? sessions.refreshMessages() : undefined,
     pending?.then(([permissions, forms]) => {
       if (!isCurrent()) return
       const patch: Partial<Pick<EventsState, "permissions" | "questions">> = {}
+      // A directory-scoped fetch only speaks for the sessions it names and
+      // the cached sessions in that same directory. Buckets for another
+      // directory are not its to clear: without scoping, a reconnect in
+      // project A wiped the pending prompt the user had on screen from
+      // project B.
       const permissionBuckets = reconcilePendingSource({
         fetched: permissions,
         before: beforePermissions,
         current: useEvents.getState().permissions,
         resolved: resolvedPermissions,
       })
-      if (permissionBuckets !== null) patch.permissions = permissionBuckets
+      if (permissionBuckets !== null) {
+        patch.permissions = replacePendingSessions(
+          useEvents.getState().permissions,
+          permissionBuckets,
+          pendingSnapshotScope(permissions ?? [], activeDirectorySessionIDs()),
+        )
+      }
       const questionBuckets = reconcilePendingSource({
         fetched: forms,
         before: beforeQuestions,
         current: useEvents.getState().questions,
         resolved: resolvedQuestions,
       })
-      if (questionBuckets !== null) patch.questions = questionBuckets
+      if (questionBuckets !== null) {
+        patch.questions = replacePendingSessions(
+          useEvents.getState().questions,
+          questionBuckets,
+          pendingSnapshotScope(forms ?? [], activeDirectorySessionIDs()),
+        )
+      }
       if (patch.permissions || patch.questions) useEvents.setState(patch)
     }),
     active?.then((running) => {
-      if (!isCurrent()) return
-      useEvents.setState((state) => {
-        const sessionStatus = { ...state.sessionStatus }
-        for (const sessionID of Object.keys(sessionStatus)) {
-          if (!(sessionID in running) && isRunningEquivalent(sessionStatus[sessionID])) sessionStatus[sessionID] = { type: "idle" }
-        }
-        for (const sessionID of Object.keys(running)) sessionStatus[sessionID] = { type: "busy" }
-        return { sessionStatus }
-      })
-      useSessions.setState((state) => ({ sending: mergeSendingState(state.sending, running) }))
+      if (!isCurrent() || running === null) return
+      confirmedRunning = running
+      // Sessions whose status a real event replaced while the probe was in
+      // flight keep that event; the probe snapshot is older. Everything else
+      // gets the probe applied (retry statuses preserved, stale ones idle).
+      const changed = changedStatusSessionIDs(statusBeforeProbe, useEvents.getState().sessionStatus)
+      useEvents.setState((state) => ({ sessionStatus: reconcileRunningStatuses(state.sessionStatus, running, changed) }))
+      useSessions.setState((state) => ({ sending: mergeSendingState(state.sending, running, changed) }))
     }),
   ])
+  return confirmedRunning
 }
 
 function scheduleCanonicalRefresh(event: Event, isCurrent: () => boolean) {
   const sessionID = eventSessionID(event)
+  // Durable history (skill/compaction rows, a committed revert removing
+  // messages) only exists on the canonical page and never streams as parts,
+  // so its refresh must not be suppressed by the mid-run gate below.
+  const durable = isDurableHistoryEvent(event.type)
+  const refreshEvent: Event = durable
+    ? { type: event.type, properties: { ...event.properties, canonicalRefresh: true } }
+    : event
   // A run mid-flight counts as busy even while its live parts stream in.
   // Terminal events (execution succeeded/failed/interrupted, session.error)
   // are exempt from the gate — the busy -> idle transition is the
   // authoritative end-of-run refresh, so nothing is lost by skipping the
-  // redundant mid-run refreshes.
-  const busy = sessionID !== undefined &&
-    (useEvents.getState().sessionStatus[sessionID]?.type === "busy" || Boolean(useSessions.getState().sending[sessionID]))
-  if (!shouldRefreshCanonicalMessages(event, busy)) return
+  // redundant mid-run refreshes. "retry" is in-flight exactly like "busy".
+  const status = sessionID !== undefined ? useEvents.getState().sessionStatus[sessionID] : undefined
+  const busy = !durable && sessionID !== undefined &&
+    ((status !== undefined && status.type !== "idle") || Boolean(useSessions.getState().sending[sessionID]))
+  if (!shouldRefreshCanonicalMessages(refreshEvent, busy)) return
   if (!sessionID || useSessions.getState().currentSession?.id !== sessionID) return
   const previous = messageRefreshTimers.get(sessionID)
   if (previous) clearTimeout(previous)
@@ -225,7 +279,17 @@ function scheduleCanonicalRefresh(event: Event, isCurrent: () => boolean) {
 }
 
 function scheduleSessionRefresh(type: string, isCurrent: () => boolean) {
-  if (!["session.created", "session.renamed", "session.moved", "session.deleted"].includes(type)) return
+  // Metadata/permission changes come from other clients and only exist on the
+  // canonical session list/info; without the refresh the list stays stale
+  // until a manual reload.
+  if (![
+    "session.created",
+    "session.renamed",
+    "session.moved",
+    "session.deleted",
+    "session.metadata.updated",
+    "session.permissions",
+  ].includes(type)) return
   if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
   sessionRefreshTimer = setTimeout(() => {
     sessionRefreshTimer = null
@@ -251,13 +315,6 @@ const isSession = (input: unknown): input is Session =>
 const isPermission = (input: unknown): input is PendingPermission =>
   Boolean(input && typeof input === "object" && "id" in input && typeof input.id === "string" && "sessionID" in input && typeof input.sessionID === "string" && "permission" in input && typeof input.permission === "string" && "patterns" in input && Array.isArray(input.patterns))
 
-// Running-equivalent statuses worth resyncing. "retry" (the server is
-// automatically retrying a failed step) is still in-flight exactly like
-// "busy", and strands the same way when its terminal session.status lands
-// during an outage — so both count as stale-running for the resync.
-const isRunningEquivalent = (status: SessionStatus | undefined): boolean =>
-  status !== undefined && (status.type === "busy" || status.type === "retry")
-
 // Re-sync any session currently marked busy/retry against the server after an
 // SSE reconnect. sessionStatus/sending are SSE-driven and there is normally
 // no other path to idle — if the server's busy -> idle `session.status`
@@ -268,19 +325,23 @@ const isRunningEquivalent = (status: SessionStatus | undefined): boolean =>
 //
 // Only ever CLEARS a running-equivalent flag the server confirms is stale via
 // isSessionActuallyIdle — it never marks a session busy, so it can't
-// clobber a genuinely still-busy session. Also re-checks sessionStatus right
-// before writing, so a real session.status event that lands while the fetch
-// is in flight (e.g. the session went busy again) wins over this resync.
-async function resyncBusySessions(isCurrent: () => boolean) {
+// clobber a genuinely still-busy session. Sessions the active probe just
+// confirmed as running are skipped outright: the message-tail heuristic must
+// not override explicit server truth. A real session.status event that lands
+// while the fetch is in flight (e.g. the session went busy again) also wins
+// over this resync via the status identity check.
+async function resyncBusySessions(isCurrent: () => boolean, confirmedRunning: Record<string, unknown> | null) {
   if (!isCurrent()) return
-  const runningEquivalentIDs = Object.entries(useEvents.getState().sessionStatus)
-    .filter(([, status]) => isRunningEquivalent(status))
-    .map(([sessionID]) => sessionID)
+  const runningEquivalentIDs = staleRunningSessionIDs(useEvents.getState().sessionStatus, confirmedRunning)
   if (runningEquivalentIDs.length === 0) return
 
   await Promise.all(
     runningEquivalentIDs.map(async (sessionID) => {
       if (!isCurrent()) return
+      // Captured before the fetch: any later status write (retry → busy,
+      // busy → retry, idle → busy) replaces this object, even when both
+      // values are running-equivalent.
+      const statusBefore = useEvents.getState().sessionStatus[sessionID]
       try {
         const sessionsState = useSessions.getState()
         const session =
@@ -292,14 +353,17 @@ async function resyncBusySessions(isCurrent: () => boolean) {
           : connState.client
         if (!client) return
 
-        const response = await client.session.messages(sessionID)
-        const messages = (response || []).map((m) => m.info)
-        if (!isSessionActuallyIdle(messages)) return // server says still running - leave it alone
+        // The newest page, not the oldest: `messages()` is ascending and pages,
+        // so on a session longer than one server page its last item is an old
+        // completed reply — reading that as the live tail would clear a
+        // genuinely running session on every reconnect.
+        const page = await client.session.messagePage(sessionID, { limit: 1, order: "desc" })
+        if (!isSessionActuallyIdleFromNewestFirst(page.data.map((item) => item.info))) return // server says still running - leave it alone
 
         // A fresh session.status event may have landed on the SSE stream
         // while this fetch was in flight — that's authoritative, don't
         // stomp on it.
-        if (!isCurrent() || !isRunningEquivalent(useEvents.getState().sessionStatus[sessionID])) return
+        if (!isCurrent() || useEvents.getState().sessionStatus[sessionID] !== statusBefore) return
 
         useEvents.setState((state) => ({
           sessionStatus: { ...state.sessionStatus, [sessionID]: { type: "idle" } },
@@ -367,8 +431,8 @@ export const useEvents = create<EventsState>((set, get) => ({
         if (transition) set(transition)
         if (!resynced) {
           resynced = true
-          void authoritativeResync(client, () => generation === streamGeneration && !currentController.signal.aborted).then(() => {
-            if (generation === streamGeneration) return resyncBusySessions(() => generation === streamGeneration && !currentController.signal.aborted)
+          void authoritativeResync(client, () => generation === streamGeneration && !currentController.signal.aborted).then((confirmedRunning) => {
+            if (generation === streamGeneration) return resyncBusySessions(() => generation === streamGeneration && !currentController.signal.aborted, confirmedRunning)
           }).catch((error) => {
             console.warn("[Events] Failed authoritative resync:", error)
           })
@@ -438,14 +502,38 @@ export const useEvents = create<EventsState>((set, get) => ({
           scheduleSessionRefresh(type, () => generation === streamGeneration && !currentController.signal.aborted)
 
           switch (type) {
+            case "session.retry.scheduled": {
+              const retry = retryFromScheduled(props)
+              if (!retry) break
+              // The run is still in flight — swap the status to the retry
+              // attempt so the status bar shows "Retrying (attempt N)"
+              // instead of a stale working label. This never runs the
+              // busy -> idle completion path (no notification, no review
+              // credit): a retry is not a completed response.
+              set((state) => ({
+                sessionStatus: { ...state.sessionStatus, [retry.sessionID]: retry.status },
+              }))
+              // Retrying is running: keep the stop control available even if
+              // this client never saw the original busy transition.
+              useSessions.setState((state) => ({
+                sending: { ...state.sending, [retry.sessionID]: true },
+              }))
+              break
+            }
+
             case "session.status": {
               const sessionID = value(props, "sessionID", isString)
               const status = value(props, "status", isSessionStatus)
               if (!sessionID || !status) break
 
-              // Detect busy → idle transition for completion notification
+              // Detect the run's finishing transition for the completion
+              // notification. "retry" (the server is re-attempting a failed
+              // step) is in-flight exactly like "busy", so a run that
+              // recovered after retries still completes here — otherwise a
+              // retried run would silently lose its completion notification
+              // and review credit.
               const previous = get().sessionStatus[sessionID]
-              const completed = previous?.type === "busy" && status.type === "idle"
+              const completed = isRunCompletion(previous, status)
 
               // A new run starts — forget any error/abort from the previous one
               if (status.type === "busy") {
@@ -459,7 +547,11 @@ export const useEvents = create<EventsState>((set, get) => ({
                 statusText: status.type === "idle" ? { ...state.statusText, [sessionID]: "" } : state.statusText,
               }))
 
-              // SSE is the source of truth — update sending state unconditionally
+              // SSE is the source of truth — mirror the run into `sending`, the
+              // flag the screen's stop control reads. Setting it for busy/retry
+              // makes a run this client did not start (another client, a cold
+              // app start) stoppable, and keeps a re-entry into a running
+              // session from clearing the stop while the run is still going.
               if (status.type === "idle") {
                 useSessions.setState((state) => ({
                   sending: { ...state.sending, [sessionID]: false },
@@ -469,6 +561,10 @@ export const useEvents = create<EventsState>((set, get) => ({
                 if (sessions.currentSession?.id === sessionID) {
                   sessions.refreshMessages()
                 }
+              } else {
+                useSessions.setState((state) => ({
+                  sending: { ...state.sending, [sessionID]: true },
+                }))
               }
 
               if (completed) {
@@ -531,10 +627,13 @@ export const useEvents = create<EventsState>((set, get) => ({
               break
             }
 
-            case "session.updated": {
-              const info = value(props, "info", isSession)
-              if (!info) break
-              useSessions.getState().handleEvent({ type, properties: { info } })
+            case "session.metadata.updated":
+            case "session.permissions": {
+              // Released v2 emits these instead of a general `session.updated`
+              // (which no protocol version carries on the stream). The store
+              // merges the latest metadata/ruleset into the cached session;
+              // scheduleSessionRefresh above also queues the list refresh.
+              useSessions.getState().handleEvent({ type, properties: props })
               break
             }
 
@@ -562,6 +661,16 @@ export const useEvents = create<EventsState>((set, get) => ({
             case "session.moved": {
               const sessionID = value(props, "sessionID", isString)
               if (!sessionID) break
+              useSessions.getState().handleEvent({ type, properties: props })
+              break
+            }
+
+            case "session.revert.staged":
+            case "session.revert.cleared":
+            case "session.revert.committed": {
+              // The session store applies the pending-revert state (and drops
+              // reverted history on commit); scheduleCanonicalRefresh above
+              // already queued a page refresh for the committed case.
               useSessions.getState().handleEvent({ type, properties: props })
               break
             }

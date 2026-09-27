@@ -40,7 +40,7 @@ export default function EditConnectionScreen() {
   const isDark = colorScheme === "dark"
   const { t } = useTranslation()
 
-  const { connections, updateConnection, removeConnection, testConnection } = useConnections()
+  const { connections, updateConnection, removeConnection, testConnection, getConnectionPassword } = useConnections()
 
   const connection = connections.find((c) => c.id === id)
 
@@ -82,6 +82,11 @@ export default function EditConnectionScreen() {
     }
 
     setIsTesting(true)
+    // The password field loads blank (saved passwords are never read back), so
+    // a blank field means "test with the saved password" — the same rule Save
+    // uses. Without this, Test Connection sent no Authorization header and
+    // reported 401 for a server the saved connection could actually reach.
+    const effectivePassword = password || (await getConnectionPassword(connection.id)) || undefined
     const result = await testConnection(
       {
         id: connection.id,
@@ -92,7 +97,7 @@ export default function EditConnectionScreen() {
         username: username.trim() || undefined,
       },
       "edit_test",
-      password || undefined,
+      effectivePassword,
     )
 
     if (result.ok) {
@@ -102,7 +107,7 @@ export default function EditConnectionScreen() {
     }
 
     // Failed: run active diagnostics, capture to Sentry, offer a shareable report.
-    const report = await probeConnection(url.trim(), buildAuth(username, password))
+    const report = await probeConnection(url.trim(), buildAuth(username, effectivePassword))
     captureDiagnostic(report)
     setIsTesting(false)
 

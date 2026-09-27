@@ -1,22 +1,10 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import type { Session } from "./sdk.ts"
-import { childCountsFromSessions, decrementChildCount, descendantIDs, flattenSessionHierarchy, incrementChildCount, mergePendingRequests, pendingSessionCounts, purgeSessionHierarchy, unassociatedDescendantPending, upsertSessionHierarchy } from "./session-hierarchy.ts"
+import { childCountsFromSessions, decrementChildCount, descendantIDs, incrementChildCount, mergePendingRequests, pendingSessionCounts, purgeSessionHierarchy, unassociatedDescendantPending, upsertSessionHierarchy } from "./session-hierarchy.ts"
 
 const session = (id: string, parentID?: string): Session => ({
   id, slug: id, projectID: "p", directory: "/work", parentID, title: id, version: "2", time: { created: 1, updated: 1 },
-})
-
-test("flattens only expanded descendants at the correct depth", () => {
-  const root = session("root")
-  const child = session("child", "root")
-  const sibling = session("sibling", "root")
-  const grandchild = session("grandchild", "child")
-  const children = { root: [child, sibling], child: [grandchild] }
-  assert.deepEqual(flattenSessionHierarchy([root], children, new Set()), [{ session: root, depth: 0 }])
-  assert.deepEqual(flattenSessionHierarchy([root], children, new Set(["root", "child"])), [
-    { session: root, depth: 0 }, { session: child, depth: 1 }, { session: grandchild, depth: 2 }, { session: sibling, depth: 1 },
-  ])
 })
 
 test("recursive deletion discovers cached descendants", () => {
@@ -34,6 +22,35 @@ test("routes roots and children and moves updates between hierarchy caches", () 
   cache = upsertSessionHierarchy(cache.roots, cache.childrenByParent, { ...child, parentID: undefined })
   assert.deepEqual(cache.roots.map((item) => item.id), ["child", "root"])
   assert.deepEqual(cache.childrenByParent.root, [])
+})
+
+test("updates an existing root in place instead of reordering the list", () => {
+  const a = session("a")
+  const b = session("b")
+  const c = session("c")
+  const renamed = { ...b, title: "renamed" }
+  const result = upsertSessionHierarchy([a, b, c], {}, renamed)
+  assert.deepEqual(result.roots, [a, renamed, c])
+  // A metadata/selection update on the tail must not yank it to the top.
+  const tail = upsertSessionHierarchy(result.roots, result.childrenByParent, { ...c, title: "tail" })
+  assert.deepEqual(tail.roots.map((item) => item.id), ["a", "b", "c"])
+})
+
+test("updates an existing child in place instead of reordering siblings", () => {
+  const x = session("x", "p")
+  const y = session("y", "p")
+  const z = session("z", "p")
+  const renamed = { ...y, title: "renamed" }
+  const result = upsertSessionHierarchy([], { p: [x, y, z] }, renamed)
+  assert.deepEqual(result.childrenByParent.p, [x, renamed, z])
+})
+
+test("a moved session leaves its old bucket and leads its new one", () => {
+  const child = session("child", "old")
+  const sibling = session("sibling", "new")
+  const result = upsertSessionHierarchy([], { old: [child], new: [sibling] }, { ...child, parentID: "new" })
+  assert.deepEqual(result.childrenByParent.old, [])
+  assert.deepEqual(result.childrenByParent.new.map((item) => item.id), ["child", "sibling"])
 })
 
 test("counts own and nested descendant pending requests without double counting", () => {

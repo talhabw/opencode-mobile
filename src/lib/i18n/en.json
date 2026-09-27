@@ -12,6 +12,7 @@
   "settings": {
     "sections": {
       "security": "Security",
+      "permissions": "Saved Approvals",
       "notifications": "Notifications",
       "privacy": "Privacy",
       "about": "About"
@@ -33,6 +34,15 @@
     },
     "notifications": {
       "disabledNotice": "Notifications are disabled at the system level. Enable them in Settings to receive alerts."
+    },
+    "savedPermissions": {
+      "description": "Tools you approved with \"Always\" are remembered for this project. Remove approvals you no longer want.",
+      "empty": "No saved approvals for this project.",
+      "removeConfirmTitle": "Remove saved approval?",
+      "removeConfirmMessage": "{{action}}: {{resource}} will ask for approval again.",
+      "removeFailedTitle": "Could not remove approval",
+      "removeFailedMessage": "The saved approval was not removed. Try again.",
+      "removeAccessibility": "Remove saved approval for {{action}} on {{resource}}"
     },
     "privacy": {
       "crashReporting": {
@@ -109,6 +119,10 @@
       "hint": "Type / for commands"
     },
     "loadingOlder": "Loading older messages...",
+    "loadFailed": {
+      "title": "Session not loaded",
+      "message": "This session could not be loaded. Check your connection and try again."
+    },
     "input": {
       "placeholderListening": "Listening...",
       "placeholderFollowUp": "Send a follow-up...",
@@ -126,6 +140,8 @@
       "revertAuthFailedMessage": "Your server credentials were rejected. Check your connection and try again.",
       "editFailedTitle": "Edit failed",
       "editFailedMessage": "Could not revert to this message. Please try again.",
+      "undoFailedTitle": "Couldn't undo",
+      "undoFailedMessage": "The revert was not cleared. Check your connection and try again.",
       "replaceDraftTitle": "Replace draft?",
       "replaceDraftMessage": "You have an unsent message in the composer. Editing this message will replace it.",
       "cameraPermissionTitle": "Permission needed",
@@ -134,6 +150,8 @@
       "emptyClipboardMessage": "Clipboard does not contain text or an image.",
       "authRequiredTitle": "Authentication required",
       "authRequiredMessage": "Biometric authentication is required to send. Please try again.",
+      "sessionNotReadyTitle": "Session not ready",
+      "sessionNotReadyMessage": "This session is still loading. Wait for it to finish and try again.",
       "sendFailedTitle": "Message not sent",
       "sendFailedMessage": "Could not send your message. Check your connection and try again.",
       "replyFailedTitle": "Reply Failed",
@@ -411,6 +429,7 @@
       "title": "Permission Required",
       "deny": "Deny",
       "always": "Always",
+      "alwaysSaves": "Saves for this project: {{patterns}}",
       "allow": "Allow"
     },
     "questionPrompt": {

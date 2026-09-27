@@ -9,7 +9,6 @@ interface Props {
   sheetRef: React.RefObject<BottomSheet | null>
   current?: string
   recents: string[]
-  serverHome: string | null
   isDark: boolean
   onSwitch: (directory?: string) => void
   // Opens a browsable folder picker rooted at the server's filesystem, as an
@@ -17,7 +16,7 @@ interface Props {
   onBrowse?: () => void
 }
 
-export function DirectorySwitcher({ sheetRef, current, recents, serverHome, isDark, onSwitch, onBrowse }: Props) {
+export function DirectorySwitcher({ sheetRef, current, recents, isDark, onSwitch, onBrowse }: Props) {
   const { t } = useTranslation()
   const acc = useAccent()
   const s = makeStyles(acc)
@@ -90,14 +89,10 @@ export function DirectorySwitcher({ sheetRef, current, recents, serverHome, isDa
       <View style={s.inputWrap}>
         <BottomSheetTextInput
           style={[s.input, isDark && s.inputDark]}
-          placeholder={serverHome ? `${serverHome}/...` : "/path/to/project"}
+          placeholder="/path/to/project"
           placeholderTextColor={isDark ? "#666666" : "#999999"}
           value={custom}
-          onChangeText={(text) => {
-            if (serverHome && text === "~") setCustom(serverHome)
-            else if (serverHome && text.startsWith("~/")) setCustom(serverHome + text.slice(1))
-            else setCustom(text)
-          }}
+          onChangeText={setCustom}
           onSubmitEditing={handleCustomSubmit}
           returnKeyType="go"
           autoCapitalize="none"
@@ -111,30 +106,18 @@ export function DirectorySwitcher({ sheetRef, current, recents, serverHome, isDa
       </View>
 
       {/* Quick path chips */}
-      {(serverHome || onBrowse) && (
+      {onBrowse && (
         <View style={s.chips}>
-          {serverHome && (
-            <>
-              <TouchableOpacity style={[s.chip, isDark && s.chipDark]} onPress={() => setCustom(serverHome)}>
-                <Text style={[s.chipText, isDark && s.chipTextDark]}>~</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={[s.chip, isDark && s.chipDark]} onPress={() => setCustom(serverHome + "/")}>
-                <Text style={[s.chipText, isDark && s.chipTextDark]}>~/</Text>
-              </TouchableOpacity>
-            </>
-          )}
-          {onBrowse && (
-            <TouchableOpacity
-              style={[s.chip, s.chipBrowse, isDark && s.chipDark]}
-              onPress={() => {
-                sheetRef.current?.close()
-                onBrowse()
-              }}
-            >
-              <Ionicons name="folder-open-outline" size={14} color={acc.cur.primary} />
-              <Text style={[s.chipText, isDark && s.chipTextDark]}>{t("chat.directorySwitcher.browseLabel")}</Text>
-            </TouchableOpacity>
-          )}
+          <TouchableOpacity
+            style={[s.chip, s.chipBrowse, isDark && s.chipDark]}
+            onPress={() => {
+              sheetRef.current?.close()
+              onBrowse()
+            }}
+          >
+            <Ionicons name="folder-open-outline" size={14} color={acc.cur.primary} />
+            <Text style={[s.chipText, isDark && s.chipTextDark]}>{t("chat.directorySwitcher.browseLabel")}</Text>
+          </TouchableOpacity>
         </View>
       )}
 

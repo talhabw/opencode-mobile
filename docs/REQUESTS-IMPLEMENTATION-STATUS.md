@@ -1,5 +1,7 @@
 # OpenCode Mobile Requests Implementation Status
 
+> Historical August status snapshot. Some API/fixture descriptions below predate the released-v2-only migration; see [the current review](V2-REVIEW-2026-09-27.md).
+
 Date: 2026-08-14
 Source: `requests.md`, plan: `docs/REQUESTS-IMPLEMENTATION-PLAN.md`
 

@@ -1,7 +1,7 @@
-// Hermes lacks Promise.withResolvers; @opencode-ai/client's SSE stream needs
-// it. Install the fallback before the SDK module is evaluated.
+// Hermes lacks Promise.withResolvers; @opencode/client's shared event stream
+// needs it. Install the fallback before the SDK module is evaluated.
 import "./promise-with-resolvers"
-import { OpenCode, type OpenCodeClient } from "@opencode-ai/client"
+import { OpenCode, type OpenCodeClient } from "@opencode/client"
 import { fetch as expoFetch } from "expo/fetch"
 import { buildRequestHeaders } from "./headers"
 import { normalizeFetchInput } from "./fetch-input.ts"
@@ -15,6 +15,7 @@ import {
   normalizeProviderCatalog,
   normalizeSession,
   V2EventAdapter,
+  V2_REQUIRED_ERROR,
   type Agent,
   type Command,
   type Event,
@@ -25,20 +26,16 @@ import {
   type Project,
   type ProviderCatalog,
   type Session,
-  isV2HealthResponse,
-  v2HealthError,
 } from "./protocol-v2"
-import type { FileRoot } from "./file-roots"
 import { promptRequest, selectedModel, type PromptPartInput } from "./session-request.ts"
 
 export { ApiAuthError, isAuthError }
-export { V2_REQUIRED_ERROR } from "./protocol-v2"
+export { V2_REQUIRED_ERROR }
 export type { Agent, Command, Event, FileEntry, Message, MessageWithParts, Part, Project, ProviderCatalog, Session }
 
 export interface ClientConfig {
   baseUrl: string
   directory?: string
-  workspace?: string
   auth?: { username: string; password: string }
 }
 
@@ -64,8 +61,7 @@ export class ApiError extends Error {
 const DEFAULT_TIMEOUT_MS = 30_000
 
 function location(config: ClientConfig) {
-  if (!config.directory && !config.workspace) return undefined
-  return { directory: config.directory, workspace: config.workspace }
+  return config.directory ? { directory: config.directory } : undefined
 }
 
 async function checked<T>(promise: Promise<T>): Promise<T> {
@@ -99,8 +95,17 @@ export function createClient(input: ClientConfig) {
   const headers = buildRequestHeaders({ auth: config.auth })
   const raw = OpenCode.make({
     baseUrl: config.baseUrl,
-    fetch: ((request, init) =>
-      expoFetch(normalizeFetchInput(request), init as Parameters<typeof expoFetch>[1])) as typeof globalThis.fetch,
+    fetch: (async (request, init) => {
+      const response = await expoFetch(normalizeFetchInput(request), init as Parameters<typeof expoFetch>[1])
+      // The generated client only classifies declared errors whose body it can
+      // JSON-parse. Normalize auth failures at the transport boundary so a
+      // plain-text 401 (or one with an unexpected body) still reaches callers
+      // as ApiAuthError instead of an unclassifiable content-type error.
+      if (response.status === 401 || response.status === 403) {
+        throw new ApiAuthError(response.status, "Authentication failed")
+      }
+      return response
+    }) as typeof globalThis.fetch,
     headers,
   })
   const scopedLocation = location(config)
@@ -133,16 +138,16 @@ export function createClient(input: ClientConfig) {
     /** Official v2 Promise client for protocol surfaces not normalized by the app. */
     protocol: raw,
     global: {
-       health: async (timeoutMs?: number): Promise<HealthResponse> => {
-         try {
-           const result = await timed((options) => raw.health.get(options), timeoutMs)
-           if (!isV2HealthResponse(result)) throw v2HealthError(result)
-           return result
-         } catch (error) {
-           if (error instanceof ApiError && error.status === 404) throw v2HealthError(error)
-           throw error
-         }
-       },
+      health: async (timeoutMs?: number): Promise<HealthResponse> => {
+        // Released v2 servers identify themselves at GET /api/info. A server
+        // without that document is not a v2 server, so surface the connection
+        // test's "v2 required" message instead of a generic parse error.
+        const info = await timed((options) => raw.server.info(options), timeoutMs)
+        if (!info || typeof info.version !== "string" || info.version.length === 0) {
+          throw new Error(V2_REQUIRED_ERROR)
+        }
+        return { healthy: true, version: info.version }
+      },
       async *events(signal?: AbortSignal): AsyncGenerator<Event> {
         const adapter = new V2EventAdapter()
         try {
@@ -158,9 +163,13 @@ export function createClient(input: ClientConfig) {
     },
     project: {
       list: async (timeoutMs?: number): Promise<Project[]> =>
-         (await timed((options) => raw.project.list(options), timeoutMs)).map(normalizeProject),
-      current: async (timeoutMs?: number): Promise<Project> =>
-        normalizeProject(await timed((options) => raw.project.current({ location: scopedLocation }, options), timeoutMs)),
+        (await timed((options) => raw.project.list(options), timeoutMs)).map(normalizeProject),
+      // Released v2 dropped /api/project/current; the location response
+      // carries the same project identity.
+      current: async (timeoutMs?: number): Promise<Project> => {
+        const result = await timed((options) => raw.location.get({ location: scopedLocation }, options), timeoutMs)
+        return normalizeProject(result.project)
+      },
     },
     file: {
       list: async (params: { path?: string } = {}): Promise<FileEntry[]> => {
@@ -176,13 +185,6 @@ export function createClient(input: ClientConfig) {
       find: async (query: string, type?: "file" | "directory") =>
         (await checked(raw.file.find({ location: scopedLocation, query, type }))).data,
       read: (path: string) => checked(raw.file.read({ location: scopedLocation, path })),
-      roots: async (): Promise<FileRoot[] | null> => null,
-    },
-    path: {
-      get: async (timeoutMs?: number) => {
-        const result = await timed((options) => raw.location.get({ location: scopedLocation }, options), timeoutMs)
-        return { home: result.directory, state: "", config: "", worktree: result.project.directory, directory: result.directory }
-      },
     },
     session: {
       page: async (
@@ -190,14 +192,13 @@ export function createClient(input: ClientConfig) {
         timeoutMs?: number,
       ): Promise<CursorPage<Session>> => {
         const response = await timed((options) => raw.session.list({
-            limit: params?.limit,
-            search: params?.search,
-            cursor: params?.cursor,
-             order: params?.cursor ? undefined : params?.order ?? "desc",
-             parentID: params?.parentID,
-            directory: config.directory,
-            workspace: config.workspace,
-          }, options), timeoutMs)
+          limit: params?.limit,
+          search: params?.search,
+          cursor: params?.cursor,
+          order: params?.cursor ? undefined : params?.order ?? "desc",
+          parentID: params?.parentID,
+          directory: config.directory,
+        }, options), timeoutMs)
         return { data: response.data.map(normalizeSession), cursor: response.cursor }
       },
       list: async (params?: { roots?: boolean; limit?: number; search?: string; cursor?: string; parentID?: string | null }, timeoutMs?: number): Promise<Session[]> => {
@@ -208,18 +209,17 @@ export function createClient(input: ClientConfig) {
           order: params?.cursor ? undefined : "desc",
           parentID: params?.parentID,
           directory: config.directory,
-          workspace: config.workspace,
         }, options), timeoutMs)
         return response.data.map(normalizeSession)
       },
       get: async (sessionID: string): Promise<Session> => normalizeSession(await checked(raw.session.get({ sessionID }))),
       create: async (params?: { title?: string }): Promise<Session> => normalizeSession(await checked(raw.session.create({
         title: params?.title,
-        location: config.directory ? { directory: config.directory, workspaceID: config.workspace } : undefined,
+        location: config.directory ? { directory: config.directory } : undefined,
       }))),
       delete: (sessionID: string) => checked(raw.session.remove({ sessionID })),
       rename: async (sessionID: string, title: string): Promise<Session> => {
-        await checked(raw.session.rename({ sessionID, title }))
+        await checked(raw.session.update({ sessionID, title }))
         return normalizeSession(await checked(raw.session.get({ sessionID })))
       },
       messagePage,
@@ -247,7 +247,7 @@ export function createClient(input: ClientConfig) {
         variant?: string
         parts?: Array<{ type: "file"; mime: string; url: string; filename?: string }>
       }): Promise<void> => {
-        // The beta command request no longer carries agent/model fields; apply
+        // The v2 command request does not carry agent/model fields; apply
         // them as session switches first so the command still runs under the
         // requested agent and model, mirroring the prompt path.
         if (params.agent) await checked(raw.session.switchAgent({ sessionID, agent: params.agent }))
@@ -257,7 +257,7 @@ export function createClient(input: ClientConfig) {
         }))
         await checked(raw.session.command({
           sessionID,
-          command: params.command,
+          name: params.command,
           text: params.arguments,
           files: params.parts?.map((part) => ({ uri: part.url, name: part.filename })),
         }))
@@ -265,7 +265,8 @@ export function createClient(input: ClientConfig) {
       switchModel: (sessionID: string, model: { providerID: string; modelID: string; variant?: string }) =>
         checked(raw.session.switchModel({ sessionID, model: { providerID: model.providerID, id: model.modelID, variant: model.variant } })),
       switchAgent: (sessionID: string, agent: string) => checked(raw.session.switchAgent({ sessionID, agent })),
-      interrupt: (sessionID: string, continueSession?: boolean) => checked(raw.session.interrupt({ sessionID, continue: continueSession })),
+      interrupt: (sessionID: string, continueSession?: boolean) =>
+        checked(raw.session.interrupt({ sessionID, resume: continueSession })),
       revert: async (sessionID: string, messageID: string): Promise<Session> => {
         await checked(raw.session.revert.stage({ sessionID, messageID }))
         return normalizeSession(await checked(raw.session.get({ sessionID })))
@@ -289,18 +290,18 @@ export function createClient(input: ClientConfig) {
       },
       reply: async (requestID: string, reply: "once" | "always" | "reject", explicitSessionID?: string) => {
         const sessionID = explicitSessionID ?? await permissionSession(requestID)
-        await checked(raw.permission.reply({ sessionID, requestID, reply }))
+        await checked(raw.permission.reply({ sessionID, requestID, decision: reply }))
         permissionSessions.delete(requestID)
         return true
       },
     },
     form: {
-      list: (sessionID: string) => checked(raw.form.list({ sessionID })),
-      requestList: async () => (await checked(raw.form.request.list({ location: scopedLocation }))).data,
+      list: (sessionID: string) => checked(raw.session.form.list({ sessionID })),
+      requestList: async () => (await checked(raw.form.list({ location: scopedLocation }))).data,
       reply: (params: { sessionID: string; formID: string; answer: Record<string, string | string[]> }) =>
-        checked(raw.form.reply({ sessionID: params.sessionID, formID: params.formID, answer: params.answer })),
+        checked(raw.session.form.reply({ sessionID: params.sessionID, formID: params.formID, answer: params.answer })),
       cancel: (params: { sessionID: string; formID: string }) =>
-        checked(raw.form.cancel({ sessionID: params.sessionID, formID: params.formID })),
+        checked(raw.session.form.cancel({ sessionID: params.sessionID, formID: params.formID })),
     },
     agent: { list: async (): Promise<Agent[]> => (await checked(raw.agent.list({ location: scopedLocation }))).data.map(normalizeAgent) },
     command: { list: async (): Promise<Command[]> => (await checked(raw.command.list({ location: scopedLocation }))).data.map(normalizeCommand) },
@@ -322,8 +323,8 @@ export function createClient(input: ClientConfig) {
     vcs: {
       get: async () => (await checked(raw.vcs.get({ location: scopedLocation }))).data,
       status: async () => (await checked(raw.vcs.status({ location: scopedLocation }))).data,
-      diff: async (mode: "working" | "branch" = "working", context?: number) =>
-        (await checked(raw.vcs.diff({ location: scopedLocation, mode, context }))).data,
+      diff: async (mode: "working" | "branch" | "committed" = "working", context?: number, base?: string) =>
+        (await checked(raw.vcs.diff({ location: scopedLocation, mode, context, base }))).data,
     },
   }
 }

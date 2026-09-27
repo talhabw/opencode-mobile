@@ -52,15 +52,18 @@ test("fromQuestionForm maps question-tool fields into the canonical view", () =>
         header: "Deploy target",
         question: "Which environment should receive the deploy?",
         options: [
-          { label: "Staging", description: "Deploy to staging first" },
-          { label: "Production" },
+          { label: "Staging", value: "Staging", description: "Deploy to staging first" },
+          { label: "Production", value: "Production" },
         ],
         custom: true,
       },
       {
         header: "Regions",
         question: "Which regions should be notified?",
-        options: [{ label: "EU", description: "Europe" }, { label: "US" }],
+        options: [
+          { label: "EU", value: "EU", description: "Europe" },
+          { label: "US", value: "US" },
+        ],
         multiple: true,
         custom: true,
       },
@@ -70,7 +73,35 @@ test("fromQuestionForm maps question-tool fields into the canonical view", () =>
     formID: "form_1",
     fieldKeys: ["q0", "q1"],
     fieldTypes: ["string", "multiselect"],
+    fieldRequired: [true, true],
   })
+})
+
+test("keeps wire option values separate from their display labels", () => {
+  const view = fromQuestionForm({
+    id: "form_values",
+    sessionID: "ses_1",
+    metadata: { kind: "question" },
+    fields: [
+      {
+        key: "env",
+        title: "Environment",
+        type: "string",
+        options: [
+          { value: "staging", label: "Staging" },
+          { value: "prod", label: "Production" },
+        ],
+      },
+      // A value-only option still renders (label falls back to the value).
+      { key: "region", type: "multiselect", options: [{ value: "eu-west" }] },
+    ],
+  })
+  assert.deepEqual(view.questions[0].options, [
+    { label: "Staging", value: "staging" },
+    { label: "Production", value: "prod" },
+  ])
+  // Displayed label is used for selection state; the wire value is answered.
+  assert.deepEqual(toFormAnswer(view, [["staging"], ["eu-west"]]), { env: "staging", region: ["eu-west"] })
 })
 
 test("isQuestionForm only accepts question-kind forms with the required wire fields", () => {
@@ -111,6 +142,7 @@ test("fromQuestionForm is defensive against malformed server data", () => {
   const view = fromQuestionForm(malformed)
   assert.deepEqual(view.fieldKeys, ["ok", "dup", "weird", "opts"])
   assert.deepEqual(view.fieldTypes, ["string", "string", "string", "multiselect"])
+  assert.deepEqual(view.fieldRequired, [true, true, true, true])
   assert.equal(view.tool, undefined)
   assert.deepEqual(view.questions, [
     { header: "Plain", question: "Plain", options: [], custom: false },
@@ -120,11 +152,28 @@ test("fromQuestionForm is defensive against malformed server data", () => {
     {
       header: "Opts",
       question: "Opts",
-      options: [{ label: "Keep", description: "kept" }],
+      options: [{ label: "Keep", value: "keep", description: "kept" }],
       multiple: true,
       custom: false,
     },
   ])
+})
+
+test("carries explicit optional fields and omits unanswered ones from the reply", () => {
+  const view = fromQuestionForm({
+    id: "form_optional",
+    sessionID: "ses_1",
+    metadata: { kind: "question" },
+    fields: [
+      { key: "required_q", title: "Required", type: "string" },
+      { key: "optional_q", title: "Optional", type: "string", required: false },
+      { key: "optional_multi", title: "Optional multi", type: "multiselect", options: [{ value: "a", label: "A" }], required: false },
+    ],
+  })
+  assert.deepEqual(view.fieldRequired, [true, false, false])
+  assert.deepEqual(view.questions.map((question) => question.required), [undefined, false, false])
+  // Unanswered optional fields are omitted; the required scalar stays empty.
+  assert.deepEqual(toFormAnswer(view, [[], [], []]), { required_q: "" })
 })
 
 test("toFormAnswer encodes scalars for string fields and arrays for multiselect", () => {

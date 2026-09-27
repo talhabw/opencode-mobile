@@ -1,7 +1,7 @@
 /**
  * Promise.withResolvers polyfill (Hermes / SDK boundary).
  *
- * The @opencode-ai/client SSE transport (shared-events.js) calls
+ * The @opencode/client shared event transport (shared-events.js) calls
  * `Promise.withResolvers()` every time it queues another read from the event
  * stream. Hermes on Android (React Native 0.81) does not implement it, so
  * every `raw.event.subscribe()` attempt throws
@@ -11,7 +11,7 @@
  *
  * This module installs a minimal, standards-compatible fallback (per
  * https://tc39.es/ecma262/#sec-promise.withresolvers) at the app/client
- * boundary: src/lib/sdk.ts imports it before @opencode-ai/client, so the
+ * boundary: src/lib/sdk.ts imports it before @opencode/client, so the
  * fallback is in place before the SDK can call it. The global mutation is
  * narrowly conditional — an existing (e.g. native) implementation is never
  * replaced.
@@ -47,6 +47,6 @@ export function installPromiseWithResolvers(): void {
 }
 
 // Install at module load. This module is imported by src/lib/sdk.ts before
-// @opencode-ai/client, so the fallback exists before the SDK evaluates (and
+// @opencode/client, so the fallback exists before the SDK evaluates (and
 // calls) Promise.withResolvers on platforms that lack it.
 installPromiseWithResolvers()

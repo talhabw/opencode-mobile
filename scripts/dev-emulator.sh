@@ -16,13 +16,17 @@
 #   OPENCODE_MOBILE_BOOT_TIMEOUT     boot wait in seconds  (default: 300)
 #   ANDROID_HOME / ANDROID_SDK_ROOT  SDK location          (fallback: ~/Android/Sdk)
 #
-# Runtime state (logs, pid) lives under /tmp/opencode-mobile-dev/.
+# Runtime state (logs, pid) lives under the same checkout-specific directory
+# as the fixture and Metro scripts:
+# ${XDG_RUNTIME_DIR:-/tmp}/opencode-mobile-dev-$UID-<checkout hash>.
 set -euo pipefail
 
+readonly ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly DEFAULT_AVD="opencode-mobile-api36"
 readonly DEFAULT_PORT="5554"
 readonly DEFAULT_TIMEOUT="300"
-readonly RUNTIME_DIR="/tmp/opencode-mobile-dev"
+readonly RUNTIME_KEY="$(printf '%s' "$ROOT_DIR" | sha256sum | cut -c1-12)"
+readonly RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/opencode-mobile-dev-$UID-$RUNTIME_KEY"
 
 AVD="${OPENCODE_MOBILE_AVD:-$DEFAULT_AVD}"
 PORT="${OPENCODE_MOBILE_EMULATOR_PORT:-$DEFAULT_PORT}"
@@ -56,7 +60,7 @@ Environment overrides:
   OPENCODE_MOBILE_BOOT_TIMEOUT     boot wait in seconds  (default: 300)
   ANDROID_HOME / ANDROID_SDK_ROOT  SDK location          (fallback: ~/Android/Sdk)
 
-Runtime state: /tmp/opencode-mobile-dev/
+Runtime state: ${XDG_RUNTIME_DIR:-/tmp}/opencode-mobile-dev-$UID-<checkout hash>/
 EOF
 }
 

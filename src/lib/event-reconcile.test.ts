@@ -14,6 +14,20 @@ test("resync merges sending and active sessions without iterator helpers", () =>
   )
 })
 
+test("sending merge keeps sessions a fresher event replaced during the probe", () => {
+  // s1's status changed while the active probe was in flight: its local
+  // sending value wins over the probe snapshot. s2's did not, so the probe
+  // decides.
+  assert.deepEqual(
+    mergeSendingState({ s1: false, s2: true }, { s2: {} }, new Set(["s1"])),
+    { s1: false, s2: true },
+  )
+  assert.deepEqual(
+    mergeSendingState({ s1: false, s2: true }, { s1: {} }, new Set()),
+    { s1: true, s2: false },
+  )
+})
+
 test("reconnect delay is bounded and deterministic at jitter midpoint", () => {
   assert.equal(reconnectDelay(1), 1000)
   assert.equal(reconnectDelay(99, 1), 15000)

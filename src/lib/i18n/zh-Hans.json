@@ -12,6 +12,7 @@
   "settings": {
     "sections": {
       "security": "安全",
+      "permissions": "已保存的授权",
       "notifications": "通知",
       "privacy": "隐私",
       "about": "关于"
@@ -33,6 +34,15 @@
     },
     "notifications": {
       "disabledNotice": "通知已在系统层面关闭。请在系统设置中启用通知以接收提醒。"
+    },
+    "savedPermissions": {
+      "description": "使用“始终允许”批准的工具会按项目记住。可移除不再需要的授权。",
+      "empty": "此项目暂无已保存的授权。",
+      "removeConfirmTitle": "移除已保存的授权？",
+      "removeConfirmMessage": "{{action}}：{{resource}} 将再次请求授权。",
+      "removeFailedTitle": "无法移除授权",
+      "removeFailedMessage": "已保存的授权未能移除，请重试。",
+      "removeAccessibility": "移除 {{action}} 在 {{resource}} 上的已保存授权"
     },
     "privacy": {
       "crashReporting": {
@@ -109,6 +119,10 @@
       "hint": "输入 / 使用命令"
     },
     "loadingOlder": "正在加载更早的消息...",
+    "loadFailed": {
+      "title": "会话未加载",
+      "message": "无法加载此会话。请检查连接后重试。"
+    },
     "input": {
       "placeholderListening": "正在聆听...",
       "placeholderFollowUp": "发送后续消息...",
@@ -126,6 +140,8 @@
       "revertAuthFailedMessage": "您的服务器凭据被拒绝。请检查连接后重试。",
       "editFailedTitle": "编辑失败",
       "editFailedMessage": "无法撤回到该消息。请重试。",
+      "undoFailedTitle": "撤销失败",
+      "undoFailedMessage": "未能清除撤回状态。请检查连接后重试。",
       "replaceDraftTitle": "替换草稿？",
       "replaceDraftMessage": "输入框中有未发送的消息。编辑此消息将替换它。",
       "cameraPermissionTitle": "需要权限",
@@ -134,6 +150,8 @@
       "emptyClipboardMessage": "剪贴板中没有文本或图片。",
       "authRequiredTitle": "需要身份验证",
       "authRequiredMessage": "发送消息需要生物识别验证。请重试。",
+      "sessionNotReadyTitle": "会话未就绪",
+      "sessionNotReadyMessage": "此会话仍在加载中。请等待加载完成后再试。",
       "sendFailedTitle": "消息未发送",
       "sendFailedMessage": "无法发送您的消息。请检查连接后重试。",
       "replyFailedTitle": "回复失败",
@@ -411,6 +429,7 @@
       "title": "需要权限",
       "deny": "拒绝",
       "always": "始终允许",
+      "alwaysSaves": "为此项目保存批准：{{patterns}}",
       "allow": "允许"
     },
     "questionPrompt": {

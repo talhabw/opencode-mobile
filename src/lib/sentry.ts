@@ -146,10 +146,6 @@ function toError(value: unknown): Error {
   }
 }
 
-// --- Scrubbing (pure functions live in ./scrub for testability) ----------
-
-export { scrubUrl } from "./scrub"
-
 // --- Helpers exposed to the rest of the app ------------------------------
 
 export type Breadcrumb = {

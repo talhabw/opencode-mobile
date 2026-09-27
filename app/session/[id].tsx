@@ -56,6 +56,8 @@ import { selectorLabel } from "../../src/lib/selection-ui"
 import { findCachedSession, unassociatedDescendantPending } from "../../src/lib/session-hierarchy"
 import { taskSubagentLink } from "../../src/lib/task-subagent"
 import { toFormAnswer, type PendingInput } from "../../src/lib/question-inputs"
+import { isComposerSessionReady, sameComposerDraft, type ComposerDraft } from "../../src/components/chat/session-composer"
+import { restoreFailedPermission, type PermissionReply } from "../../src/components/chat/permission-prompt"
 
 // Header title marquee. When the session title overflows the header title
 // area it scrolls, but never continuously: it slides left, returns, pauses a
@@ -141,11 +143,14 @@ function MarqueeTitle({ text, budget = 0 }: { text: string; budget?: number }) {
 
 
 // --- Builtin slash commands ---
+// Descriptions must match what selecting the command actually does: /new
+// leaves this screen (the session list is where a new session starts), and
+// /model and /agent open their pickers — neither cycles anything.
 const BUILTIN_COMMANDS: SlashCommand[] = [
   {
     trigger: "new",
     title: "New Session",
-    description: "Start a new session",
+    description: "Back to the session list",
     icon: "add-circle-outline",
     type: "builtin",
   },
@@ -159,7 +164,7 @@ const BUILTIN_COMMANDS: SlashCommand[] = [
   {
     trigger: "agent",
     title: "Switch Agent",
-    description: "Cycle to next agent",
+    description: "Choose a different agent",
     icon: "person-outline",
     type: "builtin",
   },
@@ -173,6 +178,11 @@ function getShortDir(dir?: string): string | null {
 
 export default function SessionScreen() {
   const { id, directory } = useLocalSearchParams<{ id: string; directory?: string }>()
+  // The session this screen was opened for. Everything that talks to the
+  // server must resolve against this, never against whatever session the
+  // single global store happens to have selected (see isComposerSessionReady).
+  const routeSessionID = typeof id === "string" && id.length > 0 ? id : undefined
+  const routeDirectory = typeof directory === "string" && directory.length > 0 ? directory : undefined
   const router = useRouter()
   const colorScheme = useColorScheme()
   const isDark = colorScheme === "dark"
@@ -189,6 +199,9 @@ export default function SessionScreen() {
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [showInfo, setShowInfo] = useState(false)
   const [headerRightW, setHeaderRightW] = useState(0)
+  // Set as soon as the focus effect starts selecting the route session, so the
+  // brief first frame (before the effect) never renders the load-failure view.
+  const [selectionAttempted, setSelectionAttempted] = useState(false)
 
   const {
     currentSession,
@@ -203,12 +216,20 @@ export default function SessionScreen() {
     loadOlderMessages,
     revertToMessage,
     unrevertSession,
+    commitPendingRevert,
     sessions,
     childrenByParent,
   } = useSessions()
 
+  // The store holds one global selection while screens stay mounted below
+  // pushed ones. These two flags bind this screen's UI and actions to its own
+  // route session: `sessionBound` for anything that reads session data, and
+  // `composerReady` for anything that writes (sends, replies, aborts).
+  const sessionBound = !!routeSessionID && currentSession?.id === routeSessionID
+  const composerReady = isComposerSessionReady(routeSessionID, currentSession?.id, isSessionLoading)
+
   // Derive sending state for this specific session
-  const isSending = useSessions((s) => !!(currentSession && s.sending[currentSession.id]))
+  const isSending = useSessions((s) => !!(routeSessionID && s.sending[routeSessionID]))
 
   const { authenticateForMessage } = useAuth()
   const { client, clientForDirectory } = useConnections()
@@ -216,10 +237,15 @@ export default function SessionScreen() {
   // Message font scale (percentage, e.g. 120 = 120%); applied to every chat font size
   const fontScale = useSettings((s) => s.fontSize)
 
-  // Use directory-aware client for sessions that belong to a project other than the active one
+  // Use directory-aware client for the session this screen was opened for. The
+  // route param is authoritative (every in-app navigation supplies it); the
+  // store binding is only a fallback. Never derive it from a currently
+  // selected session that does not match the route — that is how a composer
+  // send or permission reply could reach another project's server.
+  const sessionDirectory = routeDirectory ?? (sessionBound ? currentSession?.directory : undefined)
   const sessionClient = useMemo(
-    () => (currentSession?.directory ? (clientForDirectory(currentSession.directory) ?? client) : client),
-    [currentSession?.directory, clientForDirectory, client],
+    () => (sessionDirectory ? (clientForDirectory(sessionDirectory) ?? client) : client),
+    [sessionDirectory, clientForDirectory, client],
   )
 
   // Catalog
@@ -238,14 +264,20 @@ export default function SessionScreen() {
   const pickerAgents = catalogReady ? agents : []
   const pickerProviders = catalogReady ? providers : []
 
-  // Permission & question state
-  const sessionID = currentSession?.id
+  // Permission & question state. Keyed by the route session so prompts for
+  // the session this screen shows are never confused with a previously
+  // selected session's prompts while a cold load is in flight.
+  const sessionID = routeSessionID
   const permissions = useEvents((s) => (sessionID ? s.permissions[sessionID] : undefined)) || []
   const questions = useEvents((s) => (sessionID ? s.questions[sessionID] : undefined)) || []
   const allPermissions = useEvents((s) => s.permissions)
   const allQuestions = useEvents((s) => s.questions)
+  // In-thread subagent links are only meaningful once this screen owns the
+  // store selection; `parts` belongs to the previously selected session until
+  // the cold load lands, and could otherwise suppress a descendant fallback.
   const associatedChildIDs = useMemo(() => {
     const ids = new Set<string>()
+    if (!sessionBound) return ids
     for (const sessionParts of Object.values(parts)) {
       for (const part of sessionParts) {
         const link = taskSubagentLink(part)
@@ -253,18 +285,18 @@ export default function SessionScreen() {
       }
     }
     return ids
-  }, [parts])
+  }, [parts, sessionBound])
   const fallbackQuestions = useMemo(
-    () => sessionID ? unassociatedDescendantPending(sessionID, childrenByParent, allQuestions, associatedChildIDs) : [],
-    [sessionID, childrenByParent, allQuestions, associatedChildIDs],
+    () => sessionBound && sessionID ? unassociatedDescendantPending(sessionID, childrenByParent, allQuestions, associatedChildIDs) : [],
+    [sessionBound, sessionID, childrenByParent, allQuestions, associatedChildIDs],
   )
   // Descendant permission prompts get the same fallback treatment as descendant
   // questions: a child's pending permission is only actionable in that child's
   // session, so surface a navigation row here when the child row is not already
   // associated in-thread. Own-session permissions keep the direct prompt.
   const fallbackPermissions = useMemo(
-    () => sessionID ? unassociatedDescendantPending(sessionID, childrenByParent, allPermissions, associatedChildIDs) : [],
-    [sessionID, childrenByParent, allPermissions, associatedChildIDs],
+    () => sessionBound && sessionID ? unassociatedDescendantPending(sessionID, childrenByParent, allPermissions, associatedChildIDs) : [],
+    [sessionBound, sessionID, childrenByParent, allPermissions, associatedChildIDs],
   )
   // One fallback row per child session, counting every pending request of
   // either kind so a child with both a permission and a question is listed once.
@@ -283,7 +315,7 @@ export default function SessionScreen() {
     return [...byChild.entries()].map(([childSessionID, { count }]) => ({ sessionID: childSessionID, count }))
   }, [fallbackQuestions, fallbackPermissions])
 
-  const shortDir = getShortDir(currentSession?.directory)
+  const shortDir = sessionBound ? getShortDir(currentSession?.directory) : null
   const [showScrollButton, setShowScrollButton] = useState(false)
 
   // SSE reconnect banner
@@ -379,8 +411,15 @@ export default function SessionScreen() {
   // keystrokes for MessageBubble's custom memo comparator.
   const inputRef = useRef(input)
   inputRef.current = input
+  const attachmentsRef = useRef<Attachment[]>(attachments)
+  attachmentsRef.current = attachments
+  // Full composer snapshot for the async edit/undo flows: they capture it when
+  // they start and only touch the composer when it is unchanged when they
+  // finish (see sameComposerDraft).
+  const composerDraftRef = useRef<ComposerDraft>({ text: input, attachments })
+  composerDraftRef.current = { text: input, attachments }
 
-  const applyRevertResult = useCallback((result: Awaited<ReturnType<typeof revertToMessage>>) => {
+  const applyRevertResult = useCallback((result: Awaited<ReturnType<typeof revertToMessage>>, draftAtStart: ComposerDraft) => {
     if (!result.ok) {
       if (result.reason === "unsupported") {
         Alert.alert(t("session.alerts.notSupportedTitle"), t("session.alerts.notSupportedMessage"))
@@ -391,6 +430,10 @@ export default function SessionScreen() {
       }
       return
     }
+    // The request is async. If the user typed or attached anything while it was
+    // in flight, keep that newer draft instead of overwriting it with the
+    // reverted message; the revert banner still shows the staged state.
+    if (!sameComposerDraft(draftAtStart, composerDraftRef.current)) return
     setInput(result.text)
     // Restore attachments in the same shape the composer's own picker
     // functions (pickFromLibrary/pickFromCamera/pasteFromClipboard) use.
@@ -411,8 +454,26 @@ export default function SessionScreen() {
         text: t("session.actions.editMessage"),
         onPress: () => {
           const doRevert = async () => {
+            // Snapshot before the aborts/revert awaits: if the user types while
+            // this runs, the newer text must survive (see applyRevertResult).
+            const draftAtStart: ComposerDraft = { text: inputRef.current, attachments: attachmentsRef.current }
+            const sessions = useSessions.getState()
+            const session = sessions.currentSession
+            // Only ever act on the session this screen shows; the store may
+            // have moved on while the action sheet was open.
+            if (!session || session.id !== routeSessionID) {
+              Alert.alert(t("session.alerts.sessionNotReadyTitle"), t("session.alerts.sessionNotReadyMessage"))
+              return
+            }
+            // The server rejects a revert stage while a run is active
+            // (SessionBusyError). Mirror the TUI and web clients: stop the
+            // run first so the edit can be staged instead of looking like a
+            // no-op.
+            const status = useEvents.getState().sessionStatus[session.id]
+            const busy = sessions.sending[session.id] || (status !== undefined && status.type !== "idle")
+            if (busy) await sessions.abortSession()
             const result = await useSessions.getState().revertToMessage(messageID)
-            applyRevertResult(result)
+            applyRevertResult(result, draftAtStart)
           }
           // Editing overwrites the composer — don't silently clobber an
           // in-progress unsent draft.
@@ -432,7 +493,35 @@ export default function SessionScreen() {
         },
       },
     ])
-  }, [applyRevertResult, t])
+  }, [applyRevertResult, routeSessionID, t])
+
+  // Undo the staged revert from the banner. The composer was prefilled with
+  // the reverted message's text/attachments (see applyRevertResult), so it is
+  // only cleared once the server confirms the clear — a failed Undo keeps the
+  // draft and the banner so the user can retry. A draft typed while the undo
+  // request was in flight is kept too: the clear must not eat newer input.
+  const handleUndoRevert = useCallback(async () => {
+    if (useSessions.getState().currentSession?.id !== routeSessionID) {
+      Alert.alert(t("session.alerts.sessionNotReadyTitle"), t("session.alerts.sessionNotReadyMessage"))
+      return
+    }
+    const draftAtStart: ComposerDraft = { text: inputRef.current, attachments: attachmentsRef.current }
+    const restored = await unrevertSession()
+    if (!restored) {
+      Alert.alert(t("session.alerts.undoFailedTitle"), t("session.alerts.undoFailedMessage"))
+      return
+    }
+    if (!sameComposerDraft(draftAtStart, composerDraftRef.current)) return
+    setInput("")
+    setAttachments([])
+  }, [routeSessionID, unrevertSession, t])
+
+  // Stop button for this screen's own session only: `abortSession` acts on the
+  // store's selection, which may belong to a different screen.
+  const handleAbort = useCallback(() => {
+    if (useSessions.getState().currentSession?.id !== routeSessionID) return
+    void abortSession()
+  }, [routeSessionID, abortSession])
 
   const scrollToBottom = useCallback((animated = true) => {
     flatListRef.current?.scrollToOffset({ offset: 0, animated })
@@ -445,19 +534,28 @@ export default function SessionScreen() {
   // session's data (and its permission/question prompts) — so a user could
   // approve the wrong session's tool call. useFocusEffect re-binds this screen
   // to its own session whenever it becomes visible again.
+  const bindSession = useCallback(() => {
+    if (!routeSessionID) return
+    setSelectionAttempted(true)
+    selectSession(routeSessionID, directory).then(() => {
+      // Re-fetch pending permissions/questions from the server to recover from
+      // missed SSE events or failed optimistic removals
+      const connState = useConnections.getState()
+      const c = directory ? (connState.clientForDirectory(directory) ?? connState.client) : connState.client
+      if (c) refreshPending(c, routeSessionID)
+      const selected = useSessions.getState().currentSession
+      void useCatalog.getState().load(selected?.id === routeSessionID ? selected.directory : directory)
+    })
+  }, [routeSessionID, directory, selectSession])
+
   useFocusEffect(
     useCallback(() => {
-      if (!id) return
-      selectSession(id, directory).then(() => {
-        // Re-fetch pending permissions/questions from the server to recover from
-        // missed SSE events or failed optimistic removals
-        const connState = useConnections.getState()
-        const c = directory ? (connState.clientForDirectory(directory) ?? connState.client) : connState.client
-        if (c) refreshPending(c, id)
-        const selected = useSessions.getState().currentSession
-        void useCatalog.getState().load(selected?.directory || directory)
-      })
-    }, [id, directory]),
+      bindSession()
+      // While this screen is blurred the store belongs to another screen, so
+      // on the way back the first frame must show the spinner — not the
+      // load-failure view — until the focus re-select runs.
+      return () => setSelectionAttempted(false)
+    }, [bindSession]),
   )
 
   useEffect(() => {
@@ -492,7 +590,11 @@ export default function SessionScreen() {
       if (cmd.type === "builtin") {
         switch (cmd.trigger) {
           case "new":
-            router.back()
+            // The session list is where a new session starts. dismissTo returns
+            // to it when it is already in the stack and replaces this screen
+            // with it when the app was opened directly at a session (e.g. a
+            // notification deep link), where back() would exit the app instead.
+            router.dismissTo("/")
             return
           case "model":
             setInput("")
@@ -603,9 +705,31 @@ export default function SessionScreen() {
   // --- Send ---
   const handleSend = async () => {
     if (!input.trim() && attachments.length === 0) return
+    // `sendMessage` targets whatever session the store has selected. If the
+    // store is not bound to this screen's session yet (cold load) or the load
+    // failed, sending would deliver this draft to a different session — refuse
+    // and keep the draft instead.
+    if (!routeSessionID || !composerReady) {
+      Alert.alert(t("session.alerts.sessionNotReadyTitle"), t("session.alerts.sessionNotReadyMessage"))
+      return
+    }
     const authenticated = await authenticateForMessage()
     if (!authenticated) {
       Alert.alert(t("session.alerts.authRequiredTitle"), t("session.alerts.authRequiredMessage"))
+      return
+    }
+    // Biometric auth (and any other await above) is a window in which the
+    // store selection can change. Re-check the binding immediately before
+    // sending so this screen's draft can never go to another session.
+    if (!isComposerSessionReady(routeSessionID, useSessions.getState().currentSession?.id, useSessions.getState().isSessionLoading)) {
+      Alert.alert(t("session.alerts.sessionNotReadyTitle"), t("session.alerts.sessionNotReadyMessage"))
+      return
+    }
+    // No client for this session's directory (disconnected). The store's
+    // sendMessage would return without throwing, so guard here to keep the
+    // draft instead of clearing it into a silent no-op.
+    if (!sessionClient) {
+      Alert.alert(t("session.alerts.sendFailedTitle"), t("session.alerts.sendFailedMessage"))
       return
     }
 
@@ -616,9 +740,14 @@ export default function SessionScreen() {
 
     // Server slash commands (no attachments for commands)
     const command = files.length === 0 ? parseServerCommand(text, serverCommands) : null
-    if (command && sessionClient && currentSession) {
+    if (command) {
       try {
-        await sessionClient.session.command(currentSession.id, {
+        // New work commits a staged revert, exactly like the prompt path
+        // (sendMessage uses the same store action). A no-op when nothing is
+        // staged; rejects when the commit fails, aborting the send instead of
+        // running the command against a boundary the client still hides.
+        await commitPendingRevert()
+        await sessionClient.session.command(routeSessionID, {
           ...command,
           agent: agent || undefined,
           model: model || undefined,
@@ -627,7 +756,8 @@ export default function SessionScreen() {
         return
       } catch (err) {
         console.error("Command failed:", err)
-        setInput(text)
+        // Only restore when the user has not typed something newer meanwhile.
+        setInput((prev) => (prev ? prev : text))
         Alert.alert(t("session.alerts.sendFailedTitle"), t("session.alerts.sendFailedMessage"))
         return
       }
@@ -778,28 +908,39 @@ export default function SessionScreen() {
     prevReconnecting.current = recoveryVisible
   }, [recoveryVisible])
 
-  const handlePermissionReply = async (requestID: string, reply: "once" | "always" | "reject") => {
-    if (!sessionClient || !sessionID) return
-    // Snapshot for rollback
-    const snapshot = useEvents.getState().permissions[sessionID] || []
+  const handlePermissionReply = async (requestID: string, reply: PermissionReply): Promise<boolean> => {
+    if (!sessionClient || !sessionID) {
+      Alert.alert(t("session.alerts.replyFailedTitle"), t("session.alerts.replyFailedMessage"))
+      return false
+    }
+    // Capture only this request for rollback. Replacing the whole session
+    // bucket with a snapshot taken here would resurrect other requests
+    // resolved by SSE while this reply was in flight.
+    const request = (useEvents.getState().permissions[sessionID] || []).find((p) => p.id === requestID)
+    if (!request) return false
     markPendingResolved("permission", requestID, true)
     // Optimistically remove from UI
     useEvents.setState((state) => ({
       permissions: {
         ...state.permissions,
-        [sessionID]: snapshot.filter((p) => p.id !== requestID),
+        [sessionID]: (state.permissions[sessionID] || []).filter((p) => p.id !== requestID),
       },
     }))
     try {
       await sessionClient.permission.reply(requestID, reply, sessionID)
+      return true
     } catch (err) {
       markPendingResolved("permission", requestID, false)
       console.error("Permission reply failed:", err)
-      // Restore the prompt so the user can retry
-      useEvents.setState((state) => ({
-        permissions: { ...state.permissions, [sessionID]: snapshot },
-      }))
+      // Restore just the failed prompt so the user can retry, merging with
+      // whatever the bucket holds now instead of replacing it.
+      useEvents.setState((state) => {
+        const restored = restoreFailedPermission(state.permissions[sessionID], request)
+        if (restored === null) return state
+        return { permissions: { ...state.permissions, [sessionID]: restored } }
+      })
       Alert.alert(t("session.alerts.replyFailedTitle"), t("session.alerts.replyFailedMessage"))
+      return false
     }
   }
 
@@ -923,14 +1064,22 @@ export default function SessionScreen() {
   // the chained picker above lets the user settle one up front.
   const activeVariant = variant !== null && variantOptionKeys.includes(variant) ? variant : null
 
+  // Header/empty chrome must never borrow the previously selected session's
+  // identity while this screen is cold loading or after its load failed.
+  const screenTitle = (sessionBound ? currentSession?.title : undefined) || t("session.titleFallback")
+  // Selection was attempted, no fetch is running, and the store still is not
+  // bound to the route session: the load failed and the list/composer must not
+  // fall back to another session's transcript.
+  const sessionUnavailable = !composerReady && !isSessionLoading && (selectionAttempted || !routeSessionID)
+
   return (
     <>
       <Stack.Screen
         options={{
-          title: currentSession?.title || t("session.titleFallback"),
+          title: screenTitle,
           headerTitle: () => (
             <MarqueeTitle
-              text={currentSession?.title || t("session.titleFallback")}
+              text={screenTitle}
               budget={(Platform.OS === "ios" ? 60 : 56) + 8 + headerRightW}
             />
           ),
@@ -946,7 +1095,7 @@ export default function SessionScreen() {
                   <Text style={[s.dirText, isDark && s.dirTextDark]}>{shortDir}</Text>
                 </View>
               )}
-              <TouchableOpacity onPress={() => setShowInfo((v) => !v)} hitSlop={8}>
+              <TouchableOpacity onPress={() => sessionBound && setShowInfo((v) => !v)} hitSlop={8} disabled={!sessionBound}>
                 <Ionicons
                   name={showInfo ? "stats-chart" : "stats-chart-outline"}
                   size={20}
@@ -974,10 +1123,11 @@ export default function SessionScreen() {
         behavior={Platform.OS === "ios" ? "padding" : undefined}
         keyboardVerticalOffset={Platform.OS === "ios" ? 90 : 0}
       >
-        {/* Session info pulldown */}
+        {/* Session info pulldown. Bound-only: while cold loading (or after a
+            failed load) the store's session/messages belong to another screen. */}
         <SessionInfo
-          session={currentSession}
-          messages={messages || []}
+          session={sessionBound ? currentSession : null}
+          messages={sessionBound ? messages || [] : []}
           providers={providers}
           visible={showInfo}
           isDark={isDark}
@@ -1005,30 +1155,39 @@ export default function SessionScreen() {
         )}
 
         {/* Pending revert (from "Edit message") — offer a way back before it's
-            cleaned up by the next prompt. */}
-        {revertMessageID && (
+            cleaned up by the next prompt. Bound-only: a revert staged on
+            another session must not appear on top of this one. */}
+        {sessionBound && revertMessageID && (
           <View style={[s.banner, s.bannerRevert]}>
             <Text style={s.bannerText}>{t("session.banners.reverted")}</Text>
-            <TouchableOpacity
-              onPress={() => {
-                unrevertSession()
-                // The composer was prefilled with the reverted message's text/
-                // attachments (see applyRevertResult) — clear it so Undo doesn't
-                // leave a stale draft that could be sent as a duplicate.
-                setInput("")
-                setAttachments([])
-              }}
-              hitSlop={8}
-            >
+            <TouchableOpacity onPress={handleUndoRevert} hitSlop={8}>
               <Text style={s.bannerAction}>{t("session.banners.undo")}</Text>
             </TouchableOpacity>
           </View>
         )}
 
-        {isSessionLoading ? (
-          <View style={s.loading}>
-            <ActivityIndicator size="large" color={isDark ? "#ffffff" : "#0a0a0a"} />
-          </View>
+        {!composerReady ? (
+          sessionUnavailable ? (
+            <View style={s.loadFailed} testID="session-load-failed">
+              <Ionicons name="cloud-offline-outline" size={40} color={isDark ? "#666666" : "#999999"} />
+              <Text style={[s.loadFailedTitle, isDark && s.textWhite]}>{t("session.loadFailed.title")}</Text>
+              <Text style={[s.loadFailedMessage, isDark && s.metaDark]}>{t("session.loadFailed.message")}</Text>
+              {routeSessionID && (
+                <TouchableOpacity
+                  style={s.retryBtn}
+                  onPress={bindSession}
+                  accessibilityRole="button"
+                  testID="session-retry-button"
+                >
+                  <Text style={s.retryText}>{t("common.retry")}</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          ) : (
+            <View style={s.loading}>
+              <ActivityIndicator size="large" color={isDark ? "#ffffff" : "#0a0a0a"} />
+            </View>
+          )
         ) : (
           <View style={s.listWrap}>
             <FlatList
@@ -1111,7 +1270,7 @@ export default function SessionScreen() {
         )}
 
         {/* Status */}
-        {currentSession && <StatusIndicator sessionID={currentSession.id} isDark={isDark} />}
+        {sessionBound && routeSessionID && <StatusIndicator sessionID={routeSessionID} isDark={isDark} />}
 
         {/* Permissions */}
         {permissions.map((perm) => (
@@ -1143,11 +1302,11 @@ export default function SessionScreen() {
         <View style={[s.toolbar, isDark && s.toolbarDark]}>
           <TouchableOpacity
             style={[s.agentChip, { borderColor: agentColor }]}
-            onPress={() => catalogReady && agentSheetRef.current?.expand()}
-            disabled={!catalogReady}
+            onPress={() => composerReady && catalogReady && agentSheetRef.current?.expand()}
+            disabled={!composerReady || !catalogReady}
             testID="agent-chip"
             accessibilityRole="button"
-            accessibilityState={{ disabled: !catalogReady }}
+            accessibilityState={{ disabled: !composerReady || !catalogReady }}
             accessibilityLabel={t("session.toolbar.agentAccessibilityLabel", { name: agentLabel })}
             accessibilityHint={t("session.toolbar.agentAccessibilityHint")}
           >
@@ -1158,11 +1317,11 @@ export default function SessionScreen() {
 
           <TouchableOpacity
             style={[s.modelChip, isDark && s.modelChipDark]}
-            onPress={() => catalogReady && modelSheetRef.current?.expand()}
-            disabled={!catalogReady}
+            onPress={() => composerReady && catalogReady && modelSheetRef.current?.expand()}
+            disabled={!composerReady || !catalogReady}
             testID="model-chip"
             accessibilityRole="button"
-            accessibilityState={{ disabled: !catalogReady }}
+            accessibilityState={{ disabled: !composerReady || !catalogReady }}
             accessibilityLabel={t("session.toolbar.modelAccessibilityLabel", { name: modelLabel })}
             accessibilityHint={t("session.toolbar.modelAccessibilityHint")}
           >
@@ -1233,7 +1392,7 @@ export default function SessionScreen() {
             />
             {/* Stop button: only when busy and no input */}
             {isSending && !input.trim() && attachments.length === 0 && !speech.listening && (
-              <TouchableOpacity style={s.stopBtn} onPress={abortSession}>
+              <TouchableOpacity style={s.stopBtn} onPress={handleAbort}>
                 <Ionicons name="stop" size={20} color="#ffffff" />
               </TouchableOpacity>
             )}
@@ -1305,6 +1464,17 @@ function makeStyles(acc: AccentState) {
   container: { flex: 1, backgroundColor: "#ffffff" },
   containerDark: { backgroundColor: "#0a0a0a" },
   loading: { flex: 1, justifyContent: "center", alignItems: "center" },
+  loadFailed: { flex: 1, justifyContent: "center", alignItems: "center", paddingHorizontal: 32, gap: 8 },
+  loadFailedTitle: { fontSize: 16, fontWeight: "600", color: "#444444", marginTop: 4 },
+  loadFailedMessage: { fontSize: 13, color: "#888888", textAlign: "center" },
+  retryBtn: {
+    marginTop: 8,
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 20,
+    backgroundColor: "#0a0a0a",
+  },
+  retryText: { color: "#ffffff", fontSize: 14, fontWeight: "600" },
   listWrap: { flex: 1, position: "relative" },
 
   // Messages

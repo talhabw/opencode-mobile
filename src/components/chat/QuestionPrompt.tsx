@@ -7,6 +7,7 @@ import { questionValidationMessage, updateQuestionAnswer, updateQuestionDraft } 
 
 interface QuestionOption {
   label: string
+  value: string
   description?: string
 }
 
@@ -16,6 +17,7 @@ interface Question {
   options: QuestionOption[]
   multiple?: boolean
   custom?: boolean
+  required?: boolean
 }
 
 interface Props {
@@ -41,9 +43,9 @@ export function QuestionPrompt({ request, isDark, onReply, onReject }: Props) {
   const q = request.questions[current]
   if (!q) return null
 
-  const toggleOption = (label: string) => {
+  const toggleOption = (value: string) => {
     setError(null)
-    setAnswers((prev) => updateQuestionAnswer(prev, current, label, Boolean(q.multiple)))
+    setAnswers((prev) => updateQuestionAnswer(prev, current, value, Boolean(q.multiple)))
   }
 
   const submitCustom = () => {
@@ -92,17 +94,17 @@ export function QuestionPrompt({ request, isDark, onReply, onReject }: Props) {
 
       <View style={s.options}>
         {q.options.map((opt) => {
-          const selected = (answers[current] || []).includes(opt.label)
+          const selected = (answers[current] || []).includes(opt.value)
           return (
             <TouchableOpacity
-              key={opt.label}
+              key={opt.value}
               style={[
                 s.option,
                 isDark && s.optionDark,
                 selected && s.optionSelected,
                 selected && isDark && s.optionSelectedDark,
               ]}
-              onPress={() => toggleOption(opt.label)}
+              onPress={() => toggleOption(opt.value)}
               testID={`question-option-${current}-${opt.label}`}
               accessibilityRole={q.multiple ? "checkbox" : "radio"}
               accessibilityState={{ selected }}

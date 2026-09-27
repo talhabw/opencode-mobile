@@ -11,12 +11,26 @@ export function resyncPlan(hasCurrentSession: boolean): ResyncPlan {
   return { sessions: true, messages: hasCurrentSession, pending: true, active: true }
 }
 
+/**
+ * Merge the `session.active()` snapshot into the optimistic per-session
+ * sending map: a session is sending iff the server reports work in flight.
+ *
+ * `changedSessionIDs` are sessions whose status a fresher SSE event replaced
+ * while the probe was in flight. The probe snapshot predates those events, so
+ * their local sending value is kept instead of being overwritten — otherwise
+ * a fresh busy -> idle would resurrect the stop control and a fresh busy would
+ * hide it for a running session.
+ */
 export function mergeSendingState(
   sending: Record<string, boolean>,
   running: Record<string, unknown>,
+  changedSessionIDs: ReadonlySet<string> = new Set(),
 ): Record<string, boolean> {
   const sessionIDs = [...new Set([...Object.keys(sending), ...Object.keys(running)])]
-  return Object.fromEntries(sessionIDs.map((sessionID) => [sessionID, sessionID in running]))
+  return Object.fromEntries(sessionIDs.map((sessionID) => [
+    sessionID,
+    changedSessionIDs.has(sessionID) ? (sending[sessionID] ?? false) : sessionID in running,
+  ]))
 }
 
 const CANONICAL_REFRESH_EVENTS = new Set([
