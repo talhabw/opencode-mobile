@@ -141,6 +141,10 @@ Inspect component status:
 scripts/dev-env.sh status
 ```
 
+Do not try `bun run dev:env -- status`: the package script hardcodes `start`,
+so the extra argument is ignored and the environment starts instead of
+reporting status.
+
 Rebuild and reinstall without wiping state:
 
 ```bash
