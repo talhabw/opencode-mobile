@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { OpenCode, type SessionInfo, type SessionMessageInfo } from "@opencode-ai/client"
-import { V2EventAdapter, normalizeAgent, normalizeEvent, normalizeMessage, normalizeSession, isV2HealthResponse, normalizeProviderCatalog, parseSyntheticTag, V2_REQUIRED_ERROR } from "./protocol-v2.ts"
+import { V2EventAdapter, normalizeAgent, normalizeCommand, normalizeEvent, normalizeMessage, normalizeSession, isV2HealthResponse, normalizeProviderCatalog, parseSyntheticTag, V2_REQUIRED_ERROR } from "./protocol-v2.ts"
 
 test("official client uses v2 /api paths and location query", async () => {
   const requests: URL[] = []
@@ -31,8 +31,8 @@ test("official client maps session actions to v2 paths and generated request bod
         url,
         body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
       })
-      if (url.pathname.endsWith("/command")) {
-        return new Response(JSON.stringify({ data: {} }), { status: 200, headers: { "content-type": "application/json" } })
+      if (url.pathname.endsWith("/interrupt")) {
+        return new Response(JSON.stringify({ interrupted: true }), { status: 200, headers: { "content-type": "application/json" } })
       }
       if (url.pathname.endsWith("/revert/stage")) {
         return new Response(JSON.stringify({ data: { messageID: "message/id" } }), { status: 200, headers: { "content-type": "application/json" } })
@@ -44,15 +44,11 @@ test("official client maps session actions to v2 paths and generated request bod
   await client.session.command({
     sessionID: "session/id",
     command: "review",
-    arguments: "first  second",
-    agent: "build",
-    model: { providerID: "provider", id: "family/model", variant: "high" },
-    files: [{ uri: "data:image/jpeg;base64,YQ==", name: "a.jpg" }],
+    text: "first  second",
+    files: [{ uri: "data:image/jpeg;base64,YQ==", name: "a.jpg", description: "Screenshot" }],
   })
   await client.session.interrupt({ sessionID: "session/id" })
-  await client.permission.reply({ sessionID: "session/id", requestID: "permission/id", reply: "once" })
-  await client.question.reply({ sessionID: "session/id", requestID: "question/id", answers: [["yes"]] })
-  await client.question.reject({ sessionID: "session/id", requestID: "question/id" })
+  await client.permission.reply({ sessionID: "session/id", requestID: "permission/id", reply: "once", message: "Approved" })
   await client.session.revert.stage({ sessionID: "session/id", messageID: "message/id" })
   await client.session.revert.clear({ sessionID: "session/id" })
   await client.session.revert.commit({ sessionID: "session/id" })
@@ -61,22 +57,29 @@ test("official client maps session actions to v2 paths and generated request bod
     "/api/session/session%2Fid/command",
     "/api/session/session%2Fid/interrupt",
     "/api/session/session%2Fid/permission/permission%2Fid/reply",
-    "/api/session/session%2Fid/question/question%2Fid/reply",
-    "/api/session/session%2Fid/question/question%2Fid/reject",
     "/api/session/session%2Fid/revert/stage",
     "/api/session/session%2Fid/revert/clear",
     "/api/session/session%2Fid/revert/commit",
   ])
+  // The beta command request is flat: arguments became `text` and the file
+  // attachments moved next to it; agent/model selection is no longer part of
+  // the request body.
   assert.deepEqual(requests[0].body, {
     command: "review",
-    arguments: "first  second",
-    agent: "build",
-    model: { providerID: "provider", id: "family/model", variant: "high" },
-    files: [{ uri: "data:image/jpeg;base64,YQ==", name: "a.jpg" }],
+    text: "first  second",
+    files: [{ uri: "data:image/jpeg;base64,YQ==", name: "a.jpg", description: "Screenshot" }],
   })
-  assert.deepEqual(requests[2].body, { reply: "once" })
-  assert.deepEqual(requests[3].body, { answers: [["yes"]] })
-  assert.deepEqual(requests[5].body, { messageID: "message/id" })
+  assert.deepEqual(requests[2].body, { reply: "once", message: "Approved" })
+  assert.deepEqual(requests[3].body, { messageID: "message/id" })
+})
+
+test("beta client removes the legacy question API and project directories endpoint", async () => {
+  const client = OpenCode.make({
+    baseUrl: "http://example.test",
+    fetch: async () => new Response(null, { status: 204 }),
+  })
+  assert.equal("question" in client, false)
+  assert.equal("directories" in client.project, false)
 })
 
 test("v2 health detection rejects legacy or malformed responses", () => {
@@ -87,16 +90,30 @@ test("v2 health detection rejects legacy or malformed responses", () => {
 
 test("normalizes v2 provider and model catalog without selecting a default", () => {
   const catalog = normalizeProviderCatalog(
-    [{ id: "p", name: "Provider", disabled: false } as never],
+    [
+      { id: "p", name: "Provider", activation: "enabled" },
+      { id: "auto", name: "Auto Provider", activation: "auto" },
+      { id: "off", name: "Disabled Provider", activation: "disabled" },
+    ] as never,
     [{
       id: "m", providerID: "p", name: "Model", capabilities: { input: ["text"], output: ["text"], tools: true },
       cost: [], limit: { context: 100, output: 10 }, variants: [], status: "active",
     } as never],
     null,
   )
-  assert.deepEqual(catalog.connected, ["p"])
+  // Provider activation drives connectivity: `disabled` is excluded, `auto`
+  // and `enabled` both count as connected for the pickers.
+  assert.deepEqual(catalog.connected, ["p", "auto"])
   assert.equal(catalog.all[0].models.m.id, "m")
   assert.deepEqual(catalog.default, {})
+})
+
+test("normalizes beta command info into name and description only", () => {
+  assert.deepEqual(normalizeCommand({ name: "review", description: "Review the diff" }), {
+    name: "review",
+    description: "Review the diff",
+  })
+  assert.deepEqual(normalizeCommand({ name: "bare" }), { name: "bare", description: undefined })
 })
 
 test("normalizes v2 sessions into app-owned location shape", () => {
@@ -281,6 +298,33 @@ test("failed execution emits both the error and terminal idle state", () => {
   assert.deepEqual(events[1], {
     type: "session.status",
     properties: { sessionID: "s1", status: { type: "idle" }, canonicalRefresh: true },
+  })
+})
+
+test("passes permission message through permission.asked normalization", () => {
+  const event = normalizeEvent({
+    type: "permission.asked",
+    data: {
+      id: "perm/1",
+      sessionID: "s1",
+      action: "bash",
+      resources: ["cat /etc/hostname"],
+      source: { type: "tool", messageID: "m1", id: "call/1" },
+      message: "Run bash: cat /etc/hostname",
+    },
+  })
+  assert.equal(event.type, "permission.asked")
+  const properties = event.properties as Record<string, unknown>
+  assert.equal(properties.message, "Run bash: cat /etc/hostname")
+  assert.equal(properties.permission, "bash")
+  assert.deepEqual(properties.patterns, ["cat /etc/hostname"])
+  assert.deepEqual(properties.tool, { messageID: "m1", callID: "call/1" })
+  assert.equal(properties.sessionID, "s1")
+  // Legacy question events are no longer normalized specially — they fall
+  // through like any unknown event type.
+  assert.deepEqual(normalizeEvent({ type: "question.asked", data: { id: "q1", questions: [] } }), {
+    type: "question.asked",
+    properties: { id: "q1", questions: [] },
   })
 })
 

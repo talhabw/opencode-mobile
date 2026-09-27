@@ -93,15 +93,10 @@
     "subagentInputNeeded": "Subagent needs input",
     "openSubagentInput": "Open input request from {{title}}",
     "toolbar": {
-      "auto": "Auto",
-      "serverDefault": "Server default",
       "agentAccessibilityLabel": "Agent: {{name}}",
       "agentAccessibilityHint": "Opens the agent picker to change the active agent",
       "modelAccessibilityLabel": "Model: {{name}}",
-      "modelAccessibilityHint": "Opens the model picker to change the active model",
-      "contextLabel": "Context {{percent}}%",
-      "contextAccessibilityLabel": "Context window used, {{percent}} percent",
-      "contextAccessibilityHint": "Opens detailed usage information"
+      "modelAccessibilityHint": "Opens the model picker to change the active model"
     },
     "banners": {
       "reconnecting": "Reconnecting… (attempt {{attempt}})",
@@ -273,6 +268,10 @@
       "daysAgo": "{{count}}d ago"
     },
     "filesCount": "{{count}} files",
+    "scope": {
+      "workspace": "This Workspace",
+      "all": "All Workspaces"
+    },
     "hierarchy": {
       "expand": "Show subagent sessions",
       "collapse": "Hide subagent sessions",
@@ -397,6 +396,9 @@
         "cancelled": "Cancelled"
       }
     },
+    "systemMessage": {
+      "instructionsUpdated": "Instructions updated"
+    },
     "subagentMessage": {
       "title": "Subagent",
       "status": {
@@ -435,32 +437,32 @@
     "modelPicker": {
       "title": "Select Model",
       "searchPlaceholder": "Search models...",
-      "useDefault": "Use server default: {{name}}",
-      "useServerDefault": "Use server default",
+      "useDefault": "Default: {{name}}",
+      "useServerDefault": "Default",
       "useServerDefaultDescription": "The server chooses the model for new prompts",
-      "switchDefault": "Switch to current server default: {{name}}",
-      "defaultRowAccessibilityLabel": "Use server default",
+      "switchDefault": "Switch to current default: {{name}}",
+      "defaultRowAccessibilityLabel": "Default",
       "defaultRowAccessibilityHint": "Clears your explicit model choice and lets the server decide",
-      "switchDefaultAccessibilityHint": "Switches to the current server default"
+      "switchDefaultAccessibilityHint": "Switches to the current default"
     },
     "agentPicker": {
       "title": "Select Agent",
       "searchPlaceholder": "Search agents...",
-      "useDefault": "Use server default: {{name}}",
-      "useServerDefault": "Use server default",
+      "useDefault": "Default: {{name}}",
+      "useServerDefault": "Default",
       "useServerDefaultDescription": "The server chooses the agent for new prompts",
-      "switchDefault": "Switch to current server default: {{name}}",
+      "switchDefault": "Switch to current default: {{name}}",
       "defaultDescription": "The server chooses this for new prompts",
-      "defaultRowAccessibilityLabel": "Use server default",
+      "defaultRowAccessibilityLabel": "Default",
       "defaultRowAccessibilityHint": "Clears your explicit agent choice and lets the server decide",
-      "switchDefaultAccessibilityHint": "Switches to the current server default",
+      "switchDefaultAccessibilityHint": "Switches to the current default",
       "rowAccessibilityLabel": "Select agent {{name}}",
       "rowAccessibilityHint": "Uses this agent for new prompts"
     },
     "variantPicker": {
       "title": "Reasoning Effort",
-      "autoLabel": "Auto",
-      "autoDescription": "Use model default reasoning",
+      "defaultLabel": "Default",
+      "defaultDescription": "Use model default reasoning",
       "effort": {
         "low": "Faster, less thorough reasoning",
         "medium": "Balanced reasoning and speed",

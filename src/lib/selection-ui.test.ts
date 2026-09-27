@@ -8,7 +8,9 @@ test("default action distinguishes inheritance from a concrete switch", () => {
   expect(defaultActionDecision(true, false)).toBe("unavailable")
 })
 
-test("selector labels never call an unresolved default Auto", () => {
-  expect(selectorLabel(null, null, "Server default")).toBe("Server default")
-  expect(selectorLabel(null, "Build", "Server default")).toBe("Build · Server default")
+test("selector labels show the concrete resolved value without annotation", () => {
+  expect(selectorLabel(null, "Build")).toBe("Build")
+  expect(selectorLabel(null, null)).toBe("")
+  expect(selectorLabel(null, null, "Plan")).toBe("Plan")
+  expect(selectorLabel("Plan", "Build")).toBe("Plan")
 })

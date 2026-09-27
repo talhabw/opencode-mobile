@@ -1,9 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import {
-  dedupePendingInputs,
   fromQuestionForm,
-  fromQuestionRequest,
   isQuestionForm,
   isQuestionFormMetadata,
   toFormAnswer,
@@ -42,22 +40,6 @@ const questionForm = {
     },
   ],
 }
-
-test("fromQuestionRequest is identity plus the legacy transport marker", () => {
-  const request = {
-    id: "q_1",
-    sessionID: "ses_1",
-    questions: [{ question: "Continue?", header: "Continue", options: [{ label: "Yes", description: "" }] }],
-    tool: { messageID: "msg_1", callID: "call_1" },
-  }
-  const view = fromQuestionRequest(request)
-  assert.equal(view.id, "q_1")
-  assert.equal(view.sessionID, "ses_1")
-  assert.equal(view.transport, "question")
-  assert.equal(view.formID, undefined)
-  assert.deepEqual(view.questions, request.questions)
-  assert.deepEqual(view.tool, { messageID: "msg_1", callID: "call_1" })
-})
 
 test("fromQuestionForm maps question-tool fields into the canonical view", () => {
   assert.equal(isQuestionForm(questionForm), true)
@@ -157,15 +139,6 @@ test("toFormAnswer encodes scalars for string fields and arrays for multiselect"
 })
 
 test("toFormAnswer tolerates a view without form fields", () => {
-  const legacy = fromQuestionRequest({ id: "q_1", sessionID: "ses_1", questions: [] })
-  assert.deepEqual(toFormAnswer(legacy, [["Yes"]]), {})
-})
-
-test("dedupePendingInputs keeps the first entry per id across transports", () => {
-  const legacy = fromQuestionRequest({ id: "shared", sessionID: "ses_1", questions: [] })
-  const form = fromQuestionForm({ id: "shared", sessionID: "ses_2", metadata: { kind: "question" }, fields: [] })
-  const other = fromQuestionRequest({ id: "q_2", sessionID: "ses_1", questions: [] })
-  const merged = dedupePendingInputs([legacy, form, other])
-  assert.deepEqual(merged.map((input) => input.transport), ["question", "question"])
-  assert.equal(merged[0].sessionID, "ses_1")
+  const fieldless = fromQuestionForm({ id: "q_1", sessionID: "ses_1", metadata: { kind: "question" }, fields: [] })
+  assert.deepEqual(toFormAnswer(fieldless, [["Yes"]]), {})
 })

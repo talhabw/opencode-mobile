@@ -40,12 +40,25 @@ test("v2 fixture matches the generated client protocol", async (context) => {
   assert.equal((await client.vcs.get()).branch.current, "fixture")
   assert.deepEqual(await client.vcs.status(), [])
   assert.equal(await client.vcs.diff(), "")
-  assert.deepEqual(await client.permission.list(), [])
+  assert.deepEqual(await client.permission.list(), [{
+    id: "fixture-permission-1",
+    sessionID: "fixture-child",
+    action: "shell",
+    resources: ["git status"],
+    message: "Inspect the child workspace",
+    source: { messageID: "fixture-child-assistant", id: "call-child" },
+    tool: { messageID: "fixture-child-assistant", callID: "call-child" },
+    permission: "shell",
+    patterns: ["git status"],
+  }])
   assert.deepEqual(await client.session.active(), {})
 
   const all = await client.protocol.session.list({ directory: "/fixture/workspace" })
   assert.deepEqual(all.data.map((item) => item.id).sort(), ["fixture-child", "fixture-root"])
-  assert.deepEqual((await client.protocol.session.list({ parentID: null })).data.map((item) => item.id), ["fixture-root"])
+  // Without a directory the list spans every workspace; with one it is exact
+  // location.directory match ("fixture-other" lives in /fixture/other).
+  assert.deepEqual((await client.protocol.session.list({ parentID: null })).data.map((item) => item.id), ["fixture-root", "fixture-other"])
+  assert.deepEqual((await client.protocol.session.list({ directory: "/fixture/workspace", parentID: null })).data.map((item) => item.id), ["fixture-root"])
   assert.deepEqual((await client.protocol.session.list({ parentID: "fixture-root" })).data.map((item) => item.id), ["fixture-child"])
   assert.deepEqual((await client.session.page({ parentID: null })).data.map((item) => item.id), ["fixture-root"])
   assert.deepEqual((await client.session.list({ parentID: "fixture-root" })).map((item) => item.id), ["fixture-child"])
@@ -60,6 +73,9 @@ test("v2 fixture matches the generated client protocol", async (context) => {
   assert.equal(shell?.info.shell?.output?.truncated, false)
   const task = rootMessages.flatMap((message) => message.parts).find((part) => part.tool === "task")
   assert.deepEqual(task?.state?.metadata, { sessionId: "fixture-child", parentSessionId: "fixture-root" })
+  const instructions = rootMessages.find((message) => message.info.id === "fixture-instructions")
+  assert.equal(instructions?.info.systemKind, "system")
+  assert.ok((instructions?.parts[0]?.text?.length ?? 0) > 1_000)
 
   const events = client.global.events()
   const eventPromise = (async () => {
@@ -74,13 +90,20 @@ test("v2 fixture matches the generated client protocol", async (context) => {
   const updated = await client.session.messages("fixture-root")
   assert.equal(new Set(updated.map((message) => message.info.id)).size, updated.length)
 
-  assert.deepEqual(await client.question.list(), [{ id: "fixture-question-1", sessionID: "fixture-child", questions: [{ question: "Continue the child task?", header: "Continue", options: [{ label: "Yes", description: "Continue" }, { label: "No", description: "Stop" }], multiple: false }], tool: { messageID: "fixture-child-assistant", callID: "call-child" } }])
-  assert.equal(await client.question.reply("fixture-question-1", [["Yes"]], "fixture-child"), true)
-  assert.equal((await client.question.list()).length, 0)
+  assert.equal(await client.permission.reply("fixture-permission-1", "once", "fixture-child"), true)
+  assert.equal((await client.permission.list()).length, 0)
+
+  const pendingForms = await client.form.requestList()
+  assert.equal(pendingForms.length, 1)
+  assert.equal(isQuestionForm(pendingForms[0]), true)
+  const pendingQuestion = fromQuestionForm(pendingForms[0]!)
+  await client.form.reply({ sessionID: pendingQuestion.sessionID, formID: pendingQuestion.formID!, answer: toFormAnswer(pendingQuestion, [["Staging"], ["EU", "US"]]) })
+  assert.equal((await client.form.requestList()).length, 0)
 
   const reset = await fetch(`${base}/fixture/reset`, { method: "POST", headers: auth })
   assert.equal(reset.status, 200)
-  assert.equal((await client.question.list()).length, 1)
+  assert.equal((await client.permission.list()).length, 1)
+  assert.equal((await client.form.requestList()).length, 1)
 })
 
 test("v2 fixture emits a tool input storm that accumulates and resolves canonically", async (context) => {
@@ -150,8 +173,11 @@ test("v2 fixture exposes the forms-based question surface end to end", async (co
     throw new Error("event stream ended before match")
   }
 
-  // The forms surface starts empty; the seeded legacy question stays on the
-  // question endpoints.
+  // Pending question inputs are seeded and recovered exclusively through the
+  // forms surface on beta-18743.
+  const seeded = await client.form.requestList()
+  assert.equal(seeded.length, 1)
+  await client.form.cancel({ sessionID: "fixture-child", formID: seeded[0].id })
   assert.deepEqual(await client.form.requestList(), [])
 
   const created = waitFor((event) => event.type === "form.created")
@@ -192,5 +218,74 @@ test("v2 fixture exposes the forms-based question surface end to end", async (co
 
   const reset = await fetch(`${base}/fixture/reset`, { method: "POST", headers: auth })
   assert.equal(reset.status, 200)
-  assert.deepEqual(await client.form.requestList(), [])
+  assert.equal((await client.form.requestList()).length, 1)
+})
+
+test("v2 fixture reproduces the healthy-but-idle SSE reconnect", async (context) => {
+  const process = await start()
+  context.after(() => process.kill())
+
+  // Normal subscription handshake: the first /api/event stream opens with an
+  // immediate server.connected event.
+  const first = client.global.events()
+  let resolveConnected!: () => void
+  const connected = new Promise<void>((resolve) => { resolveConnected = resolve })
+  const firstEnded = (async () => {
+    for await (const event of first) {
+      if (event.type !== "server.connected") throw new Error(`unexpected event on closing stream: ${JSON.stringify(event)}`)
+      resolveConnected()
+    }
+    return true
+  })()
+  await Promise.race([
+    connected,
+    Bun.sleep(2_000).then(() => { throw new Error("first event stream never sent server.connected") }),
+  ])
+
+  // The hook closes every current /api/event stream; having received
+  // server.connected guarantees the server registered this client before the
+  // streams are cut.
+  const cut = await fetch(`${base}/fixture/reconnect-silent`, { method: "POST", headers: auth })
+  assert.equal(cut.status, 200)
+  assert.deepEqual(await cut.json(), { closed: 1, silentNextConnect: true })
+  await Promise.race([
+    firstEnded.then(() => {}),
+    Bun.sleep(2_000).then(() => { throw new Error("existing event stream was not closed by /fixture/reconnect-silent") }),
+  ])
+
+  // The next subscription stays open but silent: no server.connected and no
+  // stream end within the bounded window.
+  const second = client.global.events()
+  const secondEvent = (async () => {
+    for await (const event of second) return event
+    return "ended" as const
+  })()
+  const silence = await Promise.race([
+    secondEvent.then((value) => value),
+    Bun.sleep(500).then(() => "silent" as const),
+  ])
+  if (silence !== "silent") throw new Error(`reconnect stream was not silent: ${JSON.stringify(silence)}`)
+
+  // The silent stream is still open and live: a normal session.created event
+  // flows through it, proving open-not-closed while server.connected stays away.
+  const createPromise = client.session.create({ title: "Silent reconnect probe" })
+  const live = await Promise.race([
+    secondEvent.then((value) => value),
+    Bun.sleep(2_000).then(() => { throw new Error("silent reconnect stream is not open (no event delivered)") }),
+  ]) as { type: string; properties: { info?: { id?: string } } }
+  assert.equal(live.type, "session.created")
+  assert.equal(live.properties.info?.id, (await createPromise).id)
+
+  // The flag is one-shot: the following subscription gets the normal handshake again.
+  const third = client.global.events()
+  const thirdConnected = (async () => {
+    for await (const event of third) {
+      if (event.type === "server.connected") return event
+    }
+    throw new Error("third event stream ended before server.connected")
+  })()
+  assert.equal((await Promise.race([
+    thirdConnected,
+    Bun.sleep(2_000).then(() => { throw new Error("third stream never sent server.connected") }),
+  ]))?.type, "server.connected")
 })

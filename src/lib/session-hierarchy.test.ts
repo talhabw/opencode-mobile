@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import type { Session } from "./sdk.ts"
-import { childCountsFromSessions, decrementChildCount, descendantIDs, flattenSessionHierarchy, incrementChildCount, pendingSessionCounts, purgeSessionHierarchy, unassociatedDescendantPending, upsertSessionHierarchy } from "./session-hierarchy.ts"
+import { childCountsFromSessions, decrementChildCount, descendantIDs, flattenSessionHierarchy, incrementChildCount, mergePendingRequests, pendingSessionCounts, purgeSessionHierarchy, unassociatedDescendantPending, upsertSessionHierarchy } from "./session-hierarchy.ts"
 
 const session = (id: string, parentID?: string): Session => ({
   id, slug: id, projectID: "p", directory: "/work", parentID, title: id, version: "2", time: { created: 1, updated: 1 },
@@ -41,6 +41,30 @@ test("counts own and nested descendant pending requests without double counting"
   const pending = { root: [{ id: "r" }], child: [{ id: "c1" }, { id: "c2" }], grandchild: [{ id: "g" }] }
   assert.deepEqual(pendingSessionCounts("root", children, pending), { own: 1, descendants: 3, total: 4 })
   assert.deepEqual(pendingSessionCounts("child", children, pending), { own: 2, descendants: 1, total: 3 })
+})
+
+test("combines permission and question pending records into one count per session", () => {
+  const children = { root: [{ id: "child", parentID: "root" } as Session], child: [{ id: "grandchild", parentID: "child" } as Session] }
+  const permissions = { root: [{ id: "p1", sessionID: "root" }], grandchild: [{ id: "p2", sessionID: "grandchild" }] }
+  const questions = { root: [{ id: "q1", sessionID: "root" }], child: [{ id: "q2", sessionID: "child" }] }
+  const pending = mergePendingRequests(permissions, questions)
+  assert.deepEqual(pendingSessionCounts("root", children, pending), { own: 2, descendants: 2, total: 4 })
+  assert.deepEqual(pendingSessionCounts("child", children, pending), { own: 1, descendants: 1, total: 2 })
+  assert.deepEqual(pendingSessionCounts("grandchild", children, pending), { own: 1, descendants: 0, total: 1 })
+})
+
+test("mergePendingRequests drops empty buckets and keeps both kinds in one session", () => {
+  assert.deepEqual(mergePendingRequests(), {})
+  assert.deepEqual(
+    mergePendingRequests({ a: [], b: [] }, { c: [{ id: "x" }] }),
+    { c: [{ id: "x" }] },
+  )
+  // A session with both a permission and a question pending reports the sum —
+  // the same request object is never duplicated across records.
+  assert.deepEqual(
+    mergePendingRequests({ s: [{ id: "perm" }] }, { s: [{ id: "question" }] }),
+    { s: [{ id: "perm" }, { id: "question" }] },
+  )
 })
 
 test("returns only exact unassociated child requests for parent fallback", () => {

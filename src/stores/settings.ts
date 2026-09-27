@@ -6,6 +6,7 @@ import { clampPageSize, mergeStoredSettings } from "../lib/settings-merge"
 import { setAppLocale } from "../lib/i18n/config"
 import type { LocalePreference } from "../lib/i18n/locale-resolve"
 import type { AccentName } from "../lib/accents"
+import type { SessionListScope } from "../lib/session-list-scope"
 
 const SETTINGS_KEY = "opencode_settings"
 
@@ -28,6 +29,8 @@ interface Settings {
   accent: AccentName
   /** Message font size as a percentage of the base size (e.g. 120 = 120%). */
   fontSize: number
+  /** Which sessions the list shows: the active connection's workspace or every session on the server. */
+  sessionListScope: SessionListScope
 }
 
 const DEFAULTS: Settings = {
@@ -37,6 +40,7 @@ const DEFAULTS: Settings = {
   theme: "system",
   accent: "violet",
   fontSize: 100,
+  sessionListScope: "workspace",
 }
 
 interface SettingsState extends Settings {
@@ -48,6 +52,7 @@ interface SettingsState extends Settings {
   setTheme: (theme: ThemePreference) => Promise<void>
   setAccent: (accent: AccentName) => Promise<void>
   setFontSize: (percent: number) => Promise<void>
+  setSessionListScope: (scope: SessionListScope) => Promise<void>
 }
 
 function snapshot(get: () => SettingsState): Settings {
@@ -58,6 +63,7 @@ function snapshot(get: () => SettingsState): Settings {
     theme: get().theme,
     accent: get().accent,
     fontSize: get().fontSize,
+    sessionListScope: get().sessionListScope,
   }
 }
 
@@ -116,5 +122,10 @@ export const useSettings = create<SettingsState>((set, get) => ({
     const clamped = Math.min(FONT_SCALE_MAX, Math.max(FONT_SCALE_MIN, Math.round(percent)))
     set({ fontSize: clamped }) // re-renders message/markdown fonts
     await persist({ ...snapshot(get), fontSize: clamped })
+  },
+
+  setSessionListScope: async (scope) => {
+    set({ sessionListScope: scope })
+    await persist({ ...snapshot(get), sessionListScope: scope })
   },
 }))

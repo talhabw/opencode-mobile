@@ -4,7 +4,7 @@ import { Ionicons } from "@expo/vector-icons"
 import { useTranslation } from "react-i18next"
 
 interface Props {
-  permission: { id: string; permission: string; patterns: string[] }
+  permission: { id: string; permission: string; patterns: string[]; message?: string }
   isDark: boolean
   onReply: (reply: "once" | "always" | "reject") => void
 }
@@ -26,6 +26,7 @@ export function PermissionPrompt({ permission, isDark, onReply }: Props) {
       <Text style={[s.type, isDark && s.typeDark]}>
         {permission.permission}: {permission.patterns.join(", ")}
       </Text>
+      {permission.message && <Text style={[s.message, isDark && s.messageDark]}>{permission.message}</Text>}
       <View style={s.actions}>
         <TouchableOpacity style={[s.btn, s.deny]} onPress={() => reply("reject")}>
           <Text style={s.denyText}>{t("chat.permissionPrompt.deny")}</Text>
@@ -56,6 +57,8 @@ const s = StyleSheet.create({
   textWhite: { color: "#ffffff" },
   type: { fontSize: 13, color: "#78350f", marginBottom: 12 },
   typeDark: { color: "#d4a574" },
+  message: { fontSize: 13, lineHeight: 18, color: "#78350f", marginTop: -6, marginBottom: 12 },
+  messageDark: { color: "#d4a574" },
   actions: { flexDirection: "row", gap: 8 },
   btn: { flex: 1, paddingVertical: 10, borderRadius: 8, alignItems: "center" },
   deny: { backgroundColor: "#fef2f2" },

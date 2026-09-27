@@ -22,13 +22,15 @@ import { useSessions } from "../../src/stores/sessions"
 import { useConnections } from "../../src/stores/connections"
 import { useEvents } from "../../src/stores/events"
 import { useCatalog } from "../../src/stores/catalog"
+import { useSettings } from "../../src/stores/settings"
 import type BottomSheet from "@gorhom/bottom-sheet"
 import type { Session, Project } from "../../src/lib/sdk"
+import type { SessionListScope } from "../../src/lib/session-list-scope"
 import { DirectorySwitcher, DirectoryBrowserSheet } from "../../src/components/chat"
 import { groupByDirectory } from "../../src/lib/session-grouping"
 import { nameOf } from "../../src/lib/path-utils"
 import { useAccent, type AccentState } from "../../src/lib/accents"
-import { pendingSessionCounts } from "../../src/lib/session-hierarchy"
+import { pendingSessionCounts, mergePendingRequests } from "../../src/lib/session-hierarchy"
 
 function formatTime(timestamp: number, t: (key: string, opts?: Record<string, unknown>) => string): string {
   const date = new Date(timestamp)
@@ -254,9 +256,14 @@ export default function SessionsScreen() {
     recentDirectories,
   } = useConnections()
   const authError = useEvents((s) => s.authError)
+  const permissions = useEvents((s) => s.permissions)
   const questions = useEvents((s) => s.questions)
   const reconnect = useEvents((s) => s.connect)
   const loadCatalog = useCatalog((s) => s.load)
+  // "workspace" shows only the active connection's directory sessions (server
+  // default); "all" restores the cross-workspace list. Persisted preference.
+  const sessionListScope = useSettings((s) => s.sessionListScope ?? "workspace")
+  const setSessionListScope = useSettings((s) => s.setSessionListScope)
   const dirSheetRef = useRef<BottomSheet>(null)
   const browserSheetRef = useRef<BottomSheet>(null)
   const [browseStartDir, setBrowseStartDir] = useState<string | null>(null)
@@ -323,6 +330,14 @@ export default function SessionsScreen() {
     return out
   }, [sessions, childrenByParent, childrenLoading, childrenHasMore, expandedSessions, collapsedDirs])
 
+  // Permissions and questions pend per session; counts and the press target
+  // combine both so descendant permission requests surface as reliably as
+  // descendant form questions.
+  const pendingRequests = useMemo(
+    () => mergePendingRequests(permissions, questions),
+    [permissions, questions],
+  )
+
   // Fetch server-known projects when the new session modal opens
   useEffect(() => {
     if (!showNewSession || !client) return
@@ -348,7 +363,10 @@ export default function SessionsScreen() {
         loadSessions()
         refreshProject()
       }
-    }, [client, loadSessions, refreshProject]),
+      // sessionListScope in deps: toggling the scope (or the persisted
+      // preference hydrating after mount) re-runs the focus effect and
+      // reloads the list for the new scope.
+    }, [client, loadSessions, refreshProject, sessionListScope]),
   )
 
   const onRefresh = useCallback(async () => {
@@ -637,6 +655,68 @@ export default function SessionsScreen() {
         </View>
       )}
 
+      {/* List scope: the active workspace's sessions vs every session on the
+          server. Only meaningful when a workspace (directory) is selected —
+          without one both options query the server unscoped. */}
+      {activeConnection.directory ? (
+        <View style={[styles.scopeToggle, isDark && styles.scopeToggleDark]}>
+          <TouchableOpacity
+            style={[
+              styles.scopeOption,
+              isDark && styles.scopeOptionDark,
+              sessionListScope !== "all" && (isDark ? styles.scopeOptionActiveDark : styles.scopeOptionActive),
+            ]}
+            onPress={() => void setSessionListScope("workspace")}
+            accessibilityRole="button"
+            accessibilityState={{ selected: sessionListScope !== "all" }}
+            testID="scope-workspace-button"
+          >
+            <Ionicons
+              name="folder-outline"
+              size={14}
+              color={sessionListScope !== "all" ? acc.cur.accent : isDark ? "#888888" : "#666666"}
+            />
+            <Text
+              style={[
+                styles.scopeOptionText,
+                isDark && styles.metaDark,
+                sessionListScope !== "all" && styles.scopeOptionTextActive,
+              ]}
+              numberOfLines={1}
+            >
+              {t("sessionsList.scope.workspace")}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[
+              styles.scopeOption,
+              isDark && styles.scopeOptionDark,
+              sessionListScope === "all" && (isDark ? styles.scopeOptionActiveDark : styles.scopeOptionActive),
+            ]}
+            onPress={() => void setSessionListScope("all")}
+            accessibilityRole="button"
+            accessibilityState={{ selected: sessionListScope === "all" }}
+            testID="scope-all-button"
+          >
+            <Ionicons
+              name="globe-outline"
+              size={14}
+              color={sessionListScope === "all" ? acc.cur.accent : isDark ? "#888888" : "#666666"}
+            />
+            <Text
+              style={[
+                styles.scopeOptionText,
+                isDark && styles.metaDark,
+                sessionListScope === "all" && styles.scopeOptionTextActive,
+              ]}
+              numberOfLines={1}
+            >
+              {t("sessionsList.scope.all")}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
+
       <FlatList
         data={rows}
         keyExtractor={(row) => row.type === "header" ? `dir:${row.directory}` : row.type === "session" ? row.session.id : `children:${row.parentID}`}
@@ -655,9 +735,9 @@ export default function SessionsScreen() {
               isDark={isDark}
               onRename={() => handleRename(row.session)}
               onDelete={() => handleDelete(row.session)}
-              pending={pendingSessionCounts(row.session.id, childrenByParent, questions)}
+              pending={pendingSessionCounts(row.session.id, childrenByParent, pendingRequests)}
               onPendingPress={() => {
-                const counts = pendingSessionCounts(row.session.id, childrenByParent, questions)
+                const counts = pendingSessionCounts(row.session.id, childrenByParent, pendingRequests)
                 if (counts.own > 0) {
                   router.push({ pathname: "/session/[id]", params: { id: row.session.id, ...(row.session.directory ? { directory: row.session.directory } : {}) } })
                 } else {
@@ -1074,6 +1154,45 @@ function makeStyles(acc: AccentState) {
   errorText: {
     color: "#dc2626",
     fontSize: 14,
+  },
+  scopeToggle: {
+    flexDirection: "row",
+    gap: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: "#e5e5e5",
+  },
+  scopeToggleDark: {
+    borderBottomColor: "#1a1a1a",
+  },
+  scopeOption: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    paddingVertical: 7,
+    borderRadius: 8,
+    backgroundColor: "#f5f5f5",
+  },
+  scopeOptionDark: {
+    backgroundColor: "#1f1f1f",
+  },
+  scopeOptionActive: {
+    backgroundColor: acc.light.tintBg,
+  },
+  scopeOptionActiveDark: {
+    backgroundColor: acc.dark.tintBg,
+  },
+  scopeOptionText: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: "#666666",
+    flexShrink: 1,
+  },
+  scopeOptionTextActive: {
+    color: acc.cur.accent,
   },
   groupHeader: {
     flexDirection: "row",

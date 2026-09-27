@@ -93,15 +93,10 @@
     "subagentInputNeeded": "子代理需要输入",
     "openSubagentInput": "打开 {{title}} 的输入请求",
     "toolbar": {
-      "auto": "自动",
-      "serverDefault": "服务器默认",
       "agentAccessibilityLabel": "Agent：{{name}}",
       "agentAccessibilityHint": "打开 Agent 选择器以更改当前 Agent",
       "modelAccessibilityLabel": "模型：{{name}}",
-      "modelAccessibilityHint": "打开模型选择器以更改当前模型",
-      "contextLabel": "上下文 {{percent}}%",
-      "contextAccessibilityLabel": "已使用上下文窗口 {{percent}}%",
-      "contextAccessibilityHint": "打开详细使用信息"
+      "modelAccessibilityHint": "打开模型选择器以更改当前模型"
     },
     "banners": {
       "reconnecting": "正在重新连接…（第 {{attempt}} 次尝试）",
@@ -273,6 +268,10 @@
       "daysAgo": "{{count}} 天前"
     },
     "filesCount": "{{count}} 个文件",
+    "scope": {
+      "workspace": "当前工作区",
+      "all": "全部工作区"
+    },
     "hierarchy": {
       "expand": "显示子代理会话",
       "collapse": "隐藏子代理会话",
@@ -397,6 +396,9 @@
         "cancelled": "已取消"
       }
     },
+    "systemMessage": {
+      "instructionsUpdated": "指令已更新"
+    },
     "subagentMessage": {
       "title": "子代理",
       "status": {
@@ -435,32 +437,32 @@
     "modelPicker": {
       "title": "选择模型",
       "searchPlaceholder": "搜索模型...",
-      "useDefault": "使用服务器默认：{{name}}",
-      "useServerDefault": "使用服务器默认",
+      "useDefault": "默认：{{name}}",
+      "useServerDefault": "默认",
       "useServerDefaultDescription": "服务器将为新提示选择模型",
-      "switchDefault": "切换到当前服务器默认：{{name}}",
-      "defaultRowAccessibilityLabel": "使用服务器默认",
+      "switchDefault": "切换到当前默认：{{name}}",
+      "defaultRowAccessibilityLabel": "默认",
       "defaultRowAccessibilityHint": "清除您显式选择的模型并交由服务器决定",
-      "switchDefaultAccessibilityHint": "切换到当前服务器默认"
+      "switchDefaultAccessibilityHint": "切换到当前默认"
     },
     "agentPicker": {
       "title": "选择 Agent",
       "searchPlaceholder": "搜索 Agent...",
-      "useDefault": "使用服务器默认：{{name}}",
-      "useServerDefault": "使用服务器默认",
+      "useDefault": "默认：{{name}}",
+      "useServerDefault": "默认",
       "useServerDefaultDescription": "服务器将为新提示选择 Agent",
-      "switchDefault": "切换到当前服务器默认：{{name}}",
+      "switchDefault": "切换到当前默认：{{name}}",
       "defaultDescription": "服务器将在新提示中选择此项",
-      "defaultRowAccessibilityLabel": "使用服务器默认",
+      "defaultRowAccessibilityLabel": "默认",
       "defaultRowAccessibilityHint": "清除您显式选择的 Agent 并交由服务器决定",
-      "switchDefaultAccessibilityHint": "切换到当前服务器默认",
+      "switchDefaultAccessibilityHint": "切换到当前默认",
       "rowAccessibilityLabel": "选择 Agent {{name}}",
       "rowAccessibilityHint": "新提示将使用此 Agent"
     },
     "variantPicker": {
       "title": "推理强度",
-      "autoLabel": "自动",
-      "autoDescription": "使用模型默认推理强度",
+      "defaultLabel": "默认",
+      "defaultDescription": "使用模型默认推理强度",
       "effort": {
         "low": "速度更快，推理较简略",
         "medium": "推理与速度均衡",

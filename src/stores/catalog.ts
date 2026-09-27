@@ -9,7 +9,7 @@ import {
   type DefaultResolution,
   type Provider,
 } from "../lib/catalog-load"
-import { chooseModelSelection, resolveDefaultAgent } from "../lib/model-selection"
+import { chooseModelSelection } from "../lib/model-selection"
 import { stripTrailingSlash } from "../lib/path-utils"
 
 export type { CatalogScope, DefaultResolution, Provider, ProviderModel } from "../lib/catalog-load"
@@ -88,11 +88,10 @@ export const useCatalog = create<CatalogState>((set, get) => ({
     set(beginCatalogLoad(scope))
 
     try {
-      const [agentResult, commandResult, providerResult, configResult, defaultModelResult] = await Promise.all([
+      const [agentResult, commandResult, providerResult, defaultModelResult] = await Promise.all([
         client.agent.list(),
         client.command.list(),
         client.provider.list(),
-        client.config.get(),
         client.model.default(),
       ])
 
@@ -140,10 +139,15 @@ export const useCatalog = create<CatalogState>((set, get) => ({
       const defaultModel = defaultModelResult && typeof defaultModelResult === "object"
         ? { providerID: defaultModelResult.providerID, modelID: defaultModelResult.id }
         : null
-       const resolvedDefaultAgent = resolveDefaultAgent(configResult, false)
-       const defaultAgent = resolvedDefaultAgent && visible.some((item) =>
-         item.name === resolvedDefaultAgent && (item.mode === "primary" || item.mode === "all"),
-       ) ? resolvedDefaultAgent : null
+       // Mirror the TUI resolution exactly: the server sorts its agent list
+       // with the effective default agent first (config default_agent, else
+       // the first primary agent), so the first visible primary/all agent in
+       // server order IS the default. No config.get() entry-ordering guess is
+       // needed. Sessions without an explicit agent selection still omit the
+       // field on the wire so the server picks its own default.
+       const defaultAgent = visible.find(
+         (item) => item.mode === "primary" || item.mode === "all",
+       )?.name ?? null
 
       if (!isCurrentRequest(request, scope)) return
       set((state) => ({

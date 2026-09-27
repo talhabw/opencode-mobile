@@ -118,11 +118,6 @@ export interface Agent {
 export interface Command {
   name: string
   description?: string
-  agent?: string
-  model?: string
-  template: string
-  subtask?: boolean
-  hints: string[]
 }
 
 export interface Project {
@@ -428,11 +423,6 @@ export function normalizeCommand(value: CommandInfo): Command {
   return {
     name: value.name,
     description: value.description,
-    agent: value.agent,
-    model: value.model ? `${value.model.providerID}/${value.model.id}` : undefined,
-    template: value.template,
-    subtask: value.subtask,
-    hints: [],
   }
 }
 
@@ -461,7 +451,7 @@ export function normalizeProviderCatalog(providers: ProviderInfo[], models: Mode
       }])),
     })),
     default: defaultModel ? { [defaultModel.providerID]: defaultModel.id } : {},
-    connected: providers.filter((provider) => !provider.disabled).map((provider) => provider.id),
+    connected: providers.filter((provider) => provider.activation !== "disabled").map((provider) => provider.id),
   }
 }
 
@@ -488,7 +478,6 @@ export function normalizeEvent(value: EventSubscribeOutput | unknown): Event {
   if (type === "permission.asked") {
     return { type, properties: { ...data, permission: data.action, patterns: data.resources, tool: normalizeTool(data.source) } }
   }
-  if (type === "question.asked") return { type, properties: { ...data, tool: normalizeTool(data.tool) } }
   if (type === "session.created") {
     const location = data.location as { directory?: string; workspaceID?: string } | undefined
     const model = data.model as { providerID?: unknown; id?: unknown; variant?: unknown } | undefined

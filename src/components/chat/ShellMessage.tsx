@@ -56,7 +56,24 @@ export function ShellMessage({ message, isDark }: { message: Message; isDark: bo
 }
 
 export function SystemMessage({ message, parts, isDark }: { message: Message; parts: Array<{ type: string; text?: string }>; isDark: boolean }) {
+  const { t } = useTranslation()
   const text = parts.filter((part) => part.type === "text").map((part) => part.text).filter(Boolean).join("\n")
+  // Type-"system" rows are mid-conversation instruction updates: their text is
+  // the exact privileged rendering the server sent to the model (AGENTS.md
+  // bodies and the like). The TUI treats them as bookkeeping — render a
+  // compact non-content marker instead of dumping the instruction contents
+  // into the transcript. Other system rows (agent/model/location switches,
+  // compaction, skill guidance) keep their short user-facing text.
+  if (message.systemKind === "system") {
+    return (
+      <View style={[styles.system, isDark && styles.rowDark]} testID="chat-system-message">
+        <Ionicons name="document-text-outline" size={14} color={isDark ? "#999999" : "#777777"} />
+        <Text style={[styles.systemText, styles.systemMarker, isDark && styles.textDark]} numberOfLines={2}>
+          {t("chat.systemMessage.instructionsUpdated")}
+        </Text>
+      </View>
+    )
+  }
   if (!text) return null
   return (
     <View style={[styles.system, isDark && styles.rowDark]} testID="chat-system-message">
@@ -83,4 +100,5 @@ const styles = StyleSheet.create({
   truncated: { marginTop: 5, fontSize: 10, color: "#d97706" },
   system: { flexDirection: "row", alignItems: "flex-start", gap: 6, marginBottom: 10, paddingVertical: 4 },
   systemText: { flex: 1, fontSize: 12, lineHeight: 17, color: "#666666" },
+  systemMarker: { fontWeight: "600", color: "#666666" },
 })

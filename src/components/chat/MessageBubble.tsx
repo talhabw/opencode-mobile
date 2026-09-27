@@ -1,4 +1,4 @@
-import { memo } from "react"
+import { memo, useCallback } from "react"
 import { View, Text, Image, StyleSheet, ScrollView, TouchableOpacity, Dimensions } from "react-native"
 import { useTranslation } from "react-i18next"
 import { Markdown } from "../markdown"
@@ -28,19 +28,40 @@ interface Props {
   onLongPress?: (messageID: string) => void
   // Fired by expandable rows (reasoning, tool/task cards) right before their
   // layout change lands, so the screen can keep the tapped header anchored.
-  // The screen MUST pass a stable useCallback: the memo comparator below
-  // bails on identity, and this prop is compared the same way as onLongPress.
-  onToggleExpand?: (id: string, expanded: boolean) => void
+  // The third argument is the element's last measured pre-tap height (null
+  // when it was never laid out). The screen MUST pass a stable useCallback:
+  // the memo comparator below bails on identity, and this prop is compared
+  // the same way as onLongPress.
+  onToggleExpand?: (id: string, expanded: boolean, height: number | null) => void
+  // Fired by expandable rows (reasoning, tool/task cards) with their measured
+  // layout height on every size change, so the screen can attribute expansion
+  // deltas to exactly one tapped card while its anchor is pending. Keys are
+  // message-scoped (message.id + element id). Must be a stable useCallback
+  // for the same reason as onToggleExpand.
+  onElementLayout?: (key: string, height: number) => void
 }
 
 // TODO: Replace with streamdown-rn once React 19 types PR lands - it has
 // built-in block-level memoization that eliminates re-renders for stable blocks
 export const MessageBubble = memo(
-  function MessageBubble({ message, parts, isDark, fontSize = 15, isStreaming = false, onLongPress, onToggleExpand }: Props) {
+  function MessageBubble({ message, parts, isDark, fontSize = 15, isStreaming = false, onLongPress, onToggleExpand, onElementLayout }: Props) {
     const { t } = useTranslation()
     const isUser = message.role === "user"
     const acc = useAccent()
     const s = makeStyles(acc)
+
+    // Expandable rows report a bare element id (tool part id, or the message
+    // id for reasoning); scope it to this message so the screen's anchor can
+    // never confuse two messages' cards. Both wrappers are stable while
+    // message.id and the screen's callbacks are stable, preserving the memo.
+    const toggleExpandKeyed = useCallback(
+      (id: string, expanded: boolean, height: number | null) => onToggleExpand?.(`${message.id}:${id}`, expanded, height),
+      [message.id, onToggleExpand],
+    )
+    const elementLayoutKeyed = useCallback(
+      (id: string, height: number) => onElementLayout?.(`${message.id}:${id}`, height),
+      [message.id, onElementLayout],
+    )
 
     const textParts = parts.filter((p) => p.type === "text")
     const reasoningParts = parts.filter((p) => p.type === "reasoning")
@@ -102,7 +123,13 @@ export const MessageBubble = memo(
 
         {/* Reasoning (collapsible) */}
         {reasoning.length > 0 && (
-          <ReasoningBlock text={reasoning} isDark={isDark} id={message.id} onToggleExpand={onToggleExpand} />
+          <ReasoningBlock
+            text={reasoning}
+            isDark={isDark}
+            id={message.id}
+            onToggleExpand={toggleExpandKeyed}
+            onLayout={elementLayoutKeyed}
+          />
         )}
 
         {/* Message text */}
@@ -123,7 +150,7 @@ export const MessageBubble = memo(
 
         {/* Tool calls */}
         {toolParts.map((tool) => (
-          <ToolCallCard key={tool.id} tool={tool} isDark={isDark} onToggleExpand={onToggleExpand} />
+          <ToolCallCard key={tool.id} tool={tool} isDark={isDark} onToggleExpand={toggleExpandKeyed} onLayout={elementLayoutKeyed} />
         ))}
 
         {message.error && (
@@ -158,6 +185,7 @@ export const MessageBubble = memo(
     // Identity-compared like onLongPress: the screen must pass a stable
     // useCallback so expansion toggles never invalidate the memo.
     if (prev.onToggleExpand !== next.onToggleExpand) return false
+    if (prev.onElementLayout !== next.onElementLayout) return false
     if (prev.parts.length !== next.parts.length) return false
     for (let i = 0; i < prev.parts.length; i++) {
       if (prev.parts[i] !== next.parts[i]) return false

@@ -38,8 +38,7 @@ import {
   type SlashCommand,
   type Attachment,
 } from "../../src/components/chat"
-import { computeSessionUsage } from "../../src/lib/session-usage"
-import { shouldPinToBottom, expansionAnchorDelta } from "../../src/lib/session-scroll"
+import { shouldPinToBottom, anchoredAdjustment, nextAnchoredOffset } from "../../src/lib/session-scroll"
 import { useSessions } from "../../src/stores/sessions"
 import { useEvents, refreshPending, markPendingResolved } from "../../src/stores/events"
 import { useConnections } from "../../src/stores/connections"
@@ -69,8 +68,13 @@ const TITLE_GAP = 16
 // How long an expansion anchor may wait for its layout change to land before
 // being discarded. Real layout changes arrive within a frame or two; the bound
 // only guards against a rapid expand+collapse that nets to zero height change
-// and may never produce a content-size event at all.
+// and may never produce a layout event at all.
 const ANCHOR_PENDING_TIMEOUT_MS = 500
+// Inverted lists shorter than their viewport otherwise have no scroll range,
+// so expansion compensation gets clamped to zero. This space sits at the
+// visual top and covers the capped 300px tool detail without changing rest
+// positions.
+const EXPANSION_SCROLL_RESERVE = 400
 
 const headerTitleStyles = StyleSheet.create({
   wrap: { flex: 1, overflow: "hidden", justifyContent: "flex-start" },
@@ -238,6 +242,7 @@ export default function SessionScreen() {
   const sessionID = currentSession?.id
   const permissions = useEvents((s) => (sessionID ? s.permissions[sessionID] : undefined)) || []
   const questions = useEvents((s) => (sessionID ? s.questions[sessionID] : undefined)) || []
+  const allPermissions = useEvents((s) => s.permissions)
   const allQuestions = useEvents((s) => s.questions)
   const associatedChildIDs = useMemo(() => {
     const ids = new Set<string>()
@@ -253,6 +258,30 @@ export default function SessionScreen() {
     () => sessionID ? unassociatedDescendantPending(sessionID, childrenByParent, allQuestions, associatedChildIDs) : [],
     [sessionID, childrenByParent, allQuestions, associatedChildIDs],
   )
+  // Descendant permission prompts get the same fallback treatment as descendant
+  // questions: a child's pending permission is only actionable in that child's
+  // session, so surface a navigation row here when the child row is not already
+  // associated in-thread. Own-session permissions keep the direct prompt.
+  const fallbackPermissions = useMemo(
+    () => sessionID ? unassociatedDescendantPending(sessionID, childrenByParent, allPermissions, associatedChildIDs) : [],
+    [sessionID, childrenByParent, allPermissions, associatedChildIDs],
+  )
+  // One fallback row per child session, counting every pending request of
+  // either kind so a child with both a permission and a question is listed once.
+  const fallbackRequests = useMemo(() => {
+    const byChild = new Map<string, { count: number }>()
+    for (const request of fallbackQuestions) {
+      const entry = byChild.get(request.sessionID) ?? { count: 0 }
+      entry.count += 1
+      byChild.set(request.sessionID, entry)
+    }
+    for (const request of fallbackPermissions) {
+      const entry = byChild.get(request.sessionID) ?? { count: 0 }
+      entry.count += 1
+      byChild.set(request.sessionID, entry)
+    }
+    return [...byChild.entries()].map(([childSessionID, { count }]) => ({ sessionID: childSessionID, count }))
+  }, [fallbackQuestions, fallbackPermissions])
 
   const shortDir = getShortDir(currentSession?.directory)
   const [showScrollButton, setShowScrollButton] = useState(false)
@@ -630,6 +659,7 @@ export default function SessionScreen() {
   // bottom), kept in a ref so the expansion anchor below can read the latest
   // value without being recreated on every scroll.
   const offsetRef = useRef(0)
+  const [listHeight, setListHeight] = useState(0)
   const handleScroll = useCallback((event: any) => {
     const { contentOffset } = event.nativeEvent
     offsetRef.current = contentOffset.y
@@ -638,21 +668,21 @@ export default function SessionScreen() {
     setShowScrollButton(!atBottom)
   }, [])
 
-  // Last reported content height, for computing signed deltas when an expanded
-  // row grows or shrinks the content (see handleToggleExpand below).
-  const lastContentHeightRef = useRef(0)
-
   // A row expansion/collapse awaiting its layout change. onToggleExpand fires
-  // BEFORE the height change lands; the pending anchor then makes the next
-  // nonzero content-height change scroll by its own signed delta instead of
-  // bottom-pinning, so the tapped header stays under the finger. Bounded by a
-  // timeout so a rapid expand+collapse that nets to zero height change (which
-  // may never emit a content-size event) cannot leave the anchor pending.
-  const pendingAnchorRef = useRef<{ expanded: boolean } | null>(null)
+  // BEFORE the height change lands and carries the card's pre-tap measured
+  // height (captured by the card's own onLayout); while the anchor is pending,
+  // ONLY that card's onLayout height deltas move the viewport, so streaming
+  // growth in unrelated rows can never shift the tapped header, and the anchor
+  // suppresses bottom-pinning so a settling card is never yanked to the
+  // bottom. Bounded by a timeout so a rapid expand+collapse that nets to zero
+  // height change (which may never emit a layout event) cannot leave the
+  // anchor pending — and so an active stream cannot suppress bottom-pinning
+  // forever.
+  const anchorTargetRef = useRef<{ key: string; height: number | null } | null>(null)
   const pendingAnchorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const clearPendingAnchor = useCallback(() => {
-    pendingAnchorRef.current = null
+    anchorTargetRef.current = null
     if (pendingAnchorTimerRef.current) {
       clearTimeout(pendingAnchorTimerRef.current)
       pendingAnchorTimerRef.current = null
@@ -660,14 +690,39 @@ export default function SessionScreen() {
   }, [])
 
   // Stable across renders (reads refs only) so MessageBubble's custom memo
-  // comparator can bail safely without risking a stale handler.
-  const handleToggleExpand = useCallback((_id: string, expanded: boolean) => {
+  // comparator can bail safely without risking a stale handler. `height` is
+  // the tapped card's last measured pre-tap height (null if it was never laid
+  // out — the first onLayout pass then becomes the baseline).
+  const handleToggleExpand = useCallback((key: string, _expanded: boolean, height: number | null) => {
     if (pendingAnchorTimerRef.current) clearTimeout(pendingAnchorTimerRef.current)
-    pendingAnchorRef.current = { expanded }
+    anchorTargetRef.current = { key, height }
     pendingAnchorTimerRef.current = setTimeout(() => {
-      pendingAnchorRef.current = null
+      anchorTargetRef.current = null
       pendingAnchorTimerRef.current = null
     }, ANCHOR_PENDING_TIMEOUT_MS)
+  }, [])
+
+  // Layout-height reports from expandable cards (via MessageBubble's
+  // onElementLayout). Only the anchored card's own deltas adjust the offset:
+  // other cards report different keys and are ignored, which is what keeps
+  // unrelated streaming/row-height growth from being misattributed to the
+  // anchor. Anchored offsets accumulate on the last anchored offset
+  // (nextAnchoredOffset) because onScroll is throttled and may not have
+  // reported the previous anchored position between two layout passes.
+  const handleElementLayout = useCallback((key: string, height: number) => {
+    const anchor = anchorTargetRef.current
+    const adjustment = anchoredAdjustment({
+      key,
+      anchorKey: anchor?.key ?? null,
+      previousHeight: anchor?.height ?? null,
+      height,
+    })
+    if (adjustment === null || anchor === null) return
+    anchor.height = height
+    if (adjustment !== 0) {
+      offsetRef.current = nextAnchoredOffset(offsetRef.current, adjustment)
+      flatListRef.current?.scrollToOffset({ offset: offsetRef.current, animated: false })
+    }
   }, [])
 
   // Clear the anchor timer if the screen unmounts before the layout lands.
@@ -678,29 +733,20 @@ export default function SessionScreen() {
   // Fires on every content-height change (new messages AND text streaming into
   // an existing bubble). Without this, maintainVisibleContentPosition anchors
   // the viewport on the previously-visible item, so newly streamed text stays
-  // hidden just below the fold.
-  const handleContentSizeChange = useCallback((_contentWidth: number, contentHeight: number) => {
-    // Signed delta is 0 on the very first event (no previous height to compare).
-    const delta = lastContentHeightRef.current > 0 ? contentHeight - lastContentHeightRef.current : 0
-    lastContentHeightRef.current = contentHeight
-    // Expansion anchor: the tapped row just grew or shrunk by `delta`. In the
-    // inverted list the content above the row slides by `delta` against the
-    // bottom-anchored viewport, so the offset must move by the same signed
-    // delta (a collapse reports a negative delta and moves back) — clamped at
-    // 0 and unanimated so it lands in the same frame as the layout change.
-    // This change must also NOT bottom-pin, or the snap to offset 0 would fight
-    // the anchor.
-    if (expansionAnchorDelta({ delta, pending: pendingAnchorRef.current !== null }) !== null) {
-      flatListRef.current?.scrollToOffset({ offset: Math.max(0, offsetRef.current + delta), animated: false })
-      clearPendingAnchor()
-      return
-    }
+  // hidden just below the fold. While the expansion anchor is pending these
+  // global deltas are ignored — compensation comes solely from the tapped
+  // card's own onLayout deltas, and bottom-pinning here would fight the
+  // anchor mid-settling (a collapse would otherwise snap the tapped header
+  // back to offset 0).
+  const handleContentSizeChange = useCallback((_contentWidth: number, _contentHeight: number) => {
+    if (anchorTargetRef.current !== null) return
     if (shouldPinToBottom({ trigger: "content-change", nearBottom: atBottomRef.current })) {
       flatListRef.current?.scrollToOffset({ offset: 0, animated: false })
     }
-  }, [clearPendingAnchor])
+  }, [])
 
-  const handleListLayout = useCallback(() => {
+  const handleListLayout = useCallback((event: { nativeEvent: { layout: { height: number } } }) => {
+    setListHeight(Math.round(event.nativeEvent.layout.height))
     if (shouldPinToBottom({ trigger: "layout-change", nearBottom: atBottomRef.current })) {
       flatListRef.current?.scrollToOffset({ offset: 0, animated: false })
     }
@@ -759,11 +805,8 @@ export default function SessionScreen() {
 
   const handleQuestionReply = async (request: PendingInput, answers: string[][]) => {
     if (!sessionClient) throw new Error("No session client")
-    if (request.transport === "form" && request.formID) {
-      await sessionClient.form.reply({ sessionID: request.sessionID, formID: request.formID, answer: toFormAnswer(request, answers) })
-    } else {
-      await sessionClient.question.reply(request.id, answers, request.sessionID)
-    }
+    if (!request.formID) throw new Error("Question form is missing its form ID")
+    await sessionClient.form.reply({ sessionID: request.sessionID, formID: request.formID, answer: toFormAnswer(request, answers) })
     markPendingResolved("question", request.id, true)
     useEvents.setState((state) => ({
       questions: {
@@ -775,11 +818,8 @@ export default function SessionScreen() {
 
   const handleQuestionReject = async (request: PendingInput) => {
     if (!sessionClient) throw new Error("No session client")
-    if (request.transport === "form" && request.formID) {
-      await sessionClient.form.cancel({ sessionID: request.sessionID, formID: request.formID })
-    } else {
-      await sessionClient.question.reject(request.id, request.sessionID)
-    }
+    if (!request.formID) throw new Error("Question form is missing its form ID")
+    await sessionClient.form.cancel({ sessionID: request.sessionID, formID: request.formID })
     markPendingResolved("question", request.id, true)
     useEvents.setState((state) => ({
       questions: {
@@ -789,34 +829,99 @@ export default function SessionScreen() {
     }))
   }
 
+  // Mirror the TUI prompt flow: selecting a model that offers reasoning-effort
+  // variants while no valid variant is set chains straight into the effort
+  // picker so effort can be chosen up front — the toolbar chip stays absent
+  // until a variant is actually selected. Give the model sheet a beat to finish
+  // closing first so both sheets don't contend for the backdrop.
+  const variantPickerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const maybeOpenVariantPicker = useCallback(
+    (target: { providerID: string; modelID: string } | null) => {
+      // A new selection replaces any pending chained picker, and the timer is
+      // cleared on unmount too, so the sheet can never open after navigation.
+      if (variantPickerTimerRef.current) {
+        clearTimeout(variantPickerTimerRef.current)
+        variantPickerTimerRef.current = null
+      }
+      if (!target) return
+      const provider = providers.find((p) => p.id === target.providerID)
+      const options = provider?.models.find((m) => m.id === target.modelID)?.variants
+      if (!options || Object.keys(options).length === 0) return
+      const active = useCatalog.getState().variant
+      if (active !== null && active in options) return
+      variantPickerTimerRef.current = setTimeout(() => {
+        variantPickerTimerRef.current = null
+        variantSheetRef.current?.expand()
+      }, 250)
+    },
+    [providers],
+  )
+
+  // Cancel the chained picker timer if the screen unmounts before it fires.
+  useEffect(
+    () => () => {
+      if (variantPickerTimerRef.current) {
+        clearTimeout(variantPickerTimerRef.current)
+        variantPickerTimerRef.current = null
+      }
+    },
+    [],
+  )
+
   const handleModelSelect = useCallback(
     (providerID: string, modelID: string) => {
       setModel({ providerID, modelID })
+      // Chain into the effort picker when the chosen model offers variants and
+      // no valid variant is selected yet (TUI behavior).
+      maybeOpenVariantPicker({ providerID, modelID })
     },
-    [setModel],
+    [setModel, maybeOpenVariantPicker],
   )
 
   // Current agent display: catalog.agent is the canonical id used for wire
   // selection; the toolbar shows the human-readable label when available.
   const currentAgent = agents.find((a) => a.name === agent)
   const agentColor = currentAgent?.color || acc.cur.accent
+  // Effective defaults mirror the TUI prompt bar: with no explicit selection
+  // the toolbar shows the concrete resolved values (config default agent and
+  // model.default), never an "Auto"/"Server default" placeholder. The agent
+  // chip falls back to the first primary agent the server lists so it stays
+  // concrete even before config resolution.
   const defaultAgentLabel = catalog.defaultAgent ? agents.find((a) => a.name === catalog.defaultAgent)?.label || catalog.defaultAgent : null
+  const firstPrimaryAgent = agents.find((a) => a.mode === "primary" || a.mode === "all")
+  const agentLabel = selectorLabel(
+    agent ? (currentAgent?.label || agent) : null,
+    defaultAgentLabel,
+    firstPrimaryAgent ? firstPrimaryAgent.label || firstPrimaryAgent.name : "",
+  )
   const defaultModelLabel = catalog.defaultModel ? providers.find((p) => p.id === catalog.defaultModel?.providerID)?.models.find((m) => m.id === catalog.defaultModel?.modelID)?.name || catalog.defaultModel.modelID : null
-  const agentLabel = selectorLabel(agent ? (currentAgent?.label || agent) : null, catalog.defaultResolution.agent === "resolved" ? defaultAgentLabel : null, t("session.toolbar.serverDefault"))
-  const modelLabel = model?.modelID
-    ? providers.find((p) => p.id === model.providerID)?.models.find((m) => m.id === model.modelID)?.name || model.modelID
-    : catalog.defaultResolution.model === "resolved" && defaultModelLabel ? defaultModelLabel : t("session.toolbar.serverDefault")
+  // Unresolved model display falls back to the first available connected
+  // provider/model (TUI-like concrete default) so the chip/accessibility label
+  // is never empty when models exist.
+  const firstAvailableModel = providers[0]?.models[0]
+  const modelLabel = selectorLabel(
+    model?.modelID
+      ? providers.find((p) => p.id === model.providerID)?.models.find((m) => m.id === model.modelID)?.name || model.modelID
+      : null,
+    defaultModelLabel,
+    firstAvailableModel ? firstAvailableModel.name || firstAvailableModel.id : "",
+  )
 
-  // Variants for current model (for reasoning effort picker)
+  // Variants for the effective model (explicit selection, or the inherited
+  // server default when none was picked) — the reasoning effort the picker and
+  // chip reason about, and what the next prompt would actually run under.
+  const effectiveModel = model ?? catalog.defaultModel
   const currentModelVariants = useMemo(() => {
-    if (!model) return undefined
-    const provider = providers.find((p) => p.id === model.providerID)
-    const found = provider?.models.find((m) => m.id === model.modelID)
+    if (!effectiveModel) return undefined
+    const provider = providers.find((p) => p.id === effectiveModel.providerID)
+    const found = provider?.models.find((m) => m.id === effectiveModel.modelID)
     return found?.variants
-  }, [model, providers])
-
-  // Token usage: last assistant message token count vs its model context limit (same as SessionInfo)
-  const usage = useMemo(() => computeSessionUsage(messages || [], providers), [messages, providers])
+  }, [effectiveModel, providers])
+  const variantOptionKeys = currentModelVariants ? Object.keys(currentModelVariants) : []
+  // Only a variant the effective model actually lists counts as active.
+  // Unset/invalid selections keep the toolbar chip absent (TUI behavior), and
+  // the chained picker above lets the user settle one up front.
+  const activeVariant = variant !== null && variantOptionKeys.includes(variant) ? variant : null
 
   return (
     <>
@@ -940,9 +1045,13 @@ export default function SessionScreen() {
                   isStreaming={item.message.id === streamingMessageID}
                   onLongPress={handleMessageLongPress}
                   onToggleExpand={handleToggleExpand}
+                  onElementLayout={handleElementLayout}
                 />
               )}
-              contentContainerStyle={s.messageList}
+              contentContainerStyle={[
+                s.messageList,
+                listHeight > 0 ? { minHeight: listHeight + EXPANSION_SCROLL_RESERVE } : undefined,
+              ]}
               onScroll={handleScroll}
               scrollEventThrottle={100}
               onContentSizeChange={handleContentSizeChange}
@@ -977,10 +1086,10 @@ export default function SessionScreen() {
           </View>
         )}
 
-        {fallbackQuestions.length > 0 && (
+        {fallbackRequests.length > 0 && (
           <View style={[s.subagentFallback, isDark && s.subagentFallbackDark]} accessibilityRole="summary">
             <Text style={[s.subagentFallbackTitle, isDark && s.textWhite]}>{t("session.subagentInputNeeded")}</Text>
-            {Array.from(new Map(fallbackQuestions.map((request) => [request.sessionID, request])).values()).map((request) => {
+            {fallbackRequests.map((request) => {
               const child = findCachedSession(request.sessionID, sessions, childrenByParent, currentSession)
               return (
                 <TouchableOpacity
@@ -994,7 +1103,7 @@ export default function SessionScreen() {
                   <Text style={[s.subagentFallbackText, isDark && s.textWhite]} numberOfLines={1}>
                     {child?.title || t("session.titleFallback")} ({request.sessionID})
                   </Text>
-                  <Text style={[s.subagentFallbackCount, { color: acc.cur.primary }]}>{t("chat.toolCallCard.inputNeeded", { count: (allQuestions[request.sessionID] || []).length })}</Text>
+                  <Text style={[s.subagentFallbackCount, { color: acc.cur.primary }]}>{t("chat.toolCallCard.inputNeeded", { count: request.count })}</Text>
                 </TouchableOpacity>
               )
             })}
@@ -1063,33 +1172,20 @@ export default function SessionScreen() {
             </Text>
           </TouchableOpacity>
 
-          {currentModelVariants && Object.keys(currentModelVariants).length > 0 && (
+          {/* Variant (reasoning effort) chip — like the TUI prompt bar it only
+              appears once a variant is actually selected. */}
+          {activeVariant && (
             <TouchableOpacity
-              style={[s.variantChip, isDark && s.variantChipDark, variant && s.variantChipActive]}
+              style={[s.variantChip, isDark && s.variantChipDark, s.variantChipActive]}
               onPress={() => variantSheetRef.current?.expand()}
               testID="variant-chip"
             >
-              <Ionicons name="flash-outline" size={14} color={variant ? acc.cur.accent : isDark ? "#888888" : "#666666"} />
-              <Text style={[s.variantLabel, isDark && s.metaDark, variant && s.variantLabelActive]} numberOfLines={1}>
-              {variant ? variant.charAt(0).toUpperCase() + variant.slice(1) : t("session.toolbar.serverDefault")}
+              <Ionicons name="flash-outline" size={14} color={acc.cur.accent} />
+              <Text style={[s.variantLabel, isDark && s.metaDark, s.variantLabelActive]} numberOfLines={1}>
+                {activeVariant.charAt(0).toUpperCase() + activeVariant.slice(1)}
               </Text>
             </TouchableOpacity>
           )}
-
-          <TouchableOpacity
-            style={[s.tokenChip, isDark && s.tokenChipDark]}
-            onPress={() => setShowInfo((v) => !v)}
-            testID="token-percent-chip"
-            accessibilityRole="button"
-            accessibilityLabel={t("session.toolbar.contextAccessibilityLabel", { percent: usage.percent ?? "?" })}
-            accessibilityHint={t("session.toolbar.contextAccessibilityHint")}
-            accessibilityState={{ expanded: showInfo }}
-          >
-            <Ionicons name="speedometer-outline" size={14} color={isDark ? "#888888" : "#666666"} />
-            <Text style={[s.tokenLabel, isDark && s.metaDark]} numberOfLines={1}>
-              {t("session.toolbar.contextLabel", { percent: usage.percent ?? "?" })}
-            </Text>
-          </TouchableOpacity>
         </View>
 
         {/* Attachment preview */}
@@ -1173,6 +1269,9 @@ export default function SessionScreen() {
         onSelectDefault={(selection) => {
           setModel(selection)
           setVariant(null)
+          // Choosing the server-default model row inherits the default model;
+          // chain into the effort picker when it offers variants.
+          maybeOpenVariantPicker(selection ?? catalog.defaultModel)
         }}
         isDark={isDark}
         onSelect={handleModelSelect}
@@ -1193,7 +1292,7 @@ export default function SessionScreen() {
       <VariantPicker
         sheetRef={variantSheetRef}
         variants={currentModelVariants}
-        selected={variant}
+        selected={activeVariant}
         isDark={isDark}
         onSelect={setVariant}
       />
@@ -1311,21 +1410,6 @@ function makeStyles(acc: AccentState) {
   variantChipActive: { backgroundColor: acc.light.tintBg },
   variantLabel: { fontSize: 12, color: "#666666" },
   variantLabelActive: { color: acc.light.accent },
-
-  // Token usage chip (context percent)
-  tokenChip: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 4,
-    backgroundColor: "#f5f5f5",
-    borderRadius: 12,
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    marginLeft: "auto",
-    flexShrink: 1,
-  },
-  tokenChipDark: { backgroundColor: "#1a1a1a" },
-  tokenLabel: { fontSize: 12, color: "#666666", flexShrink: 1 },
 
   // Input
   inputContainer: {

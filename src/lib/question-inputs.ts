@@ -1,8 +1,8 @@
-// Canonical view of a pending agent question, unified across the two server
-// transports that can surface one:
-// - "question": the legacy question API (question.asked / question.request)
-// - "form": the forms API the question tool targets on newer servers
-//   (form.created events with metadata.kind === "question")
+// Canonical view of a pending agent question. The server surfaces the
+// question tool through the forms API — a form whose metadata.kind is
+// "question" is the authoritative source of truth. There is no legacy
+// question API/event transport anymore (beta-18743 has no question module),
+// so every pending input maps from a question-kind form.
 
 export interface PendingInputOption {
   label: string
@@ -17,7 +17,7 @@ export interface PendingInputQuestion {
   custom?: boolean
 }
 
-export type PendingInputTransport = "question" | "form"
+export type PendingInputTransport = "form"
 
 export type FormFieldKind = "string" | "multiselect" | "number" | "integer" | "boolean" | "external"
 
@@ -26,8 +26,8 @@ export interface PendingInputTool {
   callID: string
 }
 
-// Structurally compatible with the legacy PendingQuestion wire shape, so the
-// store buckets and badge consumers keep working with either transport.
+// Structurally compatible with how the store buckets pending questions, so
+// bucket consumers keep working regardless of transport.
 export interface PendingInput {
   id: string
   sessionID: string
@@ -37,17 +37,6 @@ export interface PendingInput {
   formID?: string
   fieldKeys?: string[]
   fieldTypes?: FormFieldKind[]
-}
-
-export interface QuestionRequestLike {
-  id: string
-  sessionID: string
-  questions: PendingInputQuestion[]
-  tool?: PendingInputTool
-}
-
-export function fromQuestionRequest(request: QuestionRequestLike): PendingInput {
-  return { ...request, transport: "question" }
 }
 
 // Structural subset of the SDK's FormInfo the mappers actually read. Field
@@ -178,17 +167,4 @@ export function toFormAnswer(view: PendingInput, answers: string[][]): Record<st
     answer[key] = fieldTypes[index] === "multiselect" ? selected : selected[0] ?? ""
   }
   return answer
-}
-
-// Merges both transports' pending inputs, dropping duplicate ids so a request
-// recovered via both the question and form APIs only renders once.
-export function dedupePendingInputs(inputs: readonly PendingInput[]): PendingInput[] {
-  const seen = new Set<string>()
-  const merged: PendingInput[] = []
-  for (const input of inputs) {
-    if (seen.has(input.id)) continue
-    seen.add(input.id)
-    merged.push(input)
-  }
-  return merged
 }

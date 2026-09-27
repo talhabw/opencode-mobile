@@ -19,6 +19,7 @@ import { mergeIncomingMessage } from "../lib/message-merge"
 import { isColdSessionLoad, isLiveEventForSession } from "../lib/session-load-reconcile"
 import { appendCursorPage, dedupePage, mergeCursorRefresh, mergeCursorRefreshSnapshot, mergePartsRefreshSnapshot, prependCursorPage, truncateCommittedRevert } from "../lib/cursor-pagination"
 import { attachmentUri } from "../lib/session-request"
+import { sessionInListScope } from "../lib/session-list-scope"
 import { childCountsFromSessions, decrementChildCount, findCachedSession, incrementChildCount, purgeSessionHierarchy, upsertSessionHierarchy } from "../lib/session-hierarchy"
 
 // Fast-fail bound for the sessions list on app start/open. A dead or
@@ -42,6 +43,12 @@ function parseMessages(response: MessageWithParts[]): { messages: Message[]; par
 
 function pageSize(): number {
   return useSettings.getState().pageSize
+}
+
+// Which universe of sessions the list shows: only the active connection's
+// workspace (server default), or every session on the server ("all").
+function listScope() {
+  return useSettings.getState().sessionListScope ?? "workspace"
 }
 
 interface SessionsState {
@@ -119,7 +126,20 @@ let hierarchyConnection: ReturnType<typeof useConnections.getState>["clientBase"
 
 function connectionScope(): string {
   const state = useConnections.getState()
-  return `${state.activeConnection?.id ?? ""}\u0000${state.activeConnection?.directory ?? ""}\u0000${state.clientBase?.baseUrl ?? ""}`
+  // The list scope is part of the cache identity: switching between
+  // workspace/all invalidates hierarchy caches and seq guards so a response
+  // fetched for one scope never commits into the other.
+  return `${state.activeConnection?.id ?? ""}\u0000${state.activeConnection?.directory ?? ""}\u0000${state.clientBase?.baseUrl ?? ""}\u0000${listScope()}`
+}
+
+// Client for listing sessions, matching the selected scope. "workspace" uses
+// the active connection's client, whose directory query param makes the
+// server return only that directory's sessions (exact location.directory
+// match). "all" queries unscoped, like the pre-scope behavior.
+function listClient(): Client | null {
+  const connState = useConnections.getState()
+  if (listScope() === "workspace") return connState.client
+  return connState.clientForDirectory(undefined) || connState.client
 }
 
 function upsertHierarchy(state: SessionsState, session: Session): Partial<SessionsState> {
@@ -189,9 +209,8 @@ export const useSessions = create<SessionsState>((set, get) => ({
   error: null,
 
   loadSessions: async () => {
-    const connState = useConnections.getState()
     // Session rows carry their location, which scopes all subsequent calls.
-    const client = connState.clientForDirectory(undefined) || connState.client
+    const client = listClient()
     if (!client) {
       set({ error: "No active connection" })
       return
@@ -217,12 +236,25 @@ export const useSessions = create<SessionsState>((set, get) => ({
       set({ isSessionsLoading: true, error: null })
       const page = await client.session.page({ limit: 50, order: "desc", parentID: null }, SESSION_LIST_TIMEOUT_MS)
       if (seq !== rootListSeq || scope !== connectionScope() || connection !== useConnections.getState().clientBase) return
-      set({
+      // A successful root-list load starts a new children epoch: previously
+      // expanded parents keep their cached rows on screen (no flicker), but
+      // the loaded/cursor flags reset and each is refetched below. Without
+      // this, new subagent sessions never appear on pull-to-refresh — the
+      // sticky childrenLoaded guard made the first expand's data permanent
+      // until an app restart.
+      const refetchParents = Object.keys(get().childrenLoaded)
+      set((state) => ({
         sessions: dedupePage(page).filter((session) => !session.parentID),
         sessionCursor: page.cursor,
         hasMoreSessions: Boolean(page.cursor.next),
         isSessionsLoading: false,
-      })
+        childrenLoading: {},
+        childrenLoaded: {},
+        childrenHasMore: {},
+        childrenCursor: {},
+        childrenGeneration: Object.fromEntries(Object.entries(state.childrenGeneration).map(([id, generation]) => [id, generation + 1])),
+      }))
+      for (const parentID of refetchParents) void get().loadChildren(parentID)
       // Prefetch directory-wide child counts: an unfiltered list includes
       // child sessions, so rows can show (or omit) the expand chevron without
       // per-parent fetches. Fire-and-forget — the same seq/scope/connection
@@ -241,8 +273,7 @@ export const useSessions = create<SessionsState>((set, get) => ({
   },
 
   loadMoreSessions: async () => {
-    const connState = useConnections.getState()
-    const client = connState.clientForDirectory(undefined) || connState.client
+    const client = listClient()
     const cursor = get().sessionCursor.next
     if (!client || !cursor || get().loadingMoreSessions) return
 
@@ -738,12 +769,21 @@ export const useSessions = create<SessionsState>((set, get) => ({
     if (event.type === "session.created" || event.type === "session.updated") {
       const session = (props.info || props) as Session | undefined
       if (!session?.id) return
-      set((state) => ({
-        ...upsertHierarchy(state, session),
-        childCounts: event.type === "session.created" ? incrementChildCount(state.childCounts, session.parentID) : state.childCounts,
-        currentSession: state.currentSession?.id === session.id ? session : state.currentSession,
-        isSessionLoading: isLiveEventForSession(session.id, state.currentSession?.id) ? false : state.isSessionLoading,
-      }))
+      set((state) => {
+        // The SSE stream carries events for every workspace on the server.
+        // In workspace scope, only admit sessions belonging to the active
+        // directory — same exact-match rule the scoped list query uses — so
+        // a creation in another workspace can't pollute the list until the
+        // next refresh. currentSession stays synced either way: an open
+        // session screen needs its updates regardless of list membership.
+        const admitted = sessionInListScope(listScope(), useConnections.getState().activeConnection?.directory, session.directory)
+        return {
+          ...(admitted ? upsertHierarchy(state, session) : {}),
+          childCounts: event.type === "session.created" && admitted ? incrementChildCount(state.childCounts, session.parentID) : state.childCounts,
+          currentSession: state.currentSession?.id === session.id ? session : state.currentSession,
+          isSessionLoading: isLiveEventForSession(session.id, state.currentSession?.id) ? false : state.isSessionLoading,
+        }
+      })
       return
     }
 

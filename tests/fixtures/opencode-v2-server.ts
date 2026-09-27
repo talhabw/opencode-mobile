@@ -7,6 +7,7 @@ import type {
   SessionInfo,
   SessionMessageAssistant,
   SessionMessageShell,
+  SessionMessageSystem,
   SessionMessageUser,
 } from "@opencode-ai/client"
 
@@ -28,37 +29,49 @@ const model = (modelID: string, name: string, variants: string[] = []) => ({
   cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }], limit: { context: 32768, output: 4096 }, variants: variants.map((id) => ({ id })), status: "active", enabled: true, time: { released: now }, package: "fixture",
 }) satisfies ModelInfo
 const models = [model("fixture-model", "Fixture Model", ["fast", "deep"]), model("fixture-small", "Fixture Small")]
-const provider = { id: "fixture", name: "Fixture Provider", package: "fixture", disabled: false } satisfies ProviderInfo
+const provider = { id: "fixture", name: "Fixture Provider", package: "fixture", activation: "enabled" } satisfies ProviderInfo
 const clients = new Set<Client>()
 let sessions: Json[]
 let messages = new Map<string, Json[]>()
-let questions: Json[]
 let permissions: Json[]
 let forms: Json[]
 let eventSequence = 0
 let messageSequence = 1
 let formSequence = 0
+// One-shot test hook flag: when armed, the next /api/event subscription stays
+// open without the usual immediate server.connected handshake (healthy-but-idle
+// SSE reconnect). Consumed by exactly one subscription, then normal behavior
+// resumes. See /fixture/reconnect-silent.
+let silentNextConnect = false
 
-const session = (id: string, title: string, parentID?: string): SessionInfo => ({ id, ...(parentID ? { parentID } : {}), projectID: project.id, agent: "build", model: { id: "fixture-model", providerID: "fixture", variant: "fast" }, location: { directory: root }, title, cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }, time: { created: now, updated: now } })
+const session = (id: string, title: string, parentID?: string, directory: string = root): SessionInfo => ({ id, ...(parentID ? { parentID } : {}), projectID: project.id, agent: "build", model: { id: "fixture-model", providerID: "fixture", variant: "fast" }, location: { directory }, title, cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }, time: { created: now, updated: now } })
 const user = (id: string, _sessionID: string, text: string): SessionMessageUser => ({ type: "user", id, text, time: { created: now } })
 const assistant = (id: string, text: string): SessionMessageAssistant => ({ type: "assistant", id, agent: "build", model: { id: "fixture-model", providerID: "fixture" }, cost: 0, tokens: { input: 3, output: 7, reasoning: 0, cache: { read: 0, write: 0 } }, content: [{ type: "text", text }], finish: "stop", time: { created: now, completed: now + 1 } })
 
 function reset() {
   const rootSession = session("fixture-root", "Fixture root session")
   const child = session("fixture-child", "Fixture child task", rootSession.id as string)
-  sessions = [rootSession, child]
+  // A session in a second directory so workspace-scoped list queries have
+  // something to exclude (the server filters by exact location.directory).
+  const other = session("fixture-other", "Other workspace session", undefined, "/fixture/other")
+  sessions = [rootSession, child, other]
   messages = new Map([
-    [rootSession.id as string, [user("fixture-user-1", rootSession.id as string, "Show me the fixture transcript"), assistant("fixture-assistant-1", "This is a deterministic v2 fixture response.")]],
+    [rootSession.id as string, [
+      user("fixture-user-1", rootSession.id as string, "Show me the fixture transcript"),
+      assistant("fixture-assistant-1", "This is a deterministic v2 fixture response."),
+      { type: "system", id: "fixture-instructions", text: `Instruction context updated\n${"Do not render this instruction body. ".repeat(40)}`, time: { created: now + 2 } } satisfies SessionMessageSystem,
+    ]],
     [child.id as string, [user("fixture-child-user", child.id as string, "Inspect the workspace"), { ...assistant("fixture-child-assistant", "Workspace inspection complete."), content: [{ type: "tool", id: "call-child", name: "shell", time: { created: now, completed: now + 1 }, state: { status: "completed", input: { command: "ls" }, content: [{ type: "text", text: "fixture.txt" }] } }] } satisfies SessionMessageAssistant]],
   ])
   messages.get(rootSession.id as string)!.push({ type: "assistant", id: "fixture-task", agent: "build", model: { id: "fixture-model", providerID: "fixture" }, content: [{ type: "tool", id: "call-task", name: "task", time: { created: now, completed: now + 1 }, state: { status: "completed", input: { description: "Inspect workspace", subagent_type: "explore" }, content: [{ type: "text", text: "Delegated to fixture-child" }], metadata: { sessionId: child.id, parentSessionId: rootSession.id } } }], time: { created: now, completed: now + 1 } } satisfies SessionMessageAssistant)
   messages.get(rootSession.id as string)!.push({ type: "shell", id: "fixture-shell", shellID: "fixture-shell-1", command: "printf fixture", status: "exited", exit: 0, output: { output: "fixture\n", cursor: 8, size: 8, truncated: false }, time: { created: now, completed: now + 1 } } satisfies SessionMessageShell)
-  questions = [{ id: "fixture-question-1", sessionID: child.id, questions: [{ question: "Continue the child task?", header: "Continue", options: [{ label: "Yes", description: "Continue" }, { label: "No", description: "Stop" }], multiple: false }], tool: { messageID: "fixture-child-assistant", id: "call-child" } }]
-  permissions = []
+  permissions = [{ id: "fixture-permission-1", sessionID: child.id, action: "shell", resources: ["git status"], message: "Inspect the child workspace", source: { messageID: "fixture-child-assistant", id: "call-child" } }]
   forms = []
   eventSequence = 0
   messageSequence = 1
   formSequence = 0
+  silentNextConnect = false
+  forms.push(questionForm(child.id as string, "fixture-child-assistant"))
 }
 reset()
 
@@ -91,17 +104,49 @@ async function handle(request: Request): Promise<Response> {
   const url = new URL(request.url)
   const path = url.pathname
   if (path === "/health" || path === "/api/health") return json({ healthy: true, version: "2.0.0-fixture", pid: 1 })
-  if (path === "/fixture/status") return json({ ready: true, sessions: sessions.length, questions: questions.length, permissions: permissions.length, forms: forms.length })
+  if (path === "/fixture/status") return json({ ready: true, sessions: sessions.length, permissions: permissions.length, forms: forms.length })
   if (path === "/fixture/reset" && request.method === "POST") { reset(); emit("server.connected", {}); return json({ reset: true }) }
+  // Test hook: mutate server state without emitting SSE events, so clients
+  // only learn about the new session through a list refresh. Used to verify
+  // that pull-to-refresh picks up sessions created outside the app.
+  if (path === "/fixture/silent-session" && request.method === "POST") {
+    const input = await body(request)
+    const directory = typeof input.directory === "string" ? input.directory : root
+    const parentID = typeof input.parentID === "string" ? input.parentID : undefined
+    const created = session(`fixture-silent-${sessions.length}`, (input.title as string) || "Silent session", parentID, directory)
+    sessions.unshift(created)
+    messages.set(created.id as string, [])
+    return json({ data: created })
+  }
+  if (path === "/fixture/reconnect-silent" && request.method === "POST") {
+    // Test hook reproducing the healthy-but-idle SSE reconnect: close every
+    // current /api/event stream and arm the one-shot flag so the *next*
+    // subscription stays open without the immediate server.connected handshake.
+    const closed = clients.size
+    for (const client of clients) {
+      try { client.controller.close() } catch {}
+    }
+    clients.clear()
+    silentNextConnect = true
+    return json({ closed, silentNextConnect: true })
+  }
   if (path === "/api/event") {
-    const stream = new ReadableStream<Uint8Array>({ start(controller) { const client = { controller, encoder: new TextEncoder() }; clients.add(client); controller.enqueue(client.encoder.encode(`data: ${JSON.stringify({ id: "fixture-connected", created: Date.now(), type: "server.connected", data: {} })}\n\n`)); request.signal.addEventListener("abort", () => { clients.delete(client); try { controller.close() } catch {} }) }, cancel() {} })
+    const stream = new ReadableStream<Uint8Array>({ start(controller) {
+      const client = { controller, encoder: new TextEncoder() }
+      clients.add(client)
+      if (!silentNextConnect) {
+        controller.enqueue(client.encoder.encode(`data: ${JSON.stringify({ id: "fixture-connected", created: Date.now(), type: "server.connected", data: {} })}\n\n`))
+      }
+      silentNextConnect = false
+      request.signal.addEventListener("abort", () => { clients.delete(client); try { controller.close() } catch {} })
+    }, cancel() {} })
     return new Response(stream, { headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" } })
   }
   if (path === "/api/location") return json(location())
   if (path === "/api/project") return json([{ id: project.id, canonical: root, name: "Fixture project", vcs: "git", time: { created: now, updated: now }, sandboxes: [] }])
   if (path === "/api/project/current") return json({ id: project.id, worktree: root, directory: root, canonical: root, name: "Fixture project" })
   if (path === "/api/agent") return json({ location: location(), data: agents })
-  if (path === "/api/command") return json({ location: location(), data: [{ name: "review", description: "Review fixture", template: "Review {{args}}", hints: [] }] })
+  if (path === "/api/command") return json({ location: location(), data: [{ name: "review", description: "Review fixture" }] })
   if (path === "/api/model") return json({ location: location(), data: models })
   if (path === "/api/model/known") return json({ location: location(), data: models })
   if (path === "/api/model/default") return json({ location: location(), data: models[0] })
@@ -111,13 +156,17 @@ async function handle(request: Request): Promise<Response> {
   if (path === "/api/vcs/status") return json({ location: location(), data: [] })
   if (path === "/api/vcs/diff") return json({ location: location(), data: "" })
   if (path === "/api/permission/request") return json({ data: permissions })
-  if (path === "/api/question/request") return json({ data: questions })
   if (path === "/api/form/request") return json({ location: location(), data: forms })
   if (path === "/api/session/active") return json({ data: {} })
   if (path === "/api/session" && request.method === "GET") {
     const parentID = url.searchParams.get("parentID")
-    const filtered = parentID === null ? sessions : sessions.filter((item) => parentID === "" || parentID === "null" ? !item.parentID : item.parentID === parentID)
-    return json({ data: filtered, cursor: {} })
+    const directory = url.searchParams.get("directory")
+    // Real server semantics: directory scopes the list by exact
+    // location.directory match (a parent dir does not include child-dir sessions).
+    let filtered = sessions.filter((item) => (item.location as { directory?: string } | undefined)?.directory === directory)
+    if (directory === null) filtered = sessions
+    const byParent = parentID === null ? filtered : filtered.filter((item) => parentID === "" || parentID === "null" ? !item.parentID : item.parentID === parentID)
+    return json({ data: byParent, cursor: {} })
   }
   if (path === "/api/session" && request.method === "POST") { const input = await body(request); const created = session(`fixture-created-${sessions.length}`, (input.title as string) || "Fixture session"); sessions.unshift(created); messages.set(created.id, []); emit("session.created", { sessionID: created.id, projectID: project.id, location: created.location, parentID: created.parentID, slug: created.id, title: created.title, agent: created.agent, model: created.model, version: "2" }); return json({ data: created }) }
   if (path.startsWith("/api/message")) { const sid = url.searchParams.get("sessionID") || ""; return json({ data: messages.get(sid) || [], cursor: {} }) }
@@ -140,7 +189,7 @@ async function sessionRoute(request: Request, path: string): Promise<Response> {
   if (rest === "/interrupt") { emit("session.execution.interrupted", { sessionID: sid }); return empty() }
   if (rest === "/prompt" || rest === "/command") {
     const prompt = (input.id as Json | undefined) ?? input
-    const text = rest === "/prompt" ? String(prompt.text || "") : `/${input.command} ${input.arguments || ""}`.trim()
+    const text = rest === "/prompt" ? String(prompt.text || "") : `/${input.command} ${input.text || ""}`.trim()
     const messageID = ++messageSequence
     const userID = `fixture-user-${messageID}`
     const assistantID = `fixture-assistant-${messageID}`
@@ -211,7 +260,6 @@ async function sessionRoute(request: Request, path: string): Promise<Response> {
   }
   if (rest === "/revert/stage" || rest === "/revert/clear" || rest === "/revert/commit") return rest === "/revert/stage" ? json({ messageID: input.messageID }) : empty()
   if (rest.startsWith("/permission/") && rest.endsWith("/reply")) { const requestID = rest.split("/")[2]; permissions = permissions.filter((item) => item.id !== requestID); emit("permission.replied", { sessionID: sid, requestID, reply: input.reply }); return empty() }
-  if (rest.startsWith("/question/") && (rest.endsWith("/reply") || rest.endsWith("/reject"))) { const requestID = rest.split("/")[2]; questions = questions.filter((item) => item.id !== requestID); emit(rest.endsWith("reply") ? "question.replied" : "question.rejected", { sessionID: sid, requestID, answers: input.answers }); return empty() }
   if (rest === "/form" && request.method === "GET") return json({ data: forms.filter((item) => item.sessionID === sid) })
   if (rest.startsWith("/form/") && (rest.endsWith("/reply") || rest.endsWith("/cancel"))) {
     const [, , formID, action] = rest.split("/")

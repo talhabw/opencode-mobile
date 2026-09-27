@@ -10,18 +10,16 @@ import { recordSuccessfulSession } from "../lib/store-review"
 import { isAuthError } from "../lib/api-error"
 import { isSessionActuallyIdle } from "../lib/session-status-reconcile"
 import { eventSessionID, mergeSendingState, reconnectDelay, resyncPlan, shouldRefreshCanonicalMessages } from "../lib/event-reconcile"
-import { canAutoResume } from "../lib/transport-lifecycle"
+import { canAutoResume, streamLiveTransition } from "../lib/transport-lifecycle"
 import type { TransportPhase } from "../lib/transport-lifecycle"
 import type { Client, Event, Part, Session, Message } from "../lib/sdk"
 import {
-  dedupePendingInputs,
   fromQuestionForm,
-  fromQuestionRequest,
   isQuestionForm,
   type PendingInput,
-  type QuestionRequestLike,
 } from "../lib/question-inputs"
-import { findCachedSession } from "../lib/session-hierarchy"
+import { reconcilePendingSource, replacePendingSessions } from "../lib/pending-merge"
+import { descendantIDs, findCachedSession } from "../lib/session-hierarchy"
 import { LatestValueBuffer } from "../lib/latest-value-buffer"
 
 // Session status from the server
@@ -92,48 +90,66 @@ const erroredSessions = new Set<string>()
 const STABLE_CONNECTION_MS = 10_000
 const PROLONGED_DISCONNECT_MS = 30_000
 
-// Re-fetch pending permissions and questions from the server for a session.
-// Called when entering a session to recover from missed SSE events or failed
-// optimistic removals.
+// Re-fetch pending permissions and question forms from the server for a
+// session. Called when entering a session to recover from missed SSE events or
+// failed optimistic removals. Permissions and forms are fetched independently:
+// a failure in one source never blocks the other (the beta has no question
+// API — question-kind forms are the only question source, and this is what a
+// refresh recovers), and a successful source still reconciles its own bucket.
+// Snapshot application is race-safe: a request that arrived over SSE while the
+// fetch was in flight is preserved, never clobbered by the older snapshot.
 export async function refreshPending(client: Client, sessionID: string) {
-  try {
-    const [perms, questions, forms] = await Promise.all([client.permission.list(), client.question.list(), pendingFormInputs(client)])
-    const inputs = dedupePendingInputs([...questions.map(fromQuestionRequest), ...forms])
-    const permissionIDs = new Set(perms.map((request) => request.id))
-    const inputIDs = new Set(inputs.map((input) => input.id))
-    for (const id of resolvedPermissions) if (!permissionIDs.has(id)) resolvedPermissions.delete(id)
-    for (const id of resolvedQuestions) if (!inputIDs.has(id)) resolvedQuestions.delete(id)
-    const sessionPerms = perms.filter((request) => request.sessionID === sessionID && !resolvedPermissions.has(request.id))
-    const sessionQuestions = inputs.filter((input) => input.sessionID === sessionID && !resolvedQuestions.has(input.id))
+  const beforePermissions = useEvents.getState().permissions
+  const beforeQuestions = useEvents.getState().questions
+  const sessionIDs = descendantIDs(sessionID, useSessions.getState().childrenByParent)
+  const [perms, forms] = await Promise.all([listPendingPermissions(client), pendingFormInputs(client)])
+
+  const permissionBuckets = reconcilePendingSource({
+    fetched: perms,
+    before: beforePermissions,
+    current: useEvents.getState().permissions,
+    resolved: resolvedPermissions,
+  })
+  if (permissionBuckets !== null) {
     useEvents.setState((state) => ({
-      permissions: { ...state.permissions, [sessionID]: sessionPerms },
-      questions: { ...state.questions, [sessionID]: sessionQuestions },
+      permissions: replacePendingSessions(state.permissions, permissionBuckets, sessionIDs),
     }))
+  }
+
+  const questionBuckets = reconcilePendingSource({
+    fetched: forms,
+    before: beforeQuestions,
+    current: useEvents.getState().questions,
+    resolved: resolvedQuestions,
+  })
+  if (questionBuckets !== null) {
+    useEvents.setState((state) => ({
+      questions: replacePendingSessions(state.questions, questionBuckets, sessionIDs),
+    }))
+  }
+}
+
+async function listPendingPermissions(client: Client): Promise<PendingPermission[] | null> {
+  try {
+    return await client.permission.list()
   } catch (err) {
-    console.warn("[Events] Failed to refresh pending:", err)
+    console.warn("[Events] Failed to list pending permissions:", err)
+    return null
   }
 }
 
 // Pending question forms from the global, location-scoped form request list so
-// child-session-owned forms are recovered too. Older servers do not expose
-// the forms API; a failure there must not block legacy question recovery.
-async function pendingFormInputs(client: Client): Promise<PendingInput[]> {
+// child-session-owned forms are recovered too. A failure here is isolated: the
+// null result leaves the existing (SSE-driven) bucket untouched instead of
+// wiping it with an empty snapshot.
+async function pendingFormInputs(client: Client): Promise<PendingInput[] | null> {
   try {
     const forms = await client.form.requestList()
     return forms.filter(isQuestionForm).map(fromQuestionForm).filter((input) => input.questions.length > 0)
   } catch (err) {
     console.warn("[Events] Failed to refresh pending forms:", err)
-    return []
+    return null
   }
-}
-
-function groupPending<T extends { id: string; sessionID: string }>(items: T[], resolved: Set<string>): Record<string, T[]> {
-  const grouped: Record<string, T[]> = {}
-  for (const item of items) {
-    if (resolved.has(item.id)) continue
-    grouped[item.sessionID] = [...(grouped[item.sessionID] ?? []), item]
-  }
-  return grouped
 }
 
 function cachedSession(sessionID: string): Session | undefined {
@@ -144,32 +160,41 @@ function cachedSession(sessionID: string): Session | undefined {
 async function authoritativeResync(client: Client, isCurrent: () => boolean) {
   if (!isCurrent()) return
   const sessions = useSessions.getState()
+  const beforePermissions = useEvents.getState().permissions
+  const beforeQuestions = useEvents.getState().questions
   const plan = resyncPlan(Boolean(sessions.currentSession))
   const pending = plan.pending
-    ? Promise.all([client.permission.list(), client.question.list(), pendingFormInputs(client)])
+    ? Promise.all([listPendingPermissions(client), pendingFormInputs(client)])
     : null
   const active = plan.active ? client.session.active() : null
   await Promise.all([
     plan.sessions ? sessions.loadSessions() : undefined,
     plan.messages ? sessions.refreshMessages() : undefined,
-    pending?.then(([permissions, questions, forms]) => {
+    pending?.then(([permissions, forms]) => {
       if (!isCurrent()) return
-      const inputs = dedupePendingInputs([...questions.map(fromQuestionRequest), ...forms])
-      const permissionIDs = new Set(permissions.map((request) => request.id))
-      const inputIDs = new Set(inputs.map((input) => input.id))
-      for (const id of resolvedPermissions) if (!permissionIDs.has(id)) resolvedPermissions.delete(id)
-      for (const id of resolvedQuestions) if (!inputIDs.has(id)) resolvedQuestions.delete(id)
-      useEvents.setState({
-        permissions: groupPending(permissions, resolvedPermissions),
-        questions: groupPending(inputs, resolvedQuestions),
+      const patch: Partial<Pick<EventsState, "permissions" | "questions">> = {}
+      const permissionBuckets = reconcilePendingSource({
+        fetched: permissions,
+        before: beforePermissions,
+        current: useEvents.getState().permissions,
+        resolved: resolvedPermissions,
       })
+      if (permissionBuckets !== null) patch.permissions = permissionBuckets
+      const questionBuckets = reconcilePendingSource({
+        fetched: forms,
+        before: beforeQuestions,
+        current: useEvents.getState().questions,
+        resolved: resolvedQuestions,
+      })
+      if (questionBuckets !== null) patch.questions = questionBuckets
+      if (patch.permissions || patch.questions) useEvents.setState(patch)
     }),
     active?.then((running) => {
       if (!isCurrent()) return
       useEvents.setState((state) => {
         const sessionStatus = { ...state.sessionStatus }
         for (const sessionID of Object.keys(sessionStatus)) {
-          if (!(sessionID in running) && sessionStatus[sessionID].type === "busy") sessionStatus[sessionID] = { type: "idle" }
+          if (!(sessionID in running) && isRunningEquivalent(sessionStatus[sessionID])) sessionStatus[sessionID] = { type: "idle" }
         }
         for (const sessionID of Object.keys(running)) sessionStatus[sessionID] = { type: "busy" }
         return { sessionStatus }
@@ -225,10 +250,15 @@ const isSession = (input: unknown): input is Session =>
   Boolean(input && typeof input === "object" && "id" in input && typeof input.id === "string" && "directory" in input && typeof input.directory === "string")
 const isPermission = (input: unknown): input is PendingPermission =>
   Boolean(input && typeof input === "object" && "id" in input && typeof input.id === "string" && "sessionID" in input && typeof input.sessionID === "string" && "permission" in input && typeof input.permission === "string" && "patterns" in input && Array.isArray(input.patterns))
-const isQuestion = (input: unknown): input is QuestionRequestLike =>
-  Boolean(input && typeof input === "object" && "id" in input && typeof input.id === "string" && "sessionID" in input && typeof input.sessionID === "string" && "questions" in input && Array.isArray(input.questions))
 
-// Re-sync any session currently marked "busy" against the server after an
+// Running-equivalent statuses worth resyncing. "retry" (the server is
+// automatically retrying a failed step) is still in-flight exactly like
+// "busy", and strands the same way when its terminal session.status lands
+// during an outage — so both count as stale-running for the resync.
+const isRunningEquivalent = (status: SessionStatus | undefined): boolean =>
+  status !== undefined && (status.type === "busy" || status.type === "retry")
+
+// Re-sync any session currently marked busy/retry against the server after an
 // SSE reconnect. sessionStatus/sending are SSE-driven and there is normally
 // no other path to idle — if the server's busy -> idle `session.status`
 // event fired while the network was down, SSE reconnect resumes the stream
@@ -236,20 +266,20 @@ const isQuestion = (input: unknown): input is QuestionRequestLike =>
 // flag would never clear and the UI would show a stuck 'processing' spinner
 // forever (issue #123).
 //
-// Only ever CLEARS a busy flag the server confirms is stale via
+// Only ever CLEARS a running-equivalent flag the server confirms is stale via
 // isSessionActuallyIdle — it never marks a session busy, so it can't
 // clobber a genuinely still-busy session. Also re-checks sessionStatus right
 // before writing, so a real session.status event that lands while the fetch
 // is in flight (e.g. the session went busy again) wins over this resync.
 async function resyncBusySessions(isCurrent: () => boolean) {
   if (!isCurrent()) return
-  const busySessionIDs = Object.entries(useEvents.getState().sessionStatus)
-    .filter(([, status]) => status.type === "busy")
+  const runningEquivalentIDs = Object.entries(useEvents.getState().sessionStatus)
+    .filter(([, status]) => isRunningEquivalent(status))
     .map(([sessionID]) => sessionID)
-  if (busySessionIDs.length === 0) return
+  if (runningEquivalentIDs.length === 0) return
 
   await Promise.all(
-    busySessionIDs.map(async (sessionID) => {
+    runningEquivalentIDs.map(async (sessionID) => {
       if (!isCurrent()) return
       try {
         const sessionsState = useSessions.getState()
@@ -264,12 +294,12 @@ async function resyncBusySessions(isCurrent: () => boolean) {
 
         const response = await client.session.messages(sessionID)
         const messages = (response || []).map((m) => m.info)
-        if (!isSessionActuallyIdle(messages)) return // server says still busy - leave it alone
+        if (!isSessionActuallyIdle(messages)) return // server says still running - leave it alone
 
         // A fresh session.status event may have landed on the SSE stream
         // while this fetch was in flight — that's authoritative, don't
         // stomp on it.
-        if (!isCurrent() || useEvents.getState().sessionStatus[sessionID]?.type !== "busy") return
+        if (!isCurrent() || !isRunningEquivalent(useEvents.getState().sessionStatus[sessionID])) return
 
         useEvents.setState((state) => ({
           sessionStatus: { ...state.sessionStatus, [sessionID]: { type: "idle" } },
@@ -323,9 +353,36 @@ export const useEvents = create<EventsState>((set, get) => ({
     ;(async () => {
       let reconnectScheduled = false
       let resynced = false
+      // The stream is live as soon as it is open and error-free — a healthy
+      // idle stream may never yield an event, so waiting for one left the
+      // phase stuck in connecting/reconnecting and the retry banner up
+      // forever. Applied on the first SSE event (fast path) and on the
+      // stability timer (idle path). The ready transition is skipped once a
+      // real event already applied it (streamLiveTransition returns null),
+      // and the authoritative/busy resync runs at most once per physical
+      // subscription via resynced, so an event-driven recovery is never
+      // duplicated by the timer.
+      const markStreamLive = () => {
+        const transition = streamLiveTransition(get())
+        if (transition) set(transition)
+        if (!resynced) {
+          resynced = true
+          void authoritativeResync(client, () => generation === streamGeneration && !currentController.signal.aborted).then(() => {
+            if (generation === streamGeneration) return resyncBusySessions(() => generation === streamGeneration && !currentController.signal.aborted)
+          }).catch((error) => {
+            console.warn("[Events] Failed authoritative resync:", error)
+          })
+        }
+      }
+
       const stableTimer = setTimeout(() => {
         if (!currentController.signal.aborted && generation === streamGeneration) {
           set({ reconnectAttempts: 0, lastDisconnectAt: null })
+          // No event arrived within the stability window — the stream is
+          // open but idle. Mark it ready now (clearing the retry banner) and
+          // resync once so missed events from the outage are still
+          // reconciled, exactly as the first-event path would.
+          markStreamLive()
         }
       }, STABLE_CONNECTION_MS)
 
@@ -373,20 +430,7 @@ export const useEvents = create<EventsState>((set, get) => ({
 
           // A parsed event is our first proof that authentication and the
           // subscription are usable. Do not wait for the stability timer.
-          if (get().phase !== "ready") {
-            set({ connected: true, phase: "ready", reconnectAttempts: 0, reconnectVisible: false, recoveryVisible: get().reconnectVisible })
-          }
-
-          // The stream is now live. Rebuild volatile state once per physical
-          // subscription so cold starts and reconnects cannot retain gaps.
-          if (!resynced) {
-            resynced = true
-            void authoritativeResync(client, () => generation === streamGeneration && !currentController.signal.aborted).then(() => {
-              if (generation === streamGeneration) return resyncBusySessions(() => generation === streamGeneration && !currentController.signal.aborted)
-            }).catch((error) => {
-              console.warn("[Events] Failed authoritative resync:", error)
-            })
-          }
+          markStreamLive()
 
           const type = event.type
           const props = event.properties
@@ -598,47 +642,9 @@ export const useEvents = create<EventsState>((set, get) => ({
               break
             }
 
-            case "question.asked": {
-              if (!isQuestion(props)) break
-              const req = fromQuestionRequest(props)
-              if (resolvedQuestions.has(req.id)) break
-              const existing = get().questions[req.sessionID] || []
-              if (existing.some((item) => item.id === req.id)) break
-              set((state) => ({
-                questions: {
-                  ...state.questions,
-                  [req.sessionID]: [...(state.questions[req.sessionID] || []), req],
-                },
-              }))
-              notify({
-                category: "questions",
-                title: req.questions?.[0]?.header || "Input needed",
-                body: sanitizeBody(req.questions?.[0]?.question, "The assistant has a question"),
-                sessionId: req.sessionID,
-                dedupeKey: `question-${req.id}`,
-                dedupeCooldownMs: 60_000,
-              })
-              break
-            }
-
-            case "question.replied":
-            case "question.rejected": {
-              const sessionID = value(props, "sessionID", isString)
-              const requestID = value(props, "requestID", isString)
-              if (!sessionID || !requestID) break
-              resolvedQuestions.add(requestID)
-              set((state) => ({
-                questions: {
-                  ...state.questions,
-                  [sessionID]: (state.questions[sessionID] || []).filter((q) => q.id !== requestID),
-                },
-              }))
-              break
-            }
-
             case "form.created": {
-              // Newer servers surface the question tool through forms
-              // (metadata.kind === "question") instead of question.asked.
+              // The server surfaces the question tool through forms
+              // (metadata.kind === "question") — there is no question.asked.
               const form = props.form
               if (!isQuestionForm(form)) break
               const req = fromQuestionForm(form)

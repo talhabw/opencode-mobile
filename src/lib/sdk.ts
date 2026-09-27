@@ -1,3 +1,6 @@
+// Hermes lacks Promise.withResolvers; @opencode-ai/client's SSE stream needs
+// it. Install the fallback before the SDK module is evaluated.
+import "./promise-with-resolvers"
 import { OpenCode, type OpenCodeClient } from "@opencode-ai/client"
 import { fetch as expoFetch } from "expo/fetch"
 import { buildRequestHeaders } from "./headers"
@@ -102,7 +105,6 @@ export function createClient(input: ClientConfig) {
   })
   const scopedLocation = location(config)
   const permissionSessions = new Map<string, string>()
-  const questionSessions = new Map<string, string>()
 
   const permissionSession = async (requestID: string): Promise<string> => {
     const cached = permissionSessions.get(requestID)
@@ -111,16 +113,6 @@ export function createClient(input: ClientConfig) {
     const request = response.data.find((item) => item.id === requestID)
     if (!request) throw new Error(`Unknown permission request: ${requestID}`)
     permissionSessions.set(requestID, request.sessionID)
-    return request.sessionID
-  }
-
-  const questionSession = async (requestID: string): Promise<string> => {
-    const cached = questionSessions.get(requestID)
-    if (cached) return cached
-    const response = await checked(raw.question.request.list({ location: scopedLocation }))
-    const request = response.data.find((item) => item.id === requestID)
-    if (!request) throw new Error(`Unknown question request: ${requestID}`)
-    questionSessions.set(requestID, request.sessionID)
     return request.sessionID
   }
 
@@ -169,7 +161,6 @@ export function createClient(input: ClientConfig) {
          (await timed((options) => raw.project.list(options), timeoutMs)).map(normalizeProject),
       current: async (timeoutMs?: number): Promise<Project> =>
         normalizeProject(await timed((options) => raw.project.current({ location: scopedLocation }, options), timeoutMs)),
-      directories: (projectID: string) => checked(raw.project.directories({ projectID, location: scopedLocation })),
     },
     file: {
       list: async (params: { path?: string } = {}): Promise<FileEntry[]> => {
@@ -256,12 +247,18 @@ export function createClient(input: ClientConfig) {
         variant?: string
         parts?: Array<{ type: "file"; mime: string; url: string; filename?: string }>
       }): Promise<void> => {
+        // The beta command request no longer carries agent/model fields; apply
+        // them as session switches first so the command still runs under the
+        // requested agent and model, mirroring the prompt path.
+        if (params.agent) await checked(raw.session.switchAgent({ sessionID, agent: params.agent }))
+        if (params.model) await checked(raw.session.switchModel({
+          sessionID,
+          model: selectedModel(params.model, params.variant)!,
+        }))
         await checked(raw.session.command({
           sessionID,
           command: params.command,
-          arguments: params.arguments,
-          agent: params.agent,
-          model: selectedModel(params.model, params.variant),
+          text: params.arguments,
           files: params.parts?.map((part) => ({ uri: part.url, name: part.filename })),
         }))
       },
@@ -294,25 +291,6 @@ export function createClient(input: ClientConfig) {
         const sessionID = explicitSessionID ?? await permissionSession(requestID)
         await checked(raw.permission.reply({ sessionID, requestID, reply }))
         permissionSessions.delete(requestID)
-        return true
-      },
-    },
-    question: {
-      list: async () => {
-        const response = await checked(raw.question.request.list({ location: scopedLocation }))
-        for (const request of response.data) questionSessions.set(request.id, request.sessionID)
-        return response.data.map((request) => ({ ...request, tool: request.tool && { messageID: request.tool.messageID, callID: request.tool.id } }))
-      },
-      reply: async (requestID: string, answers: string[][], explicitSessionID?: string) => {
-        const sessionID = explicitSessionID ?? await questionSession(requestID)
-        await checked(raw.question.reply({ sessionID, requestID, answers }))
-        questionSessions.delete(requestID)
-        return true
-      },
-      reject: async (requestID: string, explicitSessionID?: string) => {
-        const sessionID = explicitSessionID ?? await questionSession(requestID)
-        await checked(raw.question.reject({ sessionID, requestID }))
-        questionSessions.delete(requestID)
         return true
       },
     },

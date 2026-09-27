@@ -23,12 +23,16 @@ export function AgentPicker({ agents, selected, defaultAgent, hasPersistedOverri
   const acc = useAccent()
   const s = makeStyles(acc)
   const [search, setSearch] = useState("")
+  // Server-ordered primary/all agents with the effective default first, so the
+  // picker highlights the concrete default the way the TUI dialog does.
   const items = useMemo(() => {
     const query = search.toLowerCase()
-    return agents
+    const filtered = agents
       .filter((agent) => agent.mode === "primary" || agent.mode === "all")
       .filter((agent) => !query || `${agent.name} ${agent.label || ""} ${agent.description || ""}`.toLowerCase().includes(query))
-  }, [agents, search])
+    if (!defaultAgent) return filtered
+    return [...filtered.filter((a) => a.name === defaultAgent), ...filtered.filter((a) => a.name !== defaultAgent)]
+  }, [agents, search, defaultAgent])
   const select = useCallback((name: string) => {
     onSelect(name)
     setSearch("")

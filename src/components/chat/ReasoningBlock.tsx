@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useState, useRef } from "react"
 import { View, Text, TouchableOpacity, StyleSheet } from "react-native"
 import { Ionicons } from "@expo/vector-icons"
 import { useTranslation } from "react-i18next"
@@ -10,15 +10,25 @@ interface Props {
   id?: string
   /**
    * Fired with the NEW expanded state right before the row's layout change
-   * lands, so the transcript can anchor the header. Must be stable across
-   * renders (useCallback in the screen) to keep MessageBubble's memo correct.
+   * lands, plus the block's last measured height (the pre-tap height,
+   * captured by the block's own onLayout), so the transcript can anchor the
+   * header. Must be stable across renders (useCallback in the screen) to keep
+   * MessageBubble's memo correct.
    */
-  onToggleExpand?: (id: string, expanded: boolean) => void
+  onToggleExpand?: (id: string, expanded: boolean, height: number | null) => void
+  /**
+   * Fired with this block's measured layout height on every size change, so
+   * the screen can attribute expansion deltas to THIS block (and only this
+   * block) while an expansion anchor is pending. Must be stable across
+   * renders for the same reason as onToggleExpand.
+   */
+  onLayout?: (id: string, height: number) => void
 }
 
-export function ReasoningBlock({ text, isDark, id, onToggleExpand }: Props) {
+export function ReasoningBlock({ text, isDark, id, onToggleExpand, onLayout }: Props) {
   const { t } = useTranslation()
   const [expanded, setExpanded] = useState(false)
+  const heightRef = useRef<number | null>(null)
 
   return (
     <TouchableOpacity
@@ -26,9 +36,14 @@ export function ReasoningBlock({ text, isDark, id, onToggleExpand }: Props) {
       onPress={() => {
         const next = !expanded
         setExpanded(next)
-        onToggleExpand?.(id ?? "", next)
+        onToggleExpand?.(id ?? "", next, heightRef.current)
       }}
       activeOpacity={0.7}
+      onLayout={(e) => {
+        const h = Math.round(e.nativeEvent.layout.height)
+        heightRef.current = h
+        onLayout?.(id ?? "", h)
+      }}
     >
       <View style={s.header}>
         <Ionicons name="bulb-outline" size={14} color="#f59e0b" />

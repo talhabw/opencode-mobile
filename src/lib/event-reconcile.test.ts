@@ -23,6 +23,7 @@ test("canonical refresh covers lifecycle and tool completion but ignores unknown
   assert.equal(shouldRefreshCanonicalMessages({ type: "session.step.ended", properties: {} }), true)
   assert.equal(shouldRefreshCanonicalMessages({ type: "session.tool.success", properties: {} }), true)
   assert.equal(shouldRefreshCanonicalMessages({ type: "session.synthetic", properties: { sessionID: "s1", text: "<shell id=\"c\" state=\"completed\">" } }), true)
+  assert.equal(shouldRefreshCanonicalMessages({ type: "session.instructions.updated", properties: { sessionID: "s1" } }), true)
   assert.equal(shouldRefreshCanonicalMessages({ type: "message.part.updated", properties: { canonicalRefresh: true } }), true)
   assert.equal(shouldRefreshCanonicalMessages({ type: "message.part.updated", properties: {} }), false)
   assert.equal(shouldRefreshCanonicalMessages({ type: "session.shell.ended", properties: { canonicalRefresh: true } }), true)
@@ -58,6 +59,18 @@ test("busy sessions skip mid-run refreshes but never terminal or error refreshes
 
   // Events that never trigger a refresh stay gated off even while busy.
   assert.equal(shouldRefreshCanonicalMessages({ type: "session.text.delta", properties: {} }, true), false)
+})
+
+test("instruction updates refresh the canonical page even mid-run", () => {
+  // session.instructions.updated projects a durable System bookkeeping row that
+  // the live part stream never carries, so the refresh must not wait for the
+  // busy -> idle transition to surface it.
+  assert.equal(shouldRefreshCanonicalMessages({ type: "session.instructions.updated", properties: { sessionID: "s1" } }, true), true)
+  assert.equal(shouldRefreshCanonicalMessages({ type: "session.instructions.updated", properties: { sessionID: "s1" } }, false), true)
+  assert.equal(shouldRefreshCanonicalMessages({ type: "session.instructions.updated", properties: { sessionID: "s1" } }, undefined), true)
+  // The event still needs the canonical session id to be actionable.
+  assert.equal(eventSessionID({ type: "session.instructions.updated", properties: { sessionID: "s1" } }), "s1")
+  assert.equal(eventSessionID({ type: "session.instructions.updated", properties: {} }), undefined)
 })
 
 test("idle sessions and unknown busy state keep today's refresh behavior", () => {

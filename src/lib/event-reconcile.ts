@@ -24,6 +24,7 @@ const CANONICAL_REFRESH_EVENTS = new Set([
   "session.execution.succeeded",
   "session.execution.failed",
   "session.execution.interrupted",
+  "session.instructions.updated",
   "session.step.ended",
   "session.step.failed",
   "session.text.ended",
@@ -48,14 +49,22 @@ const TERMINAL_REFRESH_EVENTS = new Set([
   "session.status",
 ])
 
+// Durable history the live part stream never carries. `session.instructions.
+// updated` projects a System bookkeeping row into session history mid-run; no
+// streamed part reflects it, so the mid-run refresh that surfaces the row is
+// not redundant and must not be suppressed while the session is busy.
+const DURABLE_REFRESH_EVENTS = new Set([...TERMINAL_REFRESH_EVENTS, "session.instructions.updated"])
+
 export function shouldRefreshCanonicalMessages(event: Event, sessionBusy?: boolean): boolean {
   if (!CANONICAL_REFRESH_EVENTS.has(event.type) && event.properties.canonicalRefresh !== true) return false
   // While a session is mid-run, its live events already carry the same data
   // the canonical page would, and each mid-run refresh re-parses and re-renders
   // the whole thread (Markdown included) for no new information. The terminal
   // busy -> idle execution transition triggers the authoritative refresh, so
-  // skipping mid-run refreshes loses nothing.
-  if (sessionBusy === true && !TERMINAL_REFRESH_EVENTS.has(event.type)) return false
+  // skipping mid-run refreshes loses nothing. Durable updates (terminal
+  // transitions, instruction updates) are exempt: their data is only on the
+  // canonical page, never in the live stream.
+  if (sessionBusy === true && !DURABLE_REFRESH_EVENTS.has(event.type)) return false
   return true
 }
 

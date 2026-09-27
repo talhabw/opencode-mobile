@@ -28,14 +28,14 @@ export function VariantPicker({ variants, selected, isDark, onSelect, sheetRef }
     medium: t("chat.variantPicker.effort.medium"),
     high: t("chat.variantPicker.effort.high"),
   }
-  const autoOption: VariantOption = {
+  const defaultOption: VariantOption = {
     id: null,
-    label: t("chat.variantPicker.autoLabel"),
-    description: t("chat.variantPicker.autoDescription"),
+    label: t("chat.variantPicker.defaultLabel"),
+    description: t("chat.variantPicker.defaultDescription"),
   }
 
   const options: VariantOption[] = [
-    autoOption,
+    defaultOption,
     ...Object.keys(variants || {}).map((id) => ({
       id,
       label: id.charAt(0).toUpperCase() + id.slice(1),

@@ -13,6 +13,21 @@ export interface PendingSessionCounts {
   total: number
 }
 
+// Combine per-session pending request records. Permissions and questions are
+// tracked in separate events-store maps, but counts and fallback navigation
+// must treat both kinds uniformly; sessions with no pending entries are
+// dropped so empty buckets never surface as zero-count rows.
+export function mergePendingRequests(...records: readonly PendingBySession[]): PendingBySession {
+  const merged: Record<string, unknown[]> = {}
+  for (const record of records) {
+    for (const [sessionID, requests] of Object.entries(record)) {
+      if (requests.length === 0) continue
+      merged[sessionID] = [...(merged[sessionID] ?? []), ...requests]
+    }
+  }
+  return merged
+}
+
 export function flattenSessionHierarchy(
   roots: Session[],
   childrenByParent: Record<string, Session[]>,

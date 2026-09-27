@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react"
+import { useState, useCallback, useRef } from "react"
 import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, ScrollView, Platform } from "react-native"
 import { Ionicons } from "@expo/vector-icons"
 import { useTranslation } from "react-i18next"
@@ -353,18 +353,28 @@ interface Props {
   isDark: boolean
   /**
    * Fired with the NEW expanded state right before the row's layout change
-   * lands, so the transcript can anchor the header. Must be stable across
-   * renders (useCallback in the screen) to keep MessageBubble's memo correct.
+   * lands, plus the card's last measured height (the pre-tap height, captured
+   * by the card's own onLayout), so the transcript can anchor the header.
+   * Must be stable across renders (useCallback in the screen) to keep
+   * MessageBubble's memo correct.
    */
-  onToggleExpand?: (id: string, expanded: boolean) => void
+  onToggleExpand?: (id: string, expanded: boolean, height: number | null) => void
+  /**
+   * Fired with this card's measured layout height on every size change, so
+   * the screen can attribute expansion deltas to THIS card (and only this
+   * card) while an expansion anchor is pending. Must be stable across
+   * renders for the same reason as onToggleExpand.
+   */
+  onLayout?: (id: string, height: number) => void
 }
 
-function TaskSubagentCard({ tool, isDark, onToggleExpand }: Props) {
+function TaskSubagentCard({ tool, isDark, onToggleExpand, onLayout }: Props) {
   const { t } = useTranslation()
   const acc = useAccent()
   const s = makeStyles(acc)
   const [expanded, setExpanded] = useState(false)
   const [opening, setOpening] = useState(false)
+  const heightRef = useRef<number | null>(null)
   const link = taskSubagentLink(tool)
   const pendingQuestions = useEvents((state) => link ? state.questions[link.sessionID] ?? EMPTY_PENDING_QUESTIONS : EMPTY_PENDING_QUESTIONS)
   const input = tool.state?.input && typeof tool.state.input === "object" ? tool.state.input as Record<string, unknown> : {}
@@ -403,13 +413,21 @@ function TaskSubagentCard({ tool, isDark, onToggleExpand }: Props) {
   }
 
   return (
-    <View style={[s.card, s.taskCard, isDark && s.cardDark]} testID={`task-card-${tool.id}`}>
+    <View
+      style={[s.card, s.taskCard, isDark && s.cardDark]}
+      testID={`task-card-${tool.id}`}
+      onLayout={(e) => {
+        const h = Math.round(e.nativeEvent.layout.height)
+        heightRef.current = h
+        onLayout?.(tool.id, h)
+      }}
+    >
       <TouchableOpacity
         style={s.header}
         onPress={() => {
           const next = !expanded
           setExpanded(next)
-          onToggleExpand?.(tool.id, next)
+          onToggleExpand?.(tool.id, next, heightRef.current)
         }}
         accessibilityRole="button"
         accessibilityLabel={summary || t("chat.toolCallCard.taskTitle")}
@@ -457,11 +475,12 @@ function TaskSubagentCard({ tool, isDark, onToggleExpand }: Props) {
   )
 }
 
-export function ToolCallCard({ tool, isDark, onToggleExpand }: Props) {
+export function ToolCallCard({ tool, isDark, onToggleExpand, onLayout }: Props) {
   const { t } = useTranslation()
   const acc = useAccent()
   const s = makeStyles(acc)
   const [expanded, setExpanded] = useState(false)
+  const heightRef = useRef<number | null>(null)
   const icon = (tool.tool && TOOL_ICONS[tool.tool]) || "extension-puzzle-outline"
   const status = tool.state?.status || "pending"
   const color = statusColor(status)
@@ -473,10 +492,10 @@ export function ToolCallCard({ tool, isDark, onToggleExpand }: Props) {
     if (!hasDetail) return
     const next = !expanded
     setExpanded(next)
-    onToggleExpand?.(tool.id, next)
+    onToggleExpand?.(tool.id, next, heightRef.current)
   }, [hasDetail, expanded, tool.id, onToggleExpand])
 
-  if (tool.tool === "task") return <TaskSubagentCard tool={tool} isDark={isDark} onToggleExpand={onToggleExpand} />
+  if (tool.tool === "task") return <TaskSubagentCard tool={tool} isDark={isDark} onToggleExpand={onToggleExpand} onLayout={onLayout} />
 
   return (
     <TouchableOpacity
@@ -488,6 +507,11 @@ export function ToolCallCard({ tool, isDark, onToggleExpand }: Props) {
       ]}
       onPress={toggle}
       activeOpacity={hasDetail ? 0.7 : 1}
+      onLayout={(e) => {
+        const h = Math.round(e.nativeEvent.layout.height)
+        heightRef.current = h
+        onLayout?.(tool.id, h)
+      }}
     >
       {/* Header row */}
       <View style={s.header}>
